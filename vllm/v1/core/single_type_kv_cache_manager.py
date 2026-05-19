@@ -704,11 +704,7 @@ class MLAAttentionManager(FullAttentionManager):
         alignment_tokens: int | None = None,
     ) -> None:
         super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
-        if (
-            not self._should_protect_prompt_blocks()
-            or num_tokens < request.num_prompt_tokens
-            or request.num_prompt_tokens <= 1
-        ):
+        if not self._should_protect_prompt_blocks() or request.num_prompt_tokens <= 1:
             return
 
         max_cache_hit_length = request.num_prompt_tokens - 1
@@ -717,6 +713,8 @@ class MLAAttentionManager(FullAttentionManager):
             // self.cache_alignment_tokens
             * self.cache_alignment_tokens
         )
+        if aligned_cache_hit_length <= 0 or num_tokens < aligned_cache_hit_length:
+            return
         num_hit_blocks = aligned_cache_hit_length // self.block_size
         if num_hit_blocks == 0:
             return
@@ -978,9 +976,7 @@ class SlidingWindowMLAManager(SlidingWindowManager):
         alignment_tokens: int | None = None,
     ) -> None:
         super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
-        if not self.enable_caching or num_tokens < request.num_prompt_tokens:
-            return
-        if request.num_prompt_tokens <= 1:
+        if not self.enable_caching or request.num_prompt_tokens <= 1:
             return
 
         max_cache_hit_length = request.num_prompt_tokens - 1
@@ -989,7 +985,7 @@ class SlidingWindowMLAManager(SlidingWindowManager):
             // self.cache_alignment_tokens
             * self.cache_alignment_tokens
         )
-        if aligned_cache_hit_length <= 0:
+        if aligned_cache_hit_length <= 0 or num_tokens < aligned_cache_hit_length:
             return
 
         aligned_num_hit_blocks = aligned_cache_hit_length // self.block_size
