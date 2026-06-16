@@ -691,7 +691,7 @@ pyasn1==0.6.1
     #   rsa
 pyasn1-modules==0.4.2
     # via google-auth
-pycountry==24.6.1
+pycountry==26.2.16
     # via pydantic-extra-types
 pycparser==2.22
     # via cffi
