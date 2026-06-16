@@ -8,7 +8,12 @@ This branch extends PR #41834's **portable Triton DeepSeek-V4 path** (built for
 SM12x / consumer Blackwell) to also run on **SM89 / Ada Lovelace**
 (RTX 4090, L40 / L40S, L4, RTX 6000 Ada, A6000 Ada).
 
-> Status: **untested on hardware.** Syntax-checked only. Validate on an SM89 box.
+> Status: **validated on 4× RTX 4090 (SM89), 2026-06-16.** vLLM 0.11.1 built
+> from source (torch 2.11.0+cu128, CUDA 12.8), `vllm serve DeepSeek-V4-Flash`
+> with TP=4, `--kv-cache-dtype fp8_ds_mla`, `--enforce-eager`. Startup reached
+> "Application startup complete"; chat completions return correct, fluent
+> output. MoE auto-selected the **MARLIN** backend; indexer used the **FP8**
+> cache; FlashMLA/DeepGEMM correctly reported unsupported and were bypassed.
 
 ---
 
@@ -141,6 +146,14 @@ Dispatch sites extended from `family(120)` to `family(120) or SM89`:
 - `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability()`
   made accurate (adds 12 and exact 8.9; defensive — this method does not gate
   the model-provided backend).
+- `vllm/utils/import_utils.py` — `has_cutedsl()` returns False on SM89. The
+  DeepSeek-V4 indexer Q-rope-quant and KV-dequant-gather paths pick a CuTe-DSL
+  (`nvidia-cutlass-dsl`) kernel whenever the package is importable (it ships as
+  a FlashInfer dependency). Those CuTe-DSL kernels target SM90+ and emit
+  `mul.bf16x2` / `cvt.bf16.f16` PTX that ptxas rejects on Ada, crashing engine
+  init during warmup. Disabling cutedsl on SM89 forces the Triton/torch
+  fallbacks. **This was found during hardware bring-up — the static audit
+  missed it because the dispatch keys on package availability, not capability.**
 
 Deliberately **unchanged** (correct as-is for SM89):
 - MoE FP4 backends (`cutlass_moe`, `flashinfer_cutlass_moe`,

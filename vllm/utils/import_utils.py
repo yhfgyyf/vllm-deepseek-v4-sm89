@@ -546,6 +546,13 @@ def has_cutedsl() -> bool:
         import cutlass  # noqa: F401
     except Exception:
         return False
+    # CuTe-DSL kernels in vLLM target SM90+; on SM89 (Ada) they emit sm_90-only
+    # PTX (mul.bf16x2 / cvt.bf16.f16) that ptxas rejects, so the DeepSeek-V4
+    # indexer/cache paths must use their Triton/torch fallbacks instead.
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda() and current_platform.is_device_capability((8, 9)):
+        return False
     return True
 
 
