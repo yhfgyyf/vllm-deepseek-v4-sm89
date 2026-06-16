@@ -83,10 +83,6 @@ cd vllm-deepseek-v4-sm89
 # 本仓库已 = vLLM PR #41834 + SM89 改动，无需再打 patch
 ```
 
-> github 在国内不稳时，给 cmake 的 FetchContent(cutlass/flash-attn/flashmla)配镜像:
-> ```bash
-> git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
-> ```
 
 ### 3.4 编译(只为 Ada 8.9 编译，跳过 SM90/100 的 FlashMLA 源码)
 
