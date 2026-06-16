@@ -375,6 +375,16 @@ def fp8_fp4_mega_moe(*args, **kwargs):
     return _fp8_fp4_mega_moe_impl(*args, **kwargs)
 
 
+def _use_sm12x_mqa_fallback() -> bool:
+    """SM12x (Blackwell client) or SM89 (Ada): route the DeepGEMM-only MQA /
+    HC GEMM entry points to the portable Triton/torch fallbacks instead of
+    DeepGEMM, which is only built for Hopper/Blackwell-datacenter GPUs."""
+    cp = current_platform
+    return cp.is_device_capability_family(120) or (
+        cp.is_cuda() and cp.is_device_capability((8, 9))
+    )
+
+
 def fp8_fp4_mqa_topk_indices(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -386,7 +396,7 @@ def fp8_fp4_mqa_topk_indices(
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and _use_sm12x_mqa_fallback()
         and q[1] is None
     ):
         return False
@@ -449,7 +459,7 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if _use_sm12x_mqa_fallback() and q[1] is None:
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -514,7 +524,7 @@ def fp8_fp4_paged_mqa_topk_indices(
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and _use_sm12x_mqa_fallback()
         and q[1] is None
     ):
         return False
@@ -570,7 +580,7 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if _use_sm12x_mqa_fallback() and q[1] is None:
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
@@ -617,7 +627,7 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
-    if current_platform.is_device_capability_family(120):
+    if _use_sm12x_mqa_fallback():
         return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:

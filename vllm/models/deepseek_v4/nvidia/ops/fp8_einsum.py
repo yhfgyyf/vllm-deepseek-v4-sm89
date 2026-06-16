@@ -42,6 +42,7 @@ def _deepseek_v4_sm12x_fp8_einsum_kernel(
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_OUT: tl.constexpr,
     BLOCK_HIDDEN: tl.constexpr,
+    UPCAST_FP8: tl.constexpr,
 ) -> None:
     token_block = tl.program_id(0)
     out_block = tl.program_id(1)
@@ -71,6 +72,11 @@ def _deepseek_v4_sm12x_fp8_einsum_kernel(
             mask=(out_offsets[None, :] < out_rank) & (hidden[:, None] < hidden_size),
             other=0.0,
         )
+        if UPCAST_FP8:
+            # SM89/Ada: Triton may not lower an FP8-operand tl.dot on this arch,
+            # so upcast to bf16 before the MMA. SM12x keeps the native FP8 dot.
+            a = a.to(tl.bfloat16)
+            b = b.to(tl.bfloat16)
         raw = tl.dot(a, b, out_dtype=tl.float32)
         hidden_scale_block = hidden_start // BLOCK_HIDDEN
         a_scale = tl.load(
@@ -137,6 +143,8 @@ def deepseek_v4_sm12x_fp8_einsum(
     block_tokens = 16
     block_out = 128
     block_hidden = 128
+    # SM12x has native FP8 tensor-core dot; SM89/Ada upcasts FP8->bf16 first.
+    upcast_fp8 = not current_platform.is_device_capability_family(120)
     grid = (
         triton.cdiv(num_tokens, block_tokens),
         triton.cdiv(out_rank, block_out),
@@ -170,6 +178,7 @@ def deepseek_v4_sm12x_fp8_einsum(
         BLOCK_TOKENS=block_tokens,
         BLOCK_OUT=block_out,
         BLOCK_HIDDEN=block_hidden,
+        UPCAST_FP8=upcast_fp8,
         num_warps=4,
         num_stages=3,
     )
@@ -190,9 +199,13 @@ def _use_deepseek_v4_sm12x_triton_fp8_einsum(
 ) -> bool:
     capability = current_platform.get_device_capability()
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    # SM12x (major 12) and SM89/Ada (8.9) both use the Triton FP8 einsum here:
+    # they lack the SM90/SM100-only DeepGEMM fp8_einsum kernel.
+    is_supported_arch = capability is not None and (
+        capability.major == 12 or (capability.major, capability.minor) == (8, 9)
+    )
     return (
-        capability is not None
-        and capability.major == 12
+        is_supported_arch
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
         and b_scale.dtype in (torch.float32, e8m0_dtype)
