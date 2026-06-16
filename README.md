@@ -1,5 +1,7 @@
 # DeepSeek-V4-Flash on SM89 (Ada / RTX 4090) — vLLM fork
 
+> English version: [`README_EN.md`](README_EN.md)
+
 > 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM89/Ada 适配 commit**。**直接 clone 编译即可在 RTX 4090 上跑 DeepSeek-V4-Flash**，无需再打 patch。
 
 把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
