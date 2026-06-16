@@ -1138,5 +1138,5 @@ yarl==1.17.1
     # via
     #   aiohttp
     #   schemathesis
-zipp==3.23.0
+zipp==4.1.0
     # via importlib-metadata
