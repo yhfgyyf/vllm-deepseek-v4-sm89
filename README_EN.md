@@ -51,25 +51,57 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 
 ---
 
-## 3. Installation (clone this repo and build)
+## 3. Quick install (prebuilt wheel)
 
-> A source build is required: this fork carries C/C++ changes, so `VLLM_USE_PRECOMPILED` cannot be used.
+> A prebuilt wheel — **no clone, no compilation**. Use this for deployment; only build from source (§4) if you need to modify the code or target a different CUDA major version.
 
-### 3.1 Conda env + torch
+```bash
+pip install \
+  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
+  --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+This pulls in vLLM (prebuilt) + torch 2.11.0+cu128 + all deps — no compilation.
+
+**Requirements (must match the wheel ABI):**
+- **Python 3.12**, Linux x86_64
+- NVIDIA **Ada (SM89, e.g. RTX 4090)** GPU + a driver supporting **CUDA 12.8** (12.9 / 13.x drivers are fine — backward compatible)
+- The wheel links `libcudart.so.12`, so **any CUDA 12.x (12.8/12.9) works**. A **CUDA 13 / +cu130 torch** would fail with `libcudart.so.12: cannot open shared object file` — for that, build from source (§4).
+
+> To pin cu128 exactly (pip may occasionally pick a different torch variant from PyPI), do it in two steps:
+> ```bash
+> pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+> pip install https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl
+> ```
+
+If you hit `torchvision::nms does not exist` (non-cu128 torchvision pulled in):
+```bash
+pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
+```
+
+> Then jump to [§6 Deployment](#6-deployment-vllm-serve). Do **not** install DeepGEMM (unsupported on Ada).
+
+---
+
+## 4. Build from source (clone this repo)
+
+> A source build is required: this fork carries C/C++ changes, so `VLLM_USE_PRECOMPILED` cannot be used. Use this only when modifying the code or targeting a different CUDA major version (e.g. cu130). The build takes ~30–50 min.
+
+### 4.1 Conda env + torch
 
 ```bash
 conda create -n ds python=3.12 -y && conda activate ds
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 3.2 Rust toolchain (vLLM 0.11 ships a Rust frontend)
+### 4.2 Rust toolchain (vLLM 0.11 ships a Rust frontend)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95 --profile minimal
 source "$HOME/.cargo/env"
 ```
 
-### 3.3 Clone this repo
+### 4.3 Clone this repo
 
 ```bash
 git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
@@ -77,22 +109,23 @@ cd vllm-deepseek-v4-sm89
 # Already = vLLM PR #41834 + SM89 changes; no patch needed.
 ```
 
-### 3.4 Build (compile for Ada 8.9 only; skips the SM90/100 FlashMLA sources)
+### 4.4 Build (compile for Ada 8.9 only; skips the SM90/100 FlashMLA sources)
 
 ```bash
 pip install -U "setuptools>=77,<81" setuptools-rust numpy packaging wheel
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
-export MAX_JOBS=48 NVCC_THREADS=4
+export MAX_JOBS=16 NVCC_THREADS=2
 pip install -e . --no-build-isolation
 ```
 
 > Do **not** install DeepGEMM (unsupported on Ada). It is **expected** that `vllm._flashmla_C` is not built — SM89 bypasses it entirely.
 > If after the build torchvision/torchaudio are the non-cu128 builds you will see `torchvision::nms does not exist`; fix with:
 > `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
+> To produce a distributable wheel: `pip wheel . --no-build-isolation --no-deps -w dist/`.
 
 ---
 
-## 4. Operator smoke test (no full model needed)
+## 5. Operator smoke test (no full model needed)
 
 ```python
 import torch
@@ -109,7 +142,7 @@ print("has_cutedsl:", has_cutedsl())                             # False on SM89
 
 ---
 
-## 5. Deployment (vllm serve)
+## 6. Deployment (vllm serve)
 
 ```bash
 export VLLM_TRITON_MLA_SPARSE=1
@@ -136,15 +169,15 @@ Startup success markers: `Application startup complete.`, and the log shows `Usi
 
 ---
 
-## 6. Test results (4× RTX 4090)
+## 7. Test results (4× RTX 4090)
 
-### 6.1 Inference correctness
+### 7.1 Inference correctness
 ```
 Q: Introduce the Great Wall in one sentence. (in Chinese)
 A: A coherent, accurate one-sentence answer is returned, finish_reason=stop.
 ```
 
-### 6.2 Max context (KV cache)
+### 7.2 Max context (KV cache)
 | max-model-len | max-num-seqs | GMU | GPU KV cache | per-request concurrency | startup |
 |---|---|---|---|---|---|
 | 262,144 (256K) | 16 | 0.97 | 972,374 tok | 3.71x | ✅ |
@@ -155,7 +188,7 @@ Longest input that completed: **768K (786,000 tokens, prefill ~147 s)**. 1M star
 
 Input-length sweep (256K config, all succeeded): 64K (25 s) / 128K (37 s) / 200K (74 s) / 262K (71 s).
 
-### 6.3 Performance (single concurrency, 512 output tokens)
+### 7.3 Performance (single concurrency, 512 output tokens)
 | input | TTFT | prefill | decode |
 |---|---|---|---|
 | 8,192 | 1.97 s | **~4,160 tok/s** | **~82 tok/s** |
@@ -163,7 +196,7 @@ Input-length sweep (256K config, all succeeded): 64K (25 s) / 128K (37 s) / 200K
 
 Decode ~82 tok/s is bounded by Marlin MoE dequantization overhead (no FP4 tensor cores on Ada).
 
-### 6.4 Tool call (`deepseek_v4` parser)
+### 7.4 Tool call (`deepseek_v4` parser)
 ```
 Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 → finish_reason: tool_calls
@@ -172,7 +205,7 @@ Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 
 ---
 
-## 7. Known limitations / risks
+## 8. Known limitations / risks
 
 1. **MoE runs on Marlin**: correctness validated, but performance is below native FP4 MMA — the biggest remaining tuning opportunity.
 2. **Performance is not tuned for the 4090**: the fused_moe / scaled_mm tuned configs only cover RTX PRO 6000 / GB10; the 4090 uses default heuristics (the log prints "Performance might be sub-optimal").
@@ -181,6 +214,6 @@ Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 
 ---
 
-## 8. License / provenance
+## 9. License / provenance
 
 Based on [vllm-project/vllm](https://github.com/vllm-project/vllm) (Apache-2.0) and its PR #41834. This fork keeps the same license. AI-assisted, human-validated.
