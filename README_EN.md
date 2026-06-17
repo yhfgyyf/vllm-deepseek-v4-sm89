@@ -6,7 +6,7 @@
 
 It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM89 (Ada Lovelace: RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**. End-to-end validated on **4× RTX 4090 (48 GB)**: environment setup → operator tests → server startup → inference → performance / tool-calling — all passing.
 
-> ⚠️ Experimental fork, **not intended to be merged upstream**. For self-testing DeepSeek-V4-Flash on Ada GPUs only.
+> ⚠️ Experimental fork. For self-testing DeepSeek-V4-Flash on Ada GPUs only.
 
 ---
 
@@ -33,7 +33,7 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 - `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 path extended to SM89.
 - `vllm/model_executor/layers/sparse_attn_indexer.py` / `v1/attention/backends/mla/indexer.py` — fix the init-time crash in `_sparse_indexer_requires_deep_gemm`; memory budget.
 - `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability` made accurate.
-- **`vllm/utils/import_utils.py` — `has_cutedsl()` returns False on SM89** (CuTe-DSL kernels target sm90+ and emit `mul.bf16x2` / `cvt.bf16.f16` PTX that ptxas rejects on Ada → force the Triton fallback).
+- **`vllm/utils/import_utils.py` — `has_cutedsl()` returns False on SM89**.
 
 > See [`SM89_DEEPSEEK_V4_NOTES.md`](SM89_DEEPSEEK_V4_NOTES.md) for details.
 
@@ -75,13 +75,9 @@ If you hit `torchvision::nms does not exist` (non-cu128 torchvision pulled in):
 pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
 ```
 
-> Do **not** install DeepGEMM (unsupported on Ada). Then jump to [§6 Deployment](#6-deployment-vllm-serve).
-
 ---
 
 ## 4. Build from source (clone this repo)
-
-> A source build is required (this fork carries C/C++ changes, so `VLLM_USE_PRECOMPILED` cannot be used); ~30–50 min. Needed when modifying the code or targeting a different CUDA major version (e.g. cu130).
 
 ### 4.1 Conda env + torch
 
@@ -113,7 +109,7 @@ export MAX_JOBS=16 NVCC_THREADS=2
 pip install -e . --no-build-isolation
 ```
 
-> Do **not** install DeepGEMM (unsupported on Ada). It is **expected** that `vllm._flashmla_C` is not built — SM89 bypasses it entirely.
+> Do **not** install DeepGEMM (unsupported on Ada).
 > If after the build torchvision/torchaudio are the non-cu128 builds you will see `torchvision::nms does not exist`; fix with:
 > `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
 > To produce a distributable wheel: `pip wheel . --no-build-isolation --no-deps -w dist/`.
@@ -153,12 +149,6 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --trust-remote-code --port 8000
 ```
-
-**SM89 must-dos:**
-- Do **not** pass `--kernel-config moe_backend=deep_gemm_mega_moe` (MegaMoE requires SM100); the default `auto` falls back to **Marlin**.
-- Do **not** pass `--attention-backend FLASHINFER_MLA_SPARSE_DSV4` (no Triton fallback there); the default backend works.
-- Do **not** enable `use_fp4_indexer_cache` (FP4 indexer is SM100-only); the default FP8 indexer cache is used.
-- When enabling CUDA graphs (dropping `--enforce-eager`), do **not** set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (incompatible with CUDA graphs — causes an illegal memory access). If memory is tight, lower `--max-num-seqs`.
 
 Startup success markers: `Application startup complete.`, and the log shows `Using 'MARLIN' Mxfp4 MoE backend` / `Using FP8 indexer cache`.
 
