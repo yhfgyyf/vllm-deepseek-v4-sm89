@@ -2,7 +2,7 @@
 
 > 中文版见 [`README.md`](README.md)。
 
-> This repository is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm). The branch already contains **PR #41834** (the SM120 portable Triton path) plus the **SM89/Ada enablement commits**. **Just clone and build** to run DeepSeek-V4-Flash on an RTX 4090 — no patch step required.
+> This repository is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm). The branch already contains **PR #41834** (the SM120 portable Triton path) plus the **SM89/Ada enablement commits**.
 
 It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM89 (Ada Lovelace: RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**. End-to-end validated on **4× RTX 4090 (48 GB)**: environment setup → operator tests → server startup → inference → performance / tool-calling — all passing.
 
@@ -53,15 +53,11 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 
 ## 3. Quick install (prebuilt wheel)
 
-> A prebuilt wheel — **no clone, no compilation**. Use this for deployment; only build from source (§4) if you need to modify the code or target a different CUDA major version.
-
 ```bash
 pip install \
   https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
   --extra-index-url https://download.pytorch.org/whl/cu128
 ```
-
-This pulls in vLLM (prebuilt) + torch 2.11.0+cu128 + all deps — no compilation.
 
 **Requirements (must match the wheel ABI):**
 - **Python 3.12**, Linux x86_64
@@ -79,13 +75,13 @@ If you hit `torchvision::nms does not exist` (non-cu128 torchvision pulled in):
 pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
 ```
 
-> Then jump to [§6 Deployment](#6-deployment-vllm-serve). Do **not** install DeepGEMM (unsupported on Ada).
+> Do **not** install DeepGEMM (unsupported on Ada). Then jump to [§6 Deployment](#6-deployment-vllm-serve).
 
 ---
 
 ## 4. Build from source (clone this repo)
 
-> A source build is required: this fork carries C/C++ changes, so `VLLM_USE_PRECOMPILED` cannot be used. Use this only when modifying the code or targeting a different CUDA major version (e.g. cu130). The build takes ~30–50 min.
+> A source build is required (this fork carries C/C++ changes, so `VLLM_USE_PRECOMPILED` cannot be used); ~30–50 min. Needed when modifying the code or targeting a different CUDA major version (e.g. cu130).
 
 ### 4.1 Conda env + torch
 
@@ -106,7 +102,6 @@ source "$HOME/.cargo/env"
 ```bash
 git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
 cd vllm-deepseek-v4-sm89
-# Already = vLLM PR #41834 + SM89 changes; no patch needed.
 ```
 
 ### 4.4 Build (compile for Ada 8.9 only; skips the SM90/100 FlashMLA sources)

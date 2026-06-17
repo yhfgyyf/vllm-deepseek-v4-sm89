@@ -2,7 +2,7 @@
 
 > English version: [`README_EN.md`](README_EN.md)
 
-> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM89/Ada 适配 commit**。**直接 clone 编译即可在 RTX 4090 上跑 DeepSeek-V4-Flash**，无需再打 patch。
+> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM89/Ada 适配 commit**。
 
 把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
 
@@ -53,15 +53,11 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 
 ## 3. 快速安装(预编译 wheel，免编译)
 
-> 已编译好的 wheel,一条命令装好,**无需 clone、无需编译**。日常部署优先用这个;只有要改代码或换 CUDA 大版本时才走下面第 4 节源码编译。
-
 ```bash
 pip install \
   https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
   --extra-index-url https://download.pytorch.org/whl/cu128
 ```
-
-这一条会把 vLLM(预编译)+ torch 2.11.0+cu128 + 全部依赖一次装好。
 
 **要求(必须匹配 wheel 的 ABI)**:
 - **Python 3.12** · Linux x86_64
@@ -79,13 +75,13 @@ pip install \
 pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
 ```
 
-> 装好直接跳到 [第 6 节「部署」](#6-部署vllm-serve) 起服务。DeepGEMM **不要**装(Ada 不支持)。
+> DeepGEMM **不要**装(Ada 不支持)。装好后看 [第 6 节 部署](#6-部署vllm-serve)。
 
 ---
 
 ## 4. 源码安装(clone 本仓库编译)
 
-> 含 C++ 改动，不能用 `VLLM_USE_PRECOMPILED`;只在要改代码或换 CUDA 大版本(如 cu130)时用。整个编译约 30~50 分钟。
+> 含 C++ 改动，不能用 `VLLM_USE_PRECOMPILED`,整个编译约 30~50 分钟。需要改代码或换 CUDA 大版本(如 cu130)时用。
 
 ### 4.1 conda 环境 + torch
 
@@ -114,7 +110,6 @@ source "$HOME/.cargo/env"
 ```bash
 git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
 cd vllm-deepseek-v4-sm89
-# 本仓库已 = vLLM PR #41834 + SM89 改动，无需再打 patch
 ```
 
 ### 4.4 编译(只为 Ada 8.9 编译，跳过 SM90/100 的 FlashMLA 源码)
