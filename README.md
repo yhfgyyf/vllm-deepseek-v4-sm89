@@ -6,7 +6,7 @@
 
 把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
 
-> ⚠️ 实验性 fork，**不打算合并进上游**。仅供在 Ada 卡上自测 DeepSeek-V4-Flash。
+> ⚠️ 实验性 fork。仅供在 Ada 卡上自测 DeepSeek-V4-Flash。
 
 ---
 
@@ -33,7 +33,7 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 - `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 路径扩到 SM89。
 - `vllm/model_executor/layers/sparse_attn_indexer.py` / `v1/attention/backends/mla/indexer.py` — 修复构造期会崩的 `_sparse_indexer_requires_deep_gemm`、内存预算。
 - `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability` 修准确。
-- **`vllm/utils/import_utils.py` — `has_cutedsl()` 在 SM89 返回 False**(CuTe-DSL 内核 target sm90+，在 Ada 上生成 `mul.bf16x2`/`cvt.bf16.f16` 被 ptxas 拒绝 → 强制走 Triton fallback)。
+- **`vllm/utils/import_utils.py` — `has_cutedsl()` 在 SM89 返回 False**。
 
 > 详见 [`SM89_DEEPSEEK_V4_NOTES.md`](SM89_DEEPSEEK_V4_NOTES.md)。
 
@@ -75,13 +75,9 @@ pip install \
 pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
 ```
 
-> DeepGEMM **不要**装(Ada 不支持)。装好后看 [第 6 节 部署](#6-部署vllm-serve)。
-
 ---
 
 ## 4. 源码安装(clone 本仓库编译)
-
-> 含 C++ 改动，不能用 `VLLM_USE_PRECOMPILED`,整个编译约 30~50 分钟。需要改代码或换 CUDA 大版本(如 cu130)时用。
 
 ### 4.1 conda 环境 + torch
 
@@ -89,8 +85,6 @@ pip install --force-reinstall --no-deps --index-url https://download.pytorch.org
 conda create -n ds python=3.12 -y && conda activate ds
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
-
-> 经验:`download.pytorch.org` 的**大 wheel 走 R2 CDN 很快**，但小依赖(sympy 等)的索引页很慢。可先用 aliyun 装纯 python 依赖，再 `pip install torch==2.11.0 --no-deps`(走缓存)补 nvidia 库。
 
 ### 4.2 Rust 工具链(vLLM 0.11 有 Rust frontend)
 
@@ -121,7 +115,7 @@ export MAX_JOBS=16 NVCC_THREADS=2
 pip install -e . --no-build-isolation
 ```
 
-> DeepGEMM **不要**装(Ada 不支持);`vllm._flashmla_C` 编不出来是**正常的**，SM89 全程绕开它。
+> DeepGEMM **不要**装(Ada 不支持)。
 > 编译完 torchvision/torchaudio 若是非 cu128 版会报 `torchvision::nms does not exist`，修:
 > `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
 > 想打成可分发 wheel:`pip wheel . --no-build-isolation --no-deps -w dist/`。
@@ -162,11 +156,6 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --trust-remote-code --port 8000
 ```
 
-**SM89 必守的几条**:
-- **不要** `--kernel-config moe_backend=deep_gemm_mega_moe`(MegaMoE 要 SM100);默认 `auto` → 自动落 **Marlin**。
-- **不要** `--attention-backend FLASHINFER_MLA_SPARSE_DSV4`(那条没有 Triton fallback);默认后端即可。
-- **不要**开 `use_fp4_indexer_cache`(FP4 indexer 只支持 SM100);默认 FP8 indexer cache。
-- 想开 CUDA graph(去掉 `--enforce-eager`)时:**不要**设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(与 cudagraph 不兼容，会 illegal memory access)。显存吃紧就靠 `--max-num-seqs` 调小。
 
 启动成功标志:`Application startup complete.`，日志里能看到 `Using 'MARLIN' Mxfp4 MoE backend` / `Using FP8 indexer cache`。
 
