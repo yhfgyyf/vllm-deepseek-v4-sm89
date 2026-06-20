@@ -811,6 +811,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    UPCAST_FP8: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -847,6 +848,13 @@ def _w8a8_triton_block_scaled_mm(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
+        if UPCAST_FP8:
+            # Ampere (SM80/SM86) has no FP8 tensor core, so Triton cannot lower
+            # an FP8-operand tl.dot; upcast to bf16 first. Block scales are
+            # applied after the dot, so this is numerically lossless (fp8 e4m3
+            # widens exactly into bf16). FP8-capable archs keep the native dot.
+            a = a.to(tl.bfloat16)
+            b = b.to(tl.bfloat16)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -1002,6 +1010,16 @@ def w8a8_triton_block_scaled_mm(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    # Ampere (SM80/SM86) lacks FP8 tensor cores: upcast FP8 operands to bf16
+    # inside the kernel before the dot. FP8-capable archs (SM89/SM90/SM100/
+    # SM12x) keep the native FP8 tl.dot. Quantized operands (e4m3) only.
+    upcast_fp8 = (
+        current_platform.is_cuda()
+        and not current_platform.supports_fp8()
+        and A.dtype == torch.float8_e4m3fn
+        and B.dtype == torch.float8_e4m3fn
+    )
+
     _w8a8_triton_block_scaled_mm[grid](
         A,
         B,
@@ -1023,6 +1041,7 @@ def w8a8_triton_block_scaled_mm(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        UPCAST_FP8=upcast_fp8,
         **config,
     )
 

@@ -9,12 +9,12 @@ from vllm.utils.torch_utils import direct_register_custom_op
 def _use_tf32_hc_prenorm_gemm() -> bool:
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    # SM12x (Blackwell client) and SM89 (Ada) both use the TF32 TileLang HC
-    # pre-norm GEMM path; only SM90/SM100 have the DeepGEMM variant.
+    # SM12x (Blackwell client) and SM 8.x (Ampere/Ada) both use the TF32
+    # TileLang HC pre-norm GEMM path; only SM90/SM100 have the DeepGEMM variant.
     cp = current_platform
     return (
         cp.is_device_capability_family(120)
-        or (cp.is_cuda() and cp.is_device_capability((8, 9)))
+        or (cp.is_cuda() and cp.is_device_capability_family(80))
         or is_deep_gemm_supported()
     )
 

@@ -84,11 +84,11 @@ def _sparse_indexer_requires_deep_gemm(use_fp4_cache: bool = False) -> bool:
     if not current_platform.is_cuda():
         return False
     if current_platform.is_device_capability_family(120) or (
-        current_platform.is_device_capability((8, 9))
+        current_platform.is_device_capability_family(80)
     ):
-        # SM12x (Blackwell client) and SM89 (Ada) both cover FP8-Q sparse
-        # indexer calls via the portable Triton fallback. FP4-Q indexer calls
-        # still route through DeepGEMM's fp8_fp4 kernels, so fail during
+        # SM12x (Blackwell client) and SM 8.x (Ampere/Ada) both cover FP8-Q
+        # sparse indexer calls via the portable Triton fallback. FP4-Q indexer
+        # calls still route through DeepGEMM's fp8_fp4 kernels, so fail during
         # construction instead of letting the first forward hit the generic
         # DeepGEMM missing-dependency error.
         return use_fp4_cache

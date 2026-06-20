@@ -9,19 +9,20 @@ import torch
 import vllm.envs as envs
 from vllm.platforms import current_platform
 
-
-# Ada Lovelace (SM89) reuses the SM12x portable Triton DeepSeek-V4 path on this
-# branch. Ada has FP8 tensor cores but lacks the SM90/SM100-only FlashMLA +
+# Ampere (SM80/SM86) and Ada Lovelace (SM89) reuse the SM12x portable Triton
+# DeepSeek-V4 path on this branch: they all lack the SM90/SM100-only FlashMLA +
 # DeepGEMM kernels, so attention / indexer / einsum / MHC must run the same
-# Triton fallbacks as SM12x. NOTE: the MoE FP4 expert GEMM is NOT covered here
-# (Ada has no FP4 tensor cores); it falls back to the Marlin WNA16 backend.
-_SM89_CAPABILITY = (8, 9)
+# Triton fallbacks as SM12x. Ada has FP8 tensor cores; Ampere (8.0/8.6) does
+# not, so the FP8 Triton kernels upcast to bf16 before the MMA (gated on
+# supports_fp8()). NOTE: the MoE FP4 expert GEMM is NOT covered here (no SM 8.x
+# has FP4 tensor cores); it falls back to the Marlin WNA16 backend.
+_SM8X_FAMILY = 80
 
 
-def is_ada_sm89() -> bool:
-    """True iff the current CUDA device is exactly SM89 (Ada Lovelace)."""
-    return current_platform.is_cuda() and current_platform.is_device_capability(
-        _SM89_CAPABILITY
+def is_ampere_or_ada() -> bool:
+    """True iff the current CUDA device is SM 8.x (Ampere 8.0/8.6 or Ada 8.9)."""
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        _SM8X_FAMILY
     )
 
 
@@ -36,9 +37,9 @@ def _device_capability_tuple(device: torch.device):
     return current_platform.get_device_capability(device_id=index)
 
 
-def _is_sm89_device(device: torch.device) -> bool:
+def _is_ampere_or_ada_device(device: torch.device) -> bool:
     capability = _device_capability_tuple(device)
-    return capability is not None and tuple(capability) == _SM89_CAPABILITY
+    return capability is not None and capability[0] == 8
 
 
 def _is_sm12x_device(device: torch.device) -> bool:
@@ -47,8 +48,8 @@ def _is_sm12x_device(device: torch.device) -> bool:
 
 
 def _is_triton_fallback_device(device: torch.device) -> bool:
-    """SM12x (Blackwell client) or SM89 (Ada): the portable Triton path."""
-    return _is_sm12x_device(device) or _is_sm89_device(device)
+    """SM12x (Blackwell client) or SM 8.x (Ampere/Ada): the portable Triton path."""
+    return _is_sm12x_device(device) or _is_ampere_or_ada_device(device)
 
 
 def triton_sparse_mla_configured() -> bool | None:
@@ -59,7 +60,7 @@ def is_triton_sparse_mla_enabled_for_platform() -> bool:
     configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
-    return current_platform.is_device_capability_family(120) or is_ada_sm89()
+    return current_platform.is_device_capability_family(120) or is_ampere_or_ada()
 
 
 def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
@@ -91,7 +92,7 @@ def triton_sparse_mla_prefill_topk_chunk_size(
     if os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE") is not None:
         return min(combined_topk_size, configured_topk)
     if (
-        current_platform.is_device_capability_family(120) or is_ada_sm89()
+        current_platform.is_device_capability_family(120) or is_ampere_or_ada()
     ) and compress_ratio == 128:
         if request_count > 1 and combined_topk_size > 1024:
             configured_topk = min(configured_topk, 256)
@@ -115,4 +116,4 @@ def triton_sparse_mla_matmul_decode_enabled() -> bool:
     configured = envs.VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE
     if configured is not None:
         return configured
-    return current_platform.is_device_capability_family(120) or is_ada_sm89()
+    return current_platform.is_device_capability_family(120) or is_ampere_or_ada()

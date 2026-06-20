@@ -35,12 +35,12 @@ logger = init_logger(__name__)
 
 def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
     if is_sm12x is None:
-        # SM89 (Ada) uses the same portable Triton path as SM12x, so it shares
-        # the smaller 256 MB transient-logits budget rather than the SM90/SM100
-        # default.
+        # SM 8.x (Ampere/Ada) uses the same portable Triton path as SM12x, so it
+        # shares the smaller 256 MB transient-logits budget rather than the
+        # SM90/SM100 default.
         is_sm12x = current_platform.is_cuda() and (
             current_platform.is_device_capability_family(120)
-            or current_platform.is_device_capability((8, 9))
+            or current_platform.is_device_capability_family(80)
         )
     if "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB" in os.environ:
         return envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024

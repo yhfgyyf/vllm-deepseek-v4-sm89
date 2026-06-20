@@ -199,11 +199,11 @@ def _use_deepseek_v4_sm12x_triton_fp8_einsum(
 ) -> bool:
     capability = current_platform.get_device_capability()
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    # SM12x (major 12) and SM89/Ada (8.9) both use the Triton FP8 einsum here:
-    # they lack the SM90/SM100-only DeepGEMM fp8_einsum kernel.
-    is_supported_arch = capability is not None and (
-        capability.major == 12 or (capability.major, capability.minor) == (8, 9)
-    )
+    # SM12x (major 12) and SM 8.x (Ampere/Ada) both use the Triton FP8 einsum
+    # here: they lack the SM90/SM100-only DeepGEMM fp8_einsum kernel. Ampere
+    # (8.0/8.6) has no FP8 tensor core, so the kernel upcasts FP8->bf16 first
+    # (UPCAST_FP8, gated on `not is_device_capability_family(120)`).
+    is_supported_arch = capability is not None and capability.major in (8, 12)
     return (
         is_supported_arch
         and equation == "bhr,hdr->bhd"

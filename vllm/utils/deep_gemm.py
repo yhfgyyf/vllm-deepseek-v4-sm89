@@ -376,12 +376,12 @@ def fp8_fp4_mega_moe(*args, **kwargs):
 
 
 def _use_sm12x_mqa_fallback() -> bool:
-    """SM12x (Blackwell client) or SM89 (Ada): route the DeepGEMM-only MQA /
-    HC GEMM entry points to the portable Triton/torch fallbacks instead of
+    """SM12x (Blackwell client) or SM 8.x (Ampere/Ada): route the DeepGEMM-only
+    MQA / HC GEMM entry points to the portable Triton/torch fallbacks instead of
     DeepGEMM, which is only built for Hopper/Blackwell-datacenter GPUs."""
     cp = current_platform
     return cp.is_device_capability_family(120) or (
-        cp.is_cuda() and cp.is_device_capability((8, 9))
+        cp.is_cuda() and cp.is_device_capability_family(80)
     )
 
 
@@ -394,11 +394,7 @@ def fp8_fp4_mqa_topk_indices(
     topk_indices: torch.Tensor,
 ) -> bool:
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
-    if not (
-        current_platform.is_cuda()
-        and _use_sm12x_mqa_fallback()
-        and q[1] is None
-    ):
+    if not (current_platform.is_cuda() and _use_sm12x_mqa_fallback() and q[1] is None):
         return False
     from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
 
@@ -522,11 +518,7 @@ def fp8_fp4_paged_mqa_topk_indices(
     topk_indices: torch.Tensor,
 ) -> bool:
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
-    if not (
-        current_platform.is_cuda()
-        and _use_sm12x_mqa_fallback()
-        and q[1] is None
-    ):
+    if not (current_platform.is_cuda() and _use_sm12x_mqa_fallback() and q[1] is None):
         return False
     from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
 

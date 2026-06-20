@@ -16,11 +16,11 @@ _SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 8192
 
 
 def _use_sm12x_fallback() -> bool:
-    """SM12x (Blackwell client) or SM89 (Ada): both run these portable Triton/
-    torch fallbacks in place of the DeepGEMM-only kernels."""
+    """SM12x (Blackwell client) or SM 8.x (Ampere/Ada): both run these portable
+    Triton/torch fallbacks in place of the DeepGEMM-only kernels."""
     cp = current_platform
     return cp.is_device_capability_family(120) or (
-        cp.is_cuda() and cp.is_device_capability((8, 9))
+        cp.is_cuda() and cp.is_device_capability_family(80)
     )
 
 
@@ -393,11 +393,7 @@ def fp8_fp4_mqa_topk_indices(
     topk_indices: torch.Tensor,
 ) -> bool:
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
-    if not (
-        current_platform.is_cuda()
-        and _use_sm12x_fallback()
-        and q[1] is None
-    ):
+    if not (current_platform.is_cuda() and _use_sm12x_fallback() and q[1] is None):
         return False
     if _fp8_mqa_logits_topk_triton(
         q,
