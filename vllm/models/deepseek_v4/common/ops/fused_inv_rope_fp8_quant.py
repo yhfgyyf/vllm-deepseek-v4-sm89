@@ -9,6 +9,9 @@ INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layo
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -105,7 +108,9 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    # Ampere lacks the fp8e4nv type; encode e4m3 bytes and store via a uint8
+    # view of the output (passed by the launcher; identical 1-byte strides).
+    x_quant = _f32_to_e4m3_uint8(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
 
     fp8_base = (
         fp8_ptr
@@ -252,7 +257,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         o,
         positions,
         cos_sin_cache,
-        fp8_buf,
+        fp8_buf.view(torch.uint8),
         scale_buf,
         num_tokens,
         heads_per_group=heads_per_group,

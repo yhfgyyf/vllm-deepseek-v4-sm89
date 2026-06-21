@@ -133,10 +133,64 @@ def check_o_proj_einsum() -> None:
     print("  [OK] o_proj FP8 einsum DECODE_E4M3\n")
 
 
+def check_e4m3_encode_decode() -> None:
+    """Round-trip the in-Triton e4m3 encoder/decoder against torch's fp8 cast.
+    The encoder backs every fp8-producing DSv4 quant kernel on Ampere."""
+    import triton
+    import triton.language as tl
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        _e4m3_uint8_to_f32,
+        _f32_to_e4m3_uint8,
+    )
+
+    @triton.jit
+    def _roundtrip_kernel(x_ptr, enc_ptr, dec_ptr, n, BLOCK: tl.constexpr):
+        off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = off < n
+        x = tl.load(x_ptr + off, mask=mask, other=0.0)
+        bits = _f32_to_e4m3_uint8(x)
+        tl.store(enc_ptr + off, bits, mask=mask)
+        tl.store(dec_ptr + off, _e4m3_uint8_to_f32(bits), mask=mask)
+
+    dev = "cuda"
+    # Cover normals, subnormals, saturation, both signs.
+    x = torch.cat(
+        [
+            torch.linspace(-460, 460, 4096, device=dev),
+            torch.logspace(-9, 2.65, 2048, base=2, device=dev),
+            -torch.logspace(-9, 2.65, 2048, base=2, device=dev),
+        ]
+    ).contiguous()
+    n = x.numel()
+    enc = torch.empty(n, dtype=torch.uint8, device=dev)
+    dec = torch.empty(n, dtype=torch.float32, device=dev)
+    _roundtrip_kernel[(triton.cdiv(n, 256),)](x, enc, dec, n, BLOCK=256)
+
+    # torch reference: quantize to fp8 then read back bytes + value.
+    ref_fp8 = x.to(torch.float8_e4m3fn)
+    ref_bytes = ref_fp8.view(torch.uint8)
+    ref_val = ref_fp8.to(torch.float32)
+
+    byte_match = (enc == ref_bytes).float().mean().item()
+    # Decode must match torch's fp8 value exactly where bytes agree.
+    val_diff = (dec - ref_val).abs()
+    rel = val_diff / (ref_val.abs() + 1e-3)
+    print(
+        f"e4m3 codec     byte_match={byte_match * 100:.1f}%  "
+        f"decode_max_rel={rel.max().item():.4f}"
+    )
+    # >=99% exact bytes (sub-ulp RNE-vs-round-half ties differ); decode tight.
+    assert byte_match > 0.99, f"e4m3 encode byte match too low: {byte_match}"
+    assert rel.max().item() < 0.02, f"e4m3 decode rel error too high: {rel.max()}"
+    print("  [OK] e4m3 encode/decode round-trip\n")
+
+
 def main() -> None:
     if not current_platform.is_cuda():
         raise SystemExit("CUDA device required")
     check_gates()
+    check_e4m3_encode_decode()
     check_block_fp8_gemm()
     check_o_proj_einsum()
     print("ALL SM80 OP CHECKS PASSED")

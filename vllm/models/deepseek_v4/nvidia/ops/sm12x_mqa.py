@@ -4,6 +4,9 @@
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _e4m3_uint8_to_f32,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -95,19 +98,24 @@ def _fp8_mqa_logits_kernel(
         scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = tl.load(
-                q_ptr
-                + offs_m[:, None] * stride_qm
-                + h * stride_qh
-                + d[None, :] * stride_qd,
-                mask=valid_m[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
-                k_ptr + offs_n[:, None] * stride_kn + d[None, :] * stride_kd,
-                mask=valid_n[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
+            # q/k arrive as uint8 e4m3 bytes (Ampere lacks fp8e4nv); decode.
+            q = _e4m3_uint8_to_f32(
+                tl.load(
+                    q_ptr
+                    + offs_m[:, None] * stride_qm
+                    + h * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_m[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+            )
+            k = _e4m3_uint8_to_f32(
+                tl.load(
+                    k_ptr + offs_n[:, None] * stride_kn + d[None, :] * stride_kd,
+                    mask=valid_n[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+            )
             scores += tl.dot(q, tl.trans(k), input_precision="tf32")
         scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
         weighted = tl.maximum(scores * scale[None, :], 0.0)
@@ -137,6 +145,9 @@ def fp8_mqa_logits_triton(
     k_fp8, scale = kv
     num_q, num_heads, head_dim = q.shape
     seq_len_kv = k_fp8.shape[0]
+    # Ampere lacks the fp8e4nv type; the kernels decode e4m3 from uint8.
+    q = q.view(torch.uint8)
+    k_fp8 = k_fp8.view(torch.uint8)
     logits = torch.empty(
         (num_q, seq_len_kv),
         device=q.device,
@@ -257,23 +268,27 @@ def _fp8_paged_mqa_logits_kernel(
         scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = tl.load(
-                q_ptr
-                + batch[:, None] * stride_qb
-                + q_pos[:, None] * stride_qn
-                + h * stride_qh
-                + d[None, :] * stride_qd,
-                mask=valid_m[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
-                kv_ptr
-                + block_idx[:, :, None] * stride_kvb
-                + block_offset[None, :, None] * stride_kvs
-                + d[None, None, :] * stride_kvd,
-                mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
+            q = _e4m3_uint8_to_f32(
+                tl.load(
+                    q_ptr
+                    + batch[:, None] * stride_qb
+                    + q_pos[:, None] * stride_qn
+                    + h * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_m[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+            )
+            k = _e4m3_uint8_to_f32(
+                tl.load(
+                    kv_ptr
+                    + block_idx[:, :, None] * stride_kvb
+                    + block_offset[None, :, None] * stride_kvs
+                    + d[None, None, :] * stride_kvd,
+                    mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
+                    other=0,
+                )
+            )
             scores += tl.sum(q[:, None, :] * k, axis=2)
         weighted = tl.maximum(scores * scale, 0.0)
         weight = tl.load(
@@ -385,23 +400,27 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = tl.load(
-                q_ptr
-                + batch * stride_qb
-                + q_pos * stride_qn
-                + heads[:, None] * stride_qh
-                + d[None, :] * stride_qd,
-                mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
-                kv_ptr
-                + block_idx[None, :] * stride_kvb
-                + block_offset[None, :] * stride_kvs
-                + d[:, None] * stride_kvd,
-                mask=context_mask[None, :] & (d[:, None] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
+            q = _e4m3_uint8_to_f32(
+                tl.load(
+                    q_ptr
+                    + batch * stride_qb
+                    + q_pos * stride_qn
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+            )
+            k = _e4m3_uint8_to_f32(
+                tl.load(
+                    kv_ptr
+                    + block_idx[None, :] * stride_kvb
+                    + block_offset[None, :] * stride_kvs
+                    + d[:, None] * stride_kvd,
+                    mask=context_mask[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+            )
             scores += tl.dot(q, k, input_precision="tf32")
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
@@ -442,6 +461,9 @@ def fp8_paged_mqa_logits_rowwise_triton(
     batch_size, next_n, num_heads, head_dim = q.size()
     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
     _, block_size, _, _ = kv_values.size()
+    # Ampere lacks the fp8e4nv type; the kernel decodes e4m3 from uint8.
+    q = q.view(torch.uint8)
+    kv_values = kv_values.view(torch.uint8)
     num_rows = batch_size * next_n
     if token_count is None:
         token_count = max_model_len - token_start
@@ -532,6 +554,9 @@ def fp8_paged_mqa_logits_triton(
 
     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
     _, block_size, _, _ = kv_values.size()
+    # Ampere lacks the fp8e4nv type; the kernel decodes e4m3 from uint8.
+    q = q.view(torch.uint8)
+    kv_values = kv_values.view(torch.uint8)
     num_rows = batch_size * next_n
     if token_count is None:
         token_count = max_model_len - token_start

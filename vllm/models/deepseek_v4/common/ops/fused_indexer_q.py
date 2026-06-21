@@ -3,6 +3,9 @@
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
@@ -138,16 +141,16 @@ def _fused_indexer_q_rope_quant_kernel(
     if INDEX_Q_NOPE_DIM > 0:
         tl.store(
             fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
+            _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale)),
         )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
     tl.store(
         fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
+        _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale)),
     )
     tl.store(
         fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
+        _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale)),
     )
 
     # FP8 weight-fold contract:
@@ -423,7 +426,9 @@ def fused_indexer_q_rope_quant(
             index_q_cos_sin_cache,
             index_q_cos_sin_cache.stride(0),
             index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
+            # Ampere lacks the fp8e4nv type; the kernel encodes e4m3 bytes and
+            # stores through a uint8 view (same 1-byte strides).
+            index_q_fp8.view(torch.uint8),
             index_q_fp8.stride(0),
             index_q_fp8.stride(1),
             index_q_head_dim,
