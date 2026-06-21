@@ -26,7 +26,11 @@ The portable Triton path was already written to **dequantize FP8 -> TF32/bf16
 before every matmul**, and Ampere has TF32 + bf16 tensor cores. So the attention
 / indexer / einsum / MHC kernels run on SM80 unchanged once the capability gates
 are widened. The only genuinely FP8-tensor-core-dependent kernels are the two
-that use a native FP8 `tl.dot`; both are now given a bf16-upcast path.
+that feed a native FP8 `tl.dot`. On Ampere these need more than a bf16 upcast:
+Triton **cannot even represent `fp8e4nv`** on SM80 (`ValueError: type fp8e4nv
+not supported in this architecture`), so the operand cannot be loaded as fp8 at
+all. The fix bitcasts the e4m3 bytes to `uint8` and decodes them to bf16
+in-register (`DECODE_E4M3`); e4m3 widens exactly into bf16, so it is lossless.
 
 What is still NOT covered (hardware wall, same as SM89): the MoE FP4 expert GEMM.
 No SM 8.x has FP4 tensor cores, so the experts fall back to **Marlin WNA16**
@@ -56,8 +60,8 @@ subset and is preserved. 8 sites:
 - `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability()` now
   accepts `major == 8`.
 - `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py` — `_use_..._triton_fp8_einsum`
-  accepts `major in (8, 12)`. The existing `upcast_fp8 = not family(120)` already
-  fires on SM80.
+  accepts `major in (8, 12)`; the o_proj einsum kernel also gets the `DECODE_E4M3`
+  path (see B) since Ada/SM12x can load fp8 but Ampere cannot.
 - `vllm/utils/import_utils.py` — `has_cutedsl()` returns False on all SM 8.x
   (CuTe-DSL targets SM90+ and emits PTX ptxas rejects on Ampere/Ada).
 
@@ -68,19 +72,22 @@ DeepSeek-V4-Flash quantizes **all dense + attention linears to FP8 block (128)**
 for linear/attention layers"*). On SM80 the block-FP8 kernel priority list
 (`kernels/linear/__init__.py::_POSSIBLE_FP8_BLOCK_KERNELS`) resolves to the
 **Triton** backend (DeepGEMM/FlashInfer/Cutlass-block need SM90+; Marlin
-explicitly rejects block-FP8), whose kernel `_w8a8_triton_block_scaled_mm` does a
-**native FP8 `tl.dot`** — which Ampere cannot lower.
+explicitly rejects block-FP8), whose kernel `_w8a8_triton_block_scaled_mm` feeds a
+**native FP8 `tl.dot`**. On Ampere this fails to compile entirely:
+`ValueError: type fp8e4nv not supported in this architecture` — the fp8 operand
+cannot even be loaded.
 
-Fix (same pattern as the o_proj einsum): add an `UPCAST_FP8` constexpr to
-`_w8a8_triton_block_scaled_mm` and upcast both operands to bf16 before the dot.
-The launcher `w8a8_triton_block_scaled_mm` sets
-`upcast_fp8 = is_cuda and not supports_fp8() and A/B are e4m3`, so SM89/SM90/
-SM100/SM12x keep the native FP8 dot unchanged and only Ampere upcasts. Block
-scales are applied after the dot, so the upcast is numerically lossless.
-File: `vllm/model_executor/layers/quantization/utils/fp8_utils.py`.
+Fix (`vllm/model_executor/layers/quantization/utils/fp8_utils.py`): the launcher
+bitcasts the e4m3 operands to `uint8` (`A.view(torch.uint8)`) and the kernel
+decodes them with a shared `_e4m3_uint8_to_f32` helper, casting the result to
+bf16 before the dot (`DECODE_E4M3` constexpr). The gate is
+`not supports_fp8() and A/B are e4m3`, so SM89/SM90/SM100/SM12x keep the native
+FP8 dot unchanged and only Ampere decodes. Block scales apply after the dot, so
+it is numerically lossless (validated: max_rel ~0.006 vs bf16 reference).
 
 This single kernel covers every dense/attention linear (q_proj, kv_a/kv_b,
-o_proj dense GEMM, shared expert, the compressor's fused_wqa_wkv) at once.
+o_proj dense GEMM, shared expert, the compressor's fused_wqa_wkv) at once. The
+o_proj FP8 einsum (`fp8_einsum.py`) gets the same `DECODE_E4M3` decode path.
 
 ### Verified safe without changes
 - Sparse-MLA attention (`sparse_mla_kernels.py`): `tl.dot(q, kv)` operands are
@@ -120,8 +127,10 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The script checks (1) the SM80 gates report enabled, (2) `has_cutedsl()` is
-False, (3) the block-FP8 Triton GEMM with `UPCAST_FP8` matches a bf16 dequant
-reference within tolerance — this is the B-1 fix and the highest-risk path.
+False, (3) the block-FP8 Triton GEMM with `DECODE_E4M3` matches a bf16 dequant
+reference, (4) the o_proj FP8 einsum matches its reference. Validated on
+A100 80GB: gates OK, block-FP8 max_rel ~0.006, o_proj einsum max_rel ~0.0 —
+**ALL SM80 OP CHECKS PASSED**.
 
 ---
 
@@ -146,12 +155,14 @@ Same launch-flag rules as SM89: do NOT pass `moe_backend=deep_gemm_mega_moe`,
 
 ## Known risks to watch during testing
 
-1. **Block-FP8 GEMM `UPCAST_FP8`** — the dense/attention workhorse. Validate
-   `test_sm80_ops.py` passes before trusting outputs.
-2. **o_proj FP8 einsum** — also upcasts; if o_proj is wrong, confirm the
-   `UPCAST_FP8` branch fired.
-3. **Marlin MoE FP4 experts** — same correctness/perf risk as SM89.
+1. **Block-FP8 GEMM `DECODE_E4M3`** — the dense/attention workhorse.
+   `test_sm80_ops.py` passes (validated on A100). Re-run before trusting outputs
+   on any new SM80 box.
+2. **o_proj FP8 einsum `DECODE_E4M3`** — validated (max_rel ~0.0). If o_proj is
+   wrong, confirm the `DECODE_E4M3` branch fired (not the SM89 upcast branch).
+3. **Marlin MoE FP4 experts** — same correctness/perf risk as SM89; only
+   exercised end-to-end during `vllm serve`, not by the op test.
 4. **Perf is untuned** — no Ampere fused_moe / scaled_mm tuned configs; default
-   heuristics. The bf16-upcast block GEMM is slower than native FP8 MMA.
-5. **bf16 throughput on A100** is good, but the FP8->bf16 upcast doubles operand
-   read bandwidth in the block GEMM; expect lower tok/s than SM89.
+   heuristics. The e4m3-decode block GEMM is slower than native FP8 MMA.
+5. **bf16 throughput on A100** is good, but the e4m3->bf16 decode adds per-tile
+   ALU work and reads operands as uint8; expect lower tok/s than SM89.
