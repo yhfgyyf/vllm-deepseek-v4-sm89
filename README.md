@@ -1,20 +1,20 @@
-# DeepSeek-V4-Flash on SM89 (Ada / RTX 4090) — vLLM fork
+# DeepSeek-V4-Flash on SM80 / SM86 / SM89 — vLLM fork
 
 > English version: [`README_EN.md`](README_EN.md)
 
-> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM89/Ada 适配 commit**。
+> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM80 / SM86 / SM89 适配 commit**。
 
-把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
+把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM80 / SM86 / SM89**，覆盖 Ampere 和 Ada GPU，例如 A100、RTX 3090、A10/A40、RTX 4090、L40/L40S/L4、RTX 6000 Ada。
 
-> ⚠️ 实验性 fork。仅供在 Ada 卡上自测 DeepSeek-V4-Flash。
+> ⚠️ 实验性 fork。仅供在 SM80 / SM86 / SM89 GPU 上自测 DeepSeek-V4-Flash。
 
 ---
 
 ## 1. 背景:为什么需要这个 fork
 
-DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 专家 MoE + mHC。上游默认走 **FlashMLA + DeepGEMM**(只编译 Hopper / 数据中心 Blackwell)。PR #41834 为 **SM120(消费级 Blackwell)** 引入了一套**可移植 Triton 路径**替代这些内核;本 fork 在其之上把这套路径进一步放开到 **SM89**。
+DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 专家 MoE + mHC。上游默认走 **FlashMLA + DeepGEMM**(只编译 Hopper / 数据中心 Blackwell)。PR #41834 为 **SM120(消费级 Blackwell)** 引入了一套**可移植 Triton 路径**替代这些内核;本 fork 在其之上把这套路径进一步放开到 **SM80 / SM86 / SM89**。
 
-| 子系统 | 上游(SM90/100) | SM89(本 fork) |
+| 子系统 | 上游(SM90/100) | SM80 / SM86 / SM89(本 fork) |
 |---|---|---|
 | Sparse MLA attention | FlashMLA sparse | **Triton**(PR #41834 可移植内核) |
 | Lightning Indexer(FP8 MQA logits) | DeepGEMM | **Triton / torch fallback** |
@@ -23,70 +23,45 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 | MoE(FP4 专家) | DeepGEMM / FlashInfer-CUTLASS FP4 | **Marlin WNA16**(FP4→FP16 反量化) |
 | Indexer Q rope+quant / KV dequant | **CuTe-DSL** | **Triton/torch fallback** |
 
-**硬件事实**:Ada 有 FP8 张量核，但**没有 FP4 张量核、没有硬件 microscaling MMA**，所以 FP4 MoE 只能走 Marlin 反量化(比原生 FP4 MMA 慢)。
+**硬件事实**:SM80 / SM86 没有原生 FP8 张量核;SM89 有 FP8 张量核，但没有 FP4 张量核、没有硬件 microscaling MMA。因此本 fork 在这些 GPU 上使用 Triton / torch fallback 和 Marlin WNA16 路径替代 DeepGEMM / FlashInfer FP4 内核。
 
-### SM89 相关改动(相对 PR #41834，10 文件 +294/-26)
+### SM80 / SM86 / SM89 相关改动
 
-- `vllm/v1/attention/backends/mla/sparse_mla_env.py` — 中央开关 `is_ada_sm89()`，把 SM89 并入 Triton 稀疏 MLA 路径。
-- `vllm/utils/deep_gemm.py` / `models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py` — MQA logits / HC GEMM fallback dispatch 扩到 SM89。
-- `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py` — Triton FP8 einsum 扩到 SM89 + FP8 `tl.dot` 的 bf16 upcast。
-- `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 路径扩到 SM89。
+- `vllm/v1/attention/backends/mla/sparse_mla_env.py` — 把 SM80 / SM86 / SM89 并入 Triton 稀疏 MLA 路径。
+- `vllm/utils/deep_gemm.py` / `models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py` — MQA logits / HC GEMM fallback dispatch 扩到 SM80 / SM86 / SM89。
+- `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py` — Triton FP8 einsum 扩到 SM80 / SM86 / SM89，并保留 bf16 B 路径。
+- `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 路径扩到 SM80 / SM86 / SM89。
 - `vllm/model_executor/layers/sparse_attn_indexer.py` / `v1/attention/backends/mla/indexer.py` — 修复构造期会崩的 `_sparse_indexer_requires_deep_gemm`、内存预算。
 - `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability` 修准确。
-- **`vllm/utils/import_utils.py` — `has_cutedsl()` 在 SM89 返回 False**。
+- **`vllm/utils/import_utils.py` — `has_cutedsl()` 在 SM80 / SM86 / SM89 返回 False**。
+- FP8 linear / MoE 路径在 SM80 / SM86 上使用 Marlin W8A16，避免无原生 FP8 MMA 时的软件解码 GEMM。
 
 > 详见 [`SM89_DEEPSEEK_V4_NOTES.md`](SM89_DEEPSEEK_V4_NOTES.md)。
 
 ---
 
-## 2. 已验证环境
+## 2. 适配硬件与已验证环境
 
 | 项 | 版本 |
 |---|---|
-| GPU | 4× RTX 4090 (48GB) · compute capability **8.9** |
+| 适配 GPU | **SM80**(A100), **SM86**(RTX 3090 / A10 / A40), **SM89**(RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada) |
 | 驱动 / CUDA toolkit | 595.x / **CUDA 12.8**(nvcc 12.8) |
 | Python | 3.12(conda) |
 | torch | **2.11.0+cu128** |
-| vLLM | 本 fork = **0.11.1**(PR #41834 base `5be22eb` + SM89 改动)，源码编译 |
+| vLLM | 本 fork = **0.11.1**(PR #41834 base + SM80 / SM86 / SM89 改动)，源码编译 |
 
 ---
 
-## 3. 快速安装(预编译 wheel，免编译)
+## 3. 源码安装(clone 本仓库编译)
 
-```bash
-pip install \
-  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
-  --extra-index-url https://download.pytorch.org/whl/cu128
-```
-
-**要求(必须匹配 wheel 的 ABI)**:
-- **Python 3.12** · Linux x86_64
-- NVIDIA **Ada(SM89,如 RTX 4090)** + 支持 **CUDA 12.8** 的驱动(机器上装着 12.9 / 13.x 驱动也行,向后兼容)
-- wheel 链接的是 `libcudart.so.12`,所以 **任意 CUDA 12.x(12.8/12.9)都能跑**;若用 **CUDA 13 / +cu130 的 torch** 会报 `libcudart.so.12: cannot open shared object file` —— 那种情况只能走第 4 节源码重编。
-
-> 想 100% 锁定 cu128(避免 pip 偶尔从 PyPI 挑到别的 torch 变体),分两步更稳:
-> ```bash
-> pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-> pip install https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl
-> ```
-
-装完若报 `torchvision::nms does not exist`(被装成了非 cu128 版):
-```bash
-pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
-```
-
----
-
-## 4. 源码安装(clone 本仓库编译)
-
-### 4.1 conda 环境 + torch
+### 3.1 conda 环境 + torch
 
 ```bash
 conda create -n ds python=3.12 -y && conda activate ds
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 4.2 Rust 工具链(vLLM 0.11 有 Rust frontend)
+### 3.2 Rust 工具链(vLLM 0.11 有 Rust frontend)
 
 ```bash
 export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
@@ -99,26 +74,43 @@ source "$HOME/.cargo/env"
 #   registry = "sparse+https://rsproxy.cn/index/"
 ```
 
-### 4.3 clone 本仓库
+### 3.3 clone 本仓库
 
 ```bash
-git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
-cd vllm-deepseek-v4-sm89
+git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm80-sm86-sm89.git
+cd vllm-deepseek-v4-sm80-sm86-sm89
+git checkout sm80-deepseek-v4-flash
 ```
 
-### 4.4 编译(只为 Ada 8.9 编译，跳过 SM90/100 的 FlashMLA 源码)
+### 3.4 编译
 
 ```bash
 pip install -U "setuptools>=77,<81" setuptools-rust numpy packaging wheel
-export TORCH_CUDA_ARCH_LIST="8.9+PTX"
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9+PTX"
 export MAX_JOBS=16 NVCC_THREADS=2
 pip install -e . --no-build-isolation
 ```
 
-> DeepGEMM **不要**装(Ada 不支持)。
+> 如果只在单一 GPU 架构上部署，可以把 `TORCH_CUDA_ARCH_LIST` 缩小到目标架构，例如 A100 用 `8.0`，RTX 3090 用 `8.6`，RTX 4090 / L40 用 `8.9+PTX`。
+> DeepGEMM **不要**装(SM80 / SM86 / SM89 不走该路径)。
 > 编译完 torchvision/torchaudio 若是非 cu128 版会报 `torchvision::nms does not exist`，修:
 > `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
-> 想打成可分发 wheel:`pip wheel . --no-build-isolation --no-deps -w dist/`。
+
+---
+
+## 4. 可选:构建本地 wheel
+
+```bash
+pip wheel . --no-build-isolation --no-deps -w dist/
+```
+
+安装自己构建的 wheel:
+
+```bash
+pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+当前分支更新频繁，建议优先从源码安装;只有在你自己构建并发布了匹配 SM80 / SM86 / SM89 的 wheel 后，再使用预编译 wheel 安装。
 
 ---
 
