@@ -57,21 +57,23 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
-        # Marlin's per-channel scale layout cannot serve block-FP8 layers
-        # (weight_scale_inv shape [N_blocks_n, N_blocks_k]).
-        # csrc/quantization/marlin/marlin.cu fires
-        # ``TORCH_CHECK(b_scales.size(1) == size_n, ...)`` for any layer
-        # where the block-quant scales arrive in their raw 2-D layout.
-        # Even when VLLM_TEST_FORCE_FP8_MARLIN=1 is set (which downstream
-        # operators do for NVFP4-MoE on SM 12.0 / RTX PRO 6000 Blackwell),
-        # block-FP8 attention compressor layers like DSv4 fused_wqa_wkv
-        # must fall through to the next supported kernel in
-        # ``_POSSIBLE_FP8_BLOCK_KERNELS[CUDA]`` (typically the Triton
-        # block-FP8 path).
         if c.activation_quant_key.scale.group_shape.is_per_group():
+            # Block-FP8 (per-group activation). On GPUs without FP8 tensor
+            # cores (SM<89) the native block kernels (DeepGEMM/CUTLASS) are
+            # unavailable and the Triton fallback decodes e4m3 in software
+            # (~100x below peak). Marlin can serve these layers as weight-only
+            # W8A16: ``prepare_fp8_layer_for_marlin`` expands the
+            # ``[N/128, K/128]`` block scales to group-128 along K (every N in
+            # a block shares one scale, so the expansion is exact) and the
+            # activation stays bf16 -- both faster and more accurate than the
+            # Triton software-decode path. On SM>=89 keep falling through to
+            # the native FP8 block kernels.
+            cap = current_platform.get_device_capability()
+            if cap is not None and cap.to_int() < 89:
+                return True, None
             return False, (
-                "MarlinFP8 cannot serve block-FP8 layers; falling "
-                "through to the next kernel in the priority list."
+                "MarlinFP8 serves block-FP8 only on SM<89 (W8A16 fallback); "
+                "falling through to the native FP8 block kernels."
             )
         return True, None
 

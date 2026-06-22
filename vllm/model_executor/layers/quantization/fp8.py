@@ -53,6 +53,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
     process_fp8_input_tensor_strategy_moe,
+    process_fp8_weight_block_strategy,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
     validate_fp8_block_shape,
@@ -393,6 +394,23 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self.use_marlin and getattr(layer, "is_bmm", False):
+            # DSv4 o_proj `wo_a` is consumed by a fused per-group einsum that
+            # reads its raw FP8 weight directly (apply_weights is bypassed).
+            # Marlin would repack the weight into its opaque int32 layout and
+            # break that einsum, so keep `wo_a` in the [N, K] block-FP8 layout
+            # (the einsum decodes e4m3 itself) and disable marlin for it. This
+            # matches the pre-marlin block-kernel path exactly.
+            assert self.block_quant
+            weight, weight_scale_inv = process_fp8_weight_block_strategy(
+                layer.weight, layer.weight_scale_inv
+            )
+            replace_parameter(layer, "weight", weight.data)
+            replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+            layer.input_scale = None
+            self.use_marlin = False
+            return
+
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
