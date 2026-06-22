@@ -396,15 +396,20 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if self.use_marlin and getattr(layer, "is_bmm", False):
             # DSv4 o_proj `wo_a` is consumed by a fused per-group einsum that
-            # reads its raw FP8 weight directly (apply_weights is bypassed).
-            # Marlin would repack the weight into its opaque int32 layout and
-            # break that einsum, so keep `wo_a` in the [N, K] block-FP8 layout
-            # (the einsum decodes e4m3 itself) and disable marlin for it. This
-            # matches the pre-marlin block-kernel path exactly.
+            # reads its weight directly (apply_weights is bypassed). Marlin
+            # would repack the weight into its opaque int32 layout and break
+            # that einsum, so pre-dequantize the FP8 block weight to bf16 while
+            # keeping the original [N, K] layout.
             assert self.block_quant
             weight, weight_scale_inv = process_fp8_weight_block_strategy(
                 layer.weight, layer.weight_scale_inv
             )
+            block_m, block_k = self.weight_block_size
+            scale = weight_scale_inv.to(torch.float32)
+            scale = torch.repeat_interleave(scale, block_m, dim=-2)
+            scale = torch.repeat_interleave(scale, block_k, dim=-1)
+            scale = scale[: weight.shape[-2], : weight.shape[-1]]
+            weight = (weight.to(torch.float32) * scale).to(torch.bfloat16)
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
             layer.input_scale = None
