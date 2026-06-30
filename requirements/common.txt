@@ -30,7 +30,7 @@ typing_extensions >= 4.10
 filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
 partial-json-parser # used for parsing partial JSON outputs
 jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
-pyzmq >= 25.0.0
+pyzmq >= 27.1.0
 msgspec
 mistral_common[image] >= 1.11.3
 opencv-python-headless >= 4.13.0    # required for video IO
