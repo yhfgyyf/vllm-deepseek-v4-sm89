@@ -6,7 +6,13 @@
 
 把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
 
-> ⚠️ 实验性 fork。仅供在 Ada 卡上自测 DeepSeek-V4-Flash。
+## Changelog
+
+### 2026-07-01
+
+- 完成 **DeepSeek-V4-Flash-DSpark** 模型适配，支持 `method=dspark` 推测解码；当前 release wheel 打包目标切换为 **CUDA 13.0 工具链 + torch 2.11.0+cu130**，并已在 CUDA 13.x / 4× RTX 4090 上验证 `vllm serve`、tool call 和 vLLM bench。
+- DSpark 单并发 `8K / 32K / 128K` 输入、`1K` 输出均 `10/10` 成功;decode 折算为 **355 / 336 / 219 tok/s**。相比非 DSpark 源模型基线 decode **~82 tok/s**，分别提升约 **4.3× / 4.1× / 2.7×**。
+- 推荐 DSpark 服务配置:`gpu-memory-utilization=0.96`、`max-num-batched-tokens=2048`、`max-num-seqs=4`、`block-size=256`、`kv-cache-dtype=fp8_ds_mla`。
 
 ---
 
@@ -44,46 +50,46 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 | 项 | 版本 |
 |---|---|
 | GPU | 4× RTX 4090 (48GB) · compute capability **8.9** |
-| 驱动 / CUDA toolkit | 595.x / **CUDA 12.8**(nvcc 12.8) |
-| Python | 3.12(conda) |
-| torch | **2.11.0+cu128** |
-| vLLM | 本 fork = **0.11.1**(PR #41834 base `5be22eb` + SM89 改动)，源码编译 |
+| 驱动 / CUDA toolkit | 595.x / **CUDA 13.0**(nvcc 13.0) |
+| Python | 3.12 |
+| torch | **2.11.0+cu130** |
+| vLLM | 本 fork release wheel = **0.23.1rc1.dev145+g<commit>.cu130**，只为 SM89/Ada 编译 |
 
 ---
 
 ## 3. 快速安装(预编译 wheel，免编译)
 
 ```bash
-pip install \
-  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
-  --extra-index-url https://download.pytorch.org/whl/cu128
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install torch==2.11.0 --torch-backend=cu130
+
+gh release download \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl' \
+  --dir /tmp/vllm-sm89-cu130
+
+uv pip install --force-reinstall --no-deps \
+  /tmp/vllm-sm89-cu130/vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl
 ```
 
 **要求(必须匹配 wheel 的 ABI)**:
 - **Python 3.12** · Linux x86_64
-- NVIDIA **Ada(SM89,如 RTX 4090)** + 支持 **CUDA 12.8** 的驱动(机器上装着 12.9 / 13.x 驱动也行,向后兼容)
-- wheel 链接的是 `libcudart.so.12`,所以 **任意 CUDA 12.x(12.8/12.9)都能跑**;若用 **CUDA 13 / +cu130 的 torch** 会报 `libcudart.so.12: cannot open shared object file` —— 那种情况只能走第 4 节源码重编。
-
-> 想 100% 锁定 cu128(避免 pip 偶尔从 PyPI 挑到别的 torch 变体),分两步更稳:
-> ```bash
-> pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-> pip install https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl
-> ```
-
-装完若报 `torchvision::nms does not exist`(被装成了非 cu128 版):
-```bash
-pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
-```
+- NVIDIA **Ada(SM89,如 RTX 4090)** + 支持 CUDA 13.0 的驱动
+- **torch 2.11.0+cu130**；不要把这个 wheel 装进 cu128 / CUDA 12.x torch 环境
+- wheel 只编译 `TORCH_CUDA_ARCH_LIST=8.9+PTX`，用于 Ada/SM89，不是通用 GPU wheel
 
 ---
 
 ## 4. 源码安装(clone 本仓库编译)
 
-### 4.1 conda 环境 + torch
+### 4.1 Python 环境 + torch cu130
 
 ```bash
-conda create -n ds python=3.12 -y && conda activate ds
-pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install torch==2.11.0 --torch-backend=cu130
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
 ```
 
 ### 4.2 Rust 工具链(vLLM 0.11 有 Rust frontend)
@@ -106,19 +112,23 @@ git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
 cd vllm-deepseek-v4-sm89
 ```
 
-### 4.4 编译(只为 Ada 8.9 编译，跳过 SM90/100 的 FlashMLA 源码)
+### 4.4 编译 / 打包 CUDA 13.0 wheel(只为 Ada 8.9 编译)
 
 ```bash
-pip install -U "setuptools>=77,<81" setuptools-rust numpy packaging wheel
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$HOME/.cargo/bin:$PATH"
+export VLLM_TARGET_DEVICE=cuda
+export VLLM_MAIN_CUDA_VERSION=13.0
+export VLLM_VERSION_OVERRIDE=0.23.1rc1.dev145+g$(git rev-parse --short=9 HEAD).cu130
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
 export MAX_JOBS=16 NVCC_THREADS=2
-pip install -e . --no-build-isolation
+
+.venv/bin/python -m build --wheel --no-isolation
+uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
 > DeepGEMM **不要**装(Ada 不支持)。
-> 编译完 torchvision/torchaudio 若是非 cu128 版会报 `torchvision::nms does not exist`，修:
-> `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
-> 想打成可分发 wheel:`pip wheel . --no-build-isolation --no-deps -w dist/`。
+> wheel 文件名遵循 release 命名:`vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`。
 
 ---
 
@@ -141,6 +151,8 @@ print("has_cutedsl:", has_cutedsl())                             # False on SM89
 
 ## 6. 部署(vllm serve)
 
+### 6.1 源模型
+
 ```bash
 export VLLM_TRITON_MLA_SPARSE=1
 vllm serve /path/to/DeepSeek-V4-Flash \
@@ -156,6 +168,24 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --trust-remote-code --port 8000
 ```
 
+### 6.2 DSpark 推测解码模型
+
+```bash
+export VLLM_TRITON_MLA_SPARSE=1
+vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
+  --served-model-name deepseek-v4-flash-dspark \
+  --tensor-parallel-size 4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len 262144 \
+  --gpu-memory-utilization 0.96 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}' \
+  --trust-remote-code --port 8000
+```
 
 启动成功标志:`Application startup complete.`，日志里能看到 `Using 'MARLIN' Mxfp4 MoE backend` / `Using FP8 indexer cache`。
 
@@ -196,6 +226,41 @@ Q: 北京今天天气怎么样？请用摄氏度回答。  (tools=[get_weather])
 → get_weather  arguments: {"city": "北京", "unit": "celsius"}   ✅
 ```
 
+### 7.5 DSpark 推测解码(CUDA 13.x / torch cu130, 单并发)
+
+vLLM 自带 `vllm bench serve`，random dataset 固定长度，`max-concurrency=1`，每组 10 次，输出 1024 token。
+
+稳定配置:
+
+```bash
+vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
+  --served-model-name deepseek-v4-flash-dspark \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.96 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --block-size 256 \
+  --max-num-batched-tokens 2048 \
+  --kv-cache-dtype fp8_ds_mla \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
+```
+
+| 输入 → 输出 | 成功 | mean TTFT | mean TPOT | Prefill | Decode | output tok/s | total tok/s | acceptance |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 → 1,024 | 10/10 | 2.428s | 2.816ms | **3,374 tok/s** | **355 tok/s** | 192.9 | 1,736.0 | 92.81% |
+| 32,768 → 1,024 | 10/10 | 9.442s | 2.974ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
+| 131,072 → 1,024 | 10/10 | 42.829s | 4.568ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
+
+折算口径:`Prefill = input_tokens / mean_TTFT`，`Decode = 1000 / mean_TPOT(ms)`。
+
+重要限制:
+
+- `gpu-memory-utilization=0.97` 下，DSpark 长输入会在 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert -> aten::new_empty` 路径崩溃。
+- `gpu-memory-utilization=0.96 + max-num-batched-tokens=4096` 能通过 `32K → 512` 单请求，但 `32K → 1K ×10` 会复现同一路径崩溃。
+- 当前可稳定跑完 8K/32K/128K ×10 的推荐配置是 `gpu-memory-utilization=0.96 + max-num-batched-tokens=2048`。
+
 ---
 
 ## 8. 已知限制 / 风险
@@ -203,7 +268,8 @@ Q: 北京今天天气怎么样？请用摄氏度回答。  (tools=[get_weather])
 1. **MoE 走 Marlin**:正确性已验证，但性能比原生 FP4 MMA 低。性能调优空间最大的一块。
 2. **性能未针对 4090 调优**:fused_moe / scaled_mm 的 tuned config 只覆盖 RTX PRO 6000 / GB10，4090 用默认 heuristic(日志会有 "Performance might be sub-optimal" 提示)。
 3. **超长上下文**:1M 可启动但 prefill 慢到不实用;>256K 单请求约数分钟。
-4. 仅在 4× RTX 4090 验证过;其它 Ada 卡(L40/L4 等)原理相同但未实测。
+4. **DSpark 内存余量敏感**:`max-num-batched-tokens=4096` 和较高 GMU 会触发 `aten::new_empty` 崩溃;当前稳定建议是 GMU 0.96、MBT 2048。
+5. 仅在 4× RTX 4090 验证过;其它 Ada 卡(L40/L4 等)原理相同但未实测。
 
 ---
 
