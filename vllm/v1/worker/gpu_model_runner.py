@@ -593,6 +593,10 @@ class GPUModelRunner(
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dspark():
+                raise NotImplementedError(
+                    "DSpark speculative decoding requires the V2 GPU model runner."
+                )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():

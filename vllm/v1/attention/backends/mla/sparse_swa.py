@@ -344,6 +344,25 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
 
+        # DSpark draft: the block is non-causal (every query attends to the
+        # trailing window of context PLUS all query tokens, including future
+        # ones), so its per-token index list is wider than `window_size`. Pad
+        # the width to a multiple of 128 to match the FlashMLA-sparse kernel's
+        # B_TOPK tiling; the Triton SWA-decode path consumes the same wider
+        # [num_tokens, 1, width] buffer directly (SM89/SM120).
+        spec_config = self.vllm_config.speculative_config
+        self.num_speculative_tokens = (
+            spec_config.num_speculative_tokens if spec_config else 0
+        )
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
+        self.noncausal_index_width = (
+            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            if self.is_dspark
+            else 0
+        )
+        self.decode_swa_indices_noncausal: torch.Tensor | None = None
+        self._max_tokens = max_tokens
+
     def build(
         self,
         common_prefix_len: int,
@@ -382,22 +401,54 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
 
+        non_causal = not common_attn_metadata.causal
+        decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
-            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                self.decode_swa_indices,
-                self.decode_swa_indices.stride(0),
-                self.decode_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            if non_causal:
+                assert self.is_dspark, (
+                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                    "speculation mode, but causal=False was set without DSpark."
+                )
+                if self.decode_swa_indices_noncausal is None:
+                    self.decode_swa_indices_noncausal = torch.zeros(
+                        self._max_tokens,
+                        1,
+                        self.noncausal_index_width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                decode_swa_indices = self.decode_swa_indices_noncausal
+                _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
+                    decode_swa_indices,
+                    decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    self.noncausal_index_width,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+                    decode_swa_indices,
+                    decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -423,7 +474,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping=slot_mapping,
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
-            decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
+            decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             block_size=self.block_size,
             num_decodes=num_decodes,
@@ -613,4 +664,70 @@ def _compute_swa_indices_and_lens_kernel(
             swa_indices_ptr + token_idx * swa_indices_stride + offset,
             slot_ids,
             mask=offset < window_size,
+        )
+
+
+@triton.jit
+def _compute_dspark_noncausal_swa_indices_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    index_width,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    """Non-causal per-token indices for the DSpark draft block.
+
+    Every query token in the block attends to the trailing window of context
+    tokens PLUS all query tokens (including future ones), so all tokens in the
+    block share one block-anchored index list [start_pos, seq_len). This is the
+    non-causal counterpart of ``_compute_swa_indices_and_lens_kernel`` and writes
+    into the same ``[num_tokens, 1, index_width]`` buffer layout.
+    """
+    token_idx = tl.program_id(0)
+    is_valid = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid:
+        tl.store(swa_lens_ptr + token_idx, 0)
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+
+    # Block-anchored window (shared by every token in the block) + full block.
+    start_pos = tl.maximum(prefix_len - window_size, 0)
+    end_pos = seq_len
+
+    swa_len = end_pos - start_pos
+    tl.store(swa_lens_ptr + token_idx, swa_len)
+
+    for i in range(0, index_width, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+
+        pos_offset = start_pos + offset
+        block_indices = pos_offset // block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=pos_offset < end_pos,
+        )
+        block_offsets = pos_offset % block_size
+        slot_ids = block_numbers * block_size + block_offsets
+
+        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
+        tl.store(
+            swa_indices_ptr + token_idx * swa_indices_stride + offset,
+            slot_ids,
+            mask=offset < index_width,
         )

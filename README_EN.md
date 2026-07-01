@@ -6,7 +6,13 @@
 
 It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM89 (Ada Lovelace: RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**. End-to-end validated on **4× RTX 4090 (48 GB)**: environment setup → operator tests → server startup → inference → performance / tool-calling — all passing.
 
-> ⚠️ Experimental fork. For self-testing DeepSeek-V4-Flash on Ada GPUs only.
+## Changelog
+
+### 2026-07-01
+
+- Completed **DeepSeek-V4-Flash-DSpark** model adaptation with `method=dspark` speculative decoding. The current release wheel target is **CUDA 13.0 toolkit + torch 2.11.0+cu130**, and `vllm serve`, tool calling, and vLLM bench have been validated on CUDA 13.x / 4× RTX 4090.
+- DSpark single-concurrency `8K / 32K / 128K` input and `1K` output cases all passed `10/10`; converted decode throughput is **355 / 336 / 219 tok/s**. Compared with the non-DSpark source-model baseline decode throughput of **~82 tok/s**, this is about **4.3× / 4.1× / 2.7×** faster.
+- Recommended DSpark serving config: `gpu-memory-utilization=0.96`, `max-num-batched-tokens=2048`, `max-num-seqs=4`, `block-size=256`, `kv-cache-dtype=fp8_ds_mla`.
 
 ---
 
@@ -44,46 +50,46 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 | Item | Version |
 |---|---|
 | GPU | 4× RTX 4090 (48 GB) · compute capability **8.9** |
-| Driver / CUDA toolkit | 595.x / **CUDA 12.8** (nvcc 12.8) |
-| Python | 3.12 (conda) |
-| torch | **2.11.0+cu128** |
-| vLLM | this fork = **0.11.1** (PR #41834 base `5be22eb` + SM89 changes), built from source |
+| Driver / CUDA toolkit | 595.x / **CUDA 13.0** (nvcc 13.0) |
+| Python | 3.12 |
+| torch | **2.11.0+cu130** |
+| vLLM | this fork release wheel = **0.23.1rc1.dev145+g<commit>.cu130**, built for SM89/Ada only |
 
 ---
 
 ## 3. Quick install (prebuilt wheel)
 
 ```bash
-pip install \
-  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl \
-  --extra-index-url https://download.pytorch.org/whl/cu128
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install torch==2.11.0 --torch-backend=cu130
+
+gh release download \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl' \
+  --dir /tmp/vllm-sm89-cu130
+
+uv pip install --force-reinstall --no-deps \
+  /tmp/vllm-sm89-cu130/vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl
 ```
 
 **Requirements (must match the wheel ABI):**
 - **Python 3.12**, Linux x86_64
-- NVIDIA **Ada (SM89, e.g. RTX 4090)** GPU + a driver supporting **CUDA 12.8** (12.9 / 13.x drivers are fine — backward compatible)
-- The wheel links `libcudart.so.12`, so **any CUDA 12.x (12.8/12.9) works**. A **CUDA 13 / +cu130 torch** would fail with `libcudart.so.12: cannot open shared object file` — for that, build from source (§4).
-
-> To pin cu128 exactly (pip may occasionally pick a different torch variant from PyPI), do it in two steps:
-> ```bash
-> pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-> pip install https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.11.1-sm89-cu128/vllm-0.11.1+cu128-cp312-cp312-linux_x86_64.whl
-> ```
-
-If you hit `torchvision::nms does not exist` (non-cu128 torchvision pulled in):
-```bash
-pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio
-```
+- NVIDIA **Ada (SM89, e.g. RTX 4090)** GPU + a driver supporting CUDA 13.0
+- **torch 2.11.0+cu130**; do not install this wheel into a cu128 / CUDA 12.x torch environment
+- The wheel is built only with `TORCH_CUDA_ARCH_LIST=8.9+PTX`; it is for Ada/SM89, not a generic GPU wheel
 
 ---
 
 ## 4. Build from source (clone this repo)
 
-### 4.1 Conda env + torch
+### 4.1 Python env + torch cu130
 
 ```bash
-conda create -n ds python=3.12 -y && conda activate ds
-pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install torch==2.11.0 --torch-backend=cu130
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
 ```
 
 ### 4.2 Rust toolchain (vLLM 0.11 ships a Rust frontend)
@@ -100,19 +106,23 @@ git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
 cd vllm-deepseek-v4-sm89
 ```
 
-### 4.4 Build (compile for Ada 8.9 only; skips the SM90/100 FlashMLA sources)
+### 4.4 Build / package a CUDA 13.0 wheel (Ada 8.9 only)
 
 ```bash
-pip install -U "setuptools>=77,<81" setuptools-rust numpy packaging wheel
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$HOME/.cargo/bin:$PATH"
+export VLLM_TARGET_DEVICE=cuda
+export VLLM_MAIN_CUDA_VERSION=13.0
+export VLLM_VERSION_OVERRIDE=0.23.1rc1.dev145+g$(git rev-parse --short=9 HEAD).cu130
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
 export MAX_JOBS=16 NVCC_THREADS=2
-pip install -e . --no-build-isolation
+
+.venv/bin/python -m build --wheel --no-isolation
+uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
 > Do **not** install DeepGEMM (unsupported on Ada).
-> If after the build torchvision/torchaudio are the non-cu128 builds you will see `torchvision::nms does not exist`; fix with:
-> `pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu128 torchvision torchaudio`
-> To produce a distributable wheel: `pip wheel . --no-build-isolation --no-deps -w dist/`.
+> Wheel names follow the release convention: `vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`.
 
 ---
 
@@ -135,6 +145,8 @@ print("has_cutedsl:", has_cutedsl())                             # False on SM89
 
 ## 6. Deployment (vllm serve)
 
+### 6.1 Source model
+
 ```bash
 export VLLM_TRITON_MLA_SPARSE=1
 vllm serve /path/to/DeepSeek-V4-Flash \
@@ -147,6 +159,25 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --max-num-seqs 16 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --trust-remote-code --port 8000
+```
+
+### 6.2 DSpark speculative decoding model
+
+```bash
+export VLLM_TRITON_MLA_SPARSE=1
+vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
+  --served-model-name deepseek-v4-flash-dspark \
+  --tensor-parallel-size 4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len 262144 \
+  --gpu-memory-utilization 0.96 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}' \
   --trust-remote-code --port 8000
 ```
 
@@ -188,6 +219,41 @@ Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 → get_weather  arguments: {"city": "北京", "unit": "celsius"}   ✅
 ```
 
+### 7.5 DSpark speculative decoding (CUDA 13.x / torch cu130, single concurrency)
+
+Measured with vLLM's built-in `vllm bench serve`, random dataset with fixed lengths, `max-concurrency=1`, 10 requests per case, 1024 output tokens.
+
+Stable config:
+
+```bash
+vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
+  --served-model-name deepseek-v4-flash-dspark \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.96 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --block-size 256 \
+  --max-num-batched-tokens 2048 \
+  --kv-cache-dtype fp8_ds_mla \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
+```
+
+| Input → output | Success | mean TTFT | mean TPOT | Prefill | Decode | output tok/s | total tok/s | acceptance |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 → 1,024 | 10/10 | 2.428 s | 2.816 ms | **3,374 tok/s** | **355 tok/s** | 192.9 | 1,736.0 | 92.81% |
+| 32,768 → 1,024 | 10/10 | 9.442 s | 2.974 ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
+| 131,072 → 1,024 | 10/10 | 42.829 s | 4.568 ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
+
+Conversion: `Prefill = input_tokens / mean_TTFT`, `Decode = 1000 / mean_TPOT(ms)`.
+
+Important limitations:
+
+- With `gpu-memory-utilization=0.97`, long-input DSpark crashes in `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert -> aten::new_empty`.
+- `gpu-memory-utilization=0.96 + max-num-batched-tokens=4096` can pass a `32K → 512` single request, but `32K → 1K ×10` reproduces the same crash path.
+- The current recommended configuration for stable 8K/32K/128K ×10 runs is `gpu-memory-utilization=0.96 + max-num-batched-tokens=2048`.
+
 ---
 
 ## 8. Known limitations / risks
@@ -195,7 +261,8 @@ Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 1. **MoE runs on Marlin**: correctness validated, but performance is below native FP4 MMA — the biggest remaining tuning opportunity.
 2. **Performance is not tuned for the 4090**: the fused_moe / scaled_mm tuned configs only cover RTX PRO 6000 / GB10; the 4090 uses default heuristics (the log prints "Performance might be sub-optimal").
 3. **Very long context**: 1M starts but prefill is impractically slow; single requests over 256K take several minutes.
-4. Validated only on 4× RTX 4090; other Ada GPUs (L40/L4, etc.) should work in principle but are untested.
+4. **DSpark is sensitive to memory headroom**: `max-num-batched-tokens=4096` and higher GMU can trigger an `aten::new_empty` crash; the current stable recommendation is GMU 0.96 and MBT 2048.
+5. Validated only on 4× RTX 4090; other Ada GPUs (L40/L4, etc.) should work in principle but are untested.
 
 ---
 
