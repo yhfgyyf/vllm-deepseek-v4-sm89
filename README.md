@@ -12,7 +12,7 @@
 
 - 完成 **DeepSeek-V4-Flash-DSpark** 模型适配，支持 `method=dspark` 推测解码；当前 release wheel 打包目标切换为 **CUDA 13.0 工具链 + torch 2.11.0+cu130**，并已在 CUDA 13.x / 4× RTX 4090 上验证 `vllm serve`、tool call 和 vLLM bench。
 - DSpark 单并发 `8K / 32K / 128K` 输入、`1K` 输出均 `10/10` 成功;decode 折算为 **355 / 336 / 219 tok/s**。相比非 DSpark 源模型基线 decode **~82 tok/s**，分别提升约 **4.3× / 4.1× / 2.7×**。
-- 推荐 DSpark 服务配置:`gpu-memory-utilization=0.96`、`max-num-batched-tokens=2048`、`max-num-seqs=4`、`block-size=256`、`kv-cache-dtype=fp8_ds_mla`。
+- 推荐 DSpark 服务配置:`gpu-memory-utilization=0.96`、`max-model-len=262144`、`max-num-batched-tokens=2048`、`max-num-seqs=4`、`block-size=256`、`kv-cache-dtype=fp8_ds_mla`。在 4× RTX 4090、`fp8_ds_mla`、`block-size=256` 的实测配置下，GPU KV cache 总容量约 **972,374 tokens**；这是所有活跃请求共享的 KV cache token 池，不是单请求上下文长度。
 
 ---
 
@@ -73,11 +73,11 @@ uv pip install --force-reinstall --no-deps \
   /tmp/vllm-sm89-cu130/vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl
 ```
 
-**要求(必须匹配 wheel 的 ABI)**:
+**已验证过的环境**:
 - **Python 3.12** · Linux x86_64
-- NVIDIA **Ada(SM89,如 RTX 4090)** + 支持 CUDA 13.0 的驱动
-- **torch 2.11.0+cu130**；不要把这个 wheel 装进 cu128 / CUDA 12.x torch 环境
-- wheel 只编译 `TORCH_CUDA_ARCH_LIST=8.9+PTX`，用于 Ada/SM89，不是通用 GPU wheel
+- **4× RTX 4090 (SM89/Ada, 48GB)** · 驱动 595.x · CUDA toolkit 13.0
+- **torch 2.11.0+cu130**
+- wheel 使用 `TORCH_CUDA_ARCH_LIST=8.9+PTX` 编译，面向 Ada/SM89
 
 ---
 
@@ -253,26 +253,6 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
 | 32,768 → 1,024 | 10/10 | 9.442s | 2.974ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
 | 131,072 → 1,024 | 10/10 | 42.829s | 4.568ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
 
-折算口径:`Prefill = input_tokens / mean_TTFT`，`Decode = 1000 / mean_TPOT(ms)`。
-
-重要限制:
-
-- `gpu-memory-utilization=0.97` 下，DSpark 长输入会在 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert -> aten::new_empty` 路径崩溃。
-- `gpu-memory-utilization=0.96 + max-num-batched-tokens=4096` 能通过 `32K → 512` 单请求，但 `32K → 1K ×10` 会复现同一路径崩溃。
-- 当前可稳定跑完 8K/32K/128K ×10 的推荐配置是 `gpu-memory-utilization=0.96 + max-num-batched-tokens=2048`。
-
----
-
-## 8. 已知限制 / 风险
-
-1. **MoE 走 Marlin**:正确性已验证，但性能比原生 FP4 MMA 低。性能调优空间最大的一块。
-2. **性能未针对 4090 调优**:fused_moe / scaled_mm 的 tuned config 只覆盖 RTX PRO 6000 / GB10，4090 用默认 heuristic(日志会有 "Performance might be sub-optimal" 提示)。
-3. **超长上下文**:1M 可启动但 prefill 慢到不实用;>256K 单请求约数分钟。
-4. **DSpark 内存余量敏感**:`max-num-batched-tokens=4096` 和较高 GMU 会触发 `aten::new_empty` 崩溃;当前稳定建议是 GMU 0.96、MBT 2048。
-5. 仅在 4× RTX 4090 验证过;其它 Ada 卡(L40/L4 等)原理相同但未实测。
-
----
-
-## 9. 许可 / 来源
+## 8. 许可 / 来源
 
 代码基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)(Apache-2.0)及其 PR #41834。本 fork 沿用同协议。AI 辅助完成，人工验证。

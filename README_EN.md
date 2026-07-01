@@ -12,7 +12,7 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 - Completed **DeepSeek-V4-Flash-DSpark** model adaptation with `method=dspark` speculative decoding. The current release wheel target is **CUDA 13.0 toolkit + torch 2.11.0+cu130**, and `vllm serve`, tool calling, and vLLM bench have been validated on CUDA 13.x / 4× RTX 4090.
 - DSpark single-concurrency `8K / 32K / 128K` input and `1K` output cases all passed `10/10`; converted decode throughput is **355 / 336 / 219 tok/s**. Compared with the non-DSpark source-model baseline decode throughput of **~82 tok/s**, this is about **4.3× / 4.1× / 2.7×** faster.
-- Recommended DSpark serving config: `gpu-memory-utilization=0.96`, `max-num-batched-tokens=2048`, `max-num-seqs=4`, `block-size=256`, `kv-cache-dtype=fp8_ds_mla`.
+- Recommended DSpark serving config: `gpu-memory-utilization=0.96`, `max-model-len=262144`, `max-num-batched-tokens=2048`, `max-num-seqs=4`, `block-size=256`, `kv-cache-dtype=fp8_ds_mla`. With the validated 4× RTX 4090 setup, `fp8_ds_mla`, and `block-size=256`, the reported GPU KV cache capacity is about **972,374 tokens**. This is the total KV-cache token pool shared by active requests, not the per-request context length.
 
 ---
 
@@ -73,11 +73,11 @@ uv pip install --force-reinstall --no-deps \
   /tmp/vllm-sm89-cu130/vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl
 ```
 
-**Requirements (must match the wheel ABI):**
+**Validated environment:**
 - **Python 3.12**, Linux x86_64
-- NVIDIA **Ada (SM89, e.g. RTX 4090)** GPU + a driver supporting CUDA 13.0
-- **torch 2.11.0+cu130**; do not install this wheel into a cu128 / CUDA 12.x torch environment
-- The wheel is built only with `TORCH_CUDA_ARCH_LIST=8.9+PTX`; it is for Ada/SM89, not a generic GPU wheel
+- **4× RTX 4090 (SM89/Ada, 48 GB)**, 595.x driver, CUDA toolkit 13.0
+- **torch 2.11.0+cu130**
+- Wheel built with `TORCH_CUDA_ARCH_LIST=8.9+PTX`, targeting Ada/SM89
 
 ---
 
@@ -246,26 +246,6 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
 | 32,768 → 1,024 | 10/10 | 9.442 s | 2.974 ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
 | 131,072 → 1,024 | 10/10 | 42.829 s | 4.568 ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
 
-Conversion: `Prefill = input_tokens / mean_TTFT`, `Decode = 1000 / mean_TPOT(ms)`.
-
-Important limitations:
-
-- With `gpu-memory-utilization=0.97`, long-input DSpark crashes in `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert -> aten::new_empty`.
-- `gpu-memory-utilization=0.96 + max-num-batched-tokens=4096` can pass a `32K → 512` single request, but `32K → 1K ×10` reproduces the same crash path.
-- The current recommended configuration for stable 8K/32K/128K ×10 runs is `gpu-memory-utilization=0.96 + max-num-batched-tokens=2048`.
-
----
-
-## 8. Known limitations / risks
-
-1. **MoE runs on Marlin**: correctness validated, but performance is below native FP4 MMA — the biggest remaining tuning opportunity.
-2. **Performance is not tuned for the 4090**: the fused_moe / scaled_mm tuned configs only cover RTX PRO 6000 / GB10; the 4090 uses default heuristics (the log prints "Performance might be sub-optimal").
-3. **Very long context**: 1M starts but prefill is impractically slow; single requests over 256K take several minutes.
-4. **DSpark is sensitive to memory headroom**: `max-num-batched-tokens=4096` and higher GMU can trigger an `aten::new_empty` crash; the current stable recommendation is GMU 0.96 and MBT 2048.
-5. Validated only on 4× RTX 4090; other Ada GPUs (L40/L4, etc.) should work in principle but are untested.
-
----
-
-## 9. License / provenance
+## 8. License / provenance
 
 Based on [vllm-project/vllm](https://github.com/vllm-project/vllm) (Apache-2.0) and its PR #41834. This fork keeps the same license. AI-assisted, human-validated.
