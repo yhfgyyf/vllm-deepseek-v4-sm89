@@ -60,17 +60,12 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 ## 3. Quick install (prebuilt wheel)
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.12 --seed
 source .venv/bin/activate
-uv pip install torch==2.11.0 --torch-backend=cu130
 
-gh release download \
-  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl' \
-  --dir /tmp/vllm-sm89-cu130
-
-uv pip install --force-reinstall --no-deps \
-  /tmp/vllm-sm89-cu130/vllm-0.23.*.cu130-cp312-cp312-linux_x86_64.whl
+pip install \
+  "https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.23.1rc1.dev145-g8c631d45e-cu130-sm89/vllm-0.23.1rc1.dev145%2Bg8c631d45e.cu130-cp312-cp312-linux_x86_64.whl" \
+  --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
 **Validated environment:**
