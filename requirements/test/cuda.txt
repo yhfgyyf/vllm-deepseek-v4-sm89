@@ -778,7 +778,7 @@ platformdirs==4.3.6
     #   black
     #   pooch
     #   virtualenv
-plotly==5.24.1
+plotly==6.9.0
     # via
     #   -r requirements/test/cuda.in
     #   genai-perf
