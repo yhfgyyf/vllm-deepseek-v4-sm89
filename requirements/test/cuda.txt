@@ -513,7 +513,7 @@ model-hosting-container-standards==0.1.16
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
-more-itertools==10.5.0
+more-itertools==11.1.0
     # via lm-eval
 mpmath==1.3.0
     # via sympy
