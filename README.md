@@ -11,7 +11,7 @@
 
 ### 2026-08-02
 
-- 适配最新 `DeepSeek-V4-Flash-0731` 模型，并在 4× RTX 4090 上完成短上下文、长上下文和 ModelScope GSM8K 准确性测试。
+- 适配最新 `DeepSeek-V4-Flash-0731` 模型，并在 4× RTX 4090 上完成短上下文、长上下文和 GSM8K 准确性测试。
 - 修复 FlashInfer SM89 sparse MLA decode 精度问题：为每个 MMA accumulator 正确恢复分布式 query/KV UE8M0 scale，处理边界编码并支持 page block size 256。
 - 安装时请使用[最新 Release](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/latest)中配套的 vLLM 和 FlashInfer wheel，并在同一次依赖解析中安装。
 
