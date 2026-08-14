@@ -13,23 +13,30 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "a_stride_group",
+        "a_scale_stride_group",
+        "a_scale_stride_hidden",
+    ]
+)
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
     a_scale_ptr,
     b_ptr,
     b_scale_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_groups: tl.constexpr,
     out_rank: tl.constexpr,
     hidden_size: tl.constexpr,
     a_stride_token: tl.constexpr,
-    a_stride_group: tl.constexpr,
+    a_stride_group,
     a_stride_hidden: tl.constexpr,
     a_scale_stride_token: tl.constexpr,
-    a_scale_stride_group: tl.constexpr,
-    a_scale_stride_hidden: tl.constexpr,
+    a_scale_stride_group,
+    a_scale_stride_hidden,
     b_stride_group: tl.constexpr,
     b_stride_out: tl.constexpr,
     b_stride_hidden: tl.constexpr,
@@ -44,6 +51,9 @@ def _deepseek_v4_sm12x_fp8_einsum_kernel(
     BLOCK_HIDDEN: tl.constexpr,
     UPCAST_FP8: tl.constexpr,
 ) -> None:
+    # Preserve alignment without specializing on request-dependent strides.
+    a_stride_group = tl.multiple_of(a_stride_group, 16)
+    a_scale_stride_group = tl.multiple_of(a_scale_stride_group, 16)
     token_block = tl.program_id(0)
     out_block = tl.program_id(1)
     group = tl.program_id(2)
