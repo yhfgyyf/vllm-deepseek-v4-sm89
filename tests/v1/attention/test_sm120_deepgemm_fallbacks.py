@@ -158,11 +158,60 @@ def test_sparse_indexer_requires_deep_gemm_for_other_cuda_arches(monkeypatch):
     assert _sparse_indexer_requires_deep_gemm(use_fp4_cache=False)
 
 
-def test_sm120_direct_mqa_logits_block_m_prefers_short_prefill_tile():
-    assert sm12x_mqa._fp8_mqa_logits_block_m(1024, 1024) == 16
-    assert sm12x_mqa._fp8_mqa_logits_block_m(4096, 4096) == 16
-    assert sm12x_mqa._fp8_mqa_logits_block_m(16384, 16384) == 16
-    assert sm12x_mqa._fp8_mqa_logits_block_m(65536, 65536) == 64
+@pytest.mark.parametrize(
+    ("capability", "seq_len_kv", "expected"),
+    [
+        ((8, 0), 16 * 1024, 16),
+        ((8, 0), 16 * 1024 + 1, 16),
+        ((8, 6), 16 * 1024 + 1, 64),
+        ((8, 9), 16 * 1024 + 1, 64),
+        ((12, 0), 16 * 1024 + 1, 64),
+    ],
+)
+def test_sm80_direct_mqa_logits_block_m_avoids_long_prefill_spills(
+    monkeypatch, capability, seq_len_kv, expected
+):
+    monkeypatch.setattr(
+        sm12x_mqa.current_platform,
+        "is_device_capability",
+        lambda requested: requested == capability,
+    )
+
+    assert sm12x_mqa._fp8_mqa_logits_block_m(4096, seq_len_kv) == expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
+    reason="SM80 only",
+)
+def test_sm80_long_mqa_block_m16_matches_block_m64(monkeypatch):
+    torch.manual_seed(0)
+    num_q, seq_len_kv, num_heads, head_dim = 17, 16 * 1024 + 128, 64, 128
+    q = (
+        torch.randn((num_q, num_heads, head_dim), device="cuda")
+        .clamp_(-2, 2)
+        .to(torch.float8_e4m3fn)
+    )
+    k = (
+        torch.randn((seq_len_kv, head_dim), device="cuda")
+        .clamp_(-2, 2)
+        .to(torch.float8_e4m3fn)
+    )
+    scale = torch.rand(seq_len_kv, device="cuda", dtype=torch.float32)
+    weights = torch.rand((num_q, num_heads), device="cuda", dtype=torch.float32)
+    row_starts = torch.arange(num_q, device="cuda", dtype=torch.int32)
+    row_ends = torch.full((num_q,), seq_len_kv - 1, device="cuda", dtype=torch.int32)
+
+    monkeypatch.setattr(sm12x_mqa, "_fp8_mqa_logits_block_m", lambda *_: 16)
+    block_m16 = sm12x_mqa.fp8_mqa_logits_triton(
+        q, (k, scale), weights, row_starts, row_ends
+    )
+    monkeypatch.setattr(sm12x_mqa, "_fp8_mqa_logits_block_m", lambda *_: 64)
+    block_m64 = sm12x_mqa.fp8_mqa_logits_triton(
+        q, (k, scale), weights, row_starts, row_ends
+    )
+
+    torch.testing.assert_close(block_m16, block_m64, rtol=0, atol=0)
 
 
 def test_sm120_direct_mqa_logits_block_d_uses_full_indexer_head_tile():

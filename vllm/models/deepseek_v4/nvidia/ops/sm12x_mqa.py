@@ -7,6 +7,7 @@ import torch
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _e4m3_uint8_to_f32,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -189,6 +190,9 @@ def fp8_mqa_logits_triton(
 
 
 def _fp8_mqa_logits_block_m(num_q: int, seq_len_kv: int) -> int:
+    # Larger query tiles spill to local memory on SM80 for long sequences.
+    if current_platform.is_device_capability((8, 0)):
+        return 16
     if seq_len_kv <= 16 * 1024:
         return 16
     return 64
