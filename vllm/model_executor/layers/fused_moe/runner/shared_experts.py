@@ -52,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        self._aux_launched = False
         self._layer = layer
         self._moe_config = moe_config
 
@@ -134,12 +135,26 @@ class SharedExperts(torch.nn.Module):
     ) -> torch.Tensor:
         # TODO: assert that maybe_sync_shared_experts_stream has been called.
 
-        # Run shared experts in parallel on a separate stream.
+        # R2-W6 (W5 round-1 (c)): run shared experts in parallel on a
+        # separate stream. The main stream is NOT made to wait here; the
+        # caller decides when to re-sync via wait_shared_experts(), so the
+        # shared-expert GEMMs can overlap the routed-experts work (gate/topk/
+        # marlin) launched after this returns.
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)
-        current_stream().wait_stream(self._stream)
 
         return output
+
+    def wait_shared_experts(self) -> None:
+        """Make the current (main) stream wait for the shared-expert aux
+        stream, so the shared output is safe to consume. No-op unless the
+        shared experts were launched on the aux stream for this forward
+        (MULTI_STREAM_OVERLAPPED path); when they ran on the main stream
+        (NO_OVERLAP, M > VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD) there is
+        nothing to wait for, and waiting would create a capture-isolation
+        error under CUDA graphs (uncaptured aux-stream work)."""
+        if self._stream is not None and self._aux_launched:
+            current_stream().wait_stream(self._stream)
 
     @property
     def _output_idx(self) -> int:
@@ -165,10 +180,12 @@ class SharedExperts(torch.nn.Module):
         assert self._output[self._output_idx] is None
 
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            self._aux_launched = True
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input
             )
         else:
+            self._aux_launched = False
             self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None
