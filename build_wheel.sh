@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-export CUDA_HOME=/usr/local/cuda-13.0
+export CUDA_HOME=/usr/local/cuda-13.2
 export PATH="$CUDA_HOME/bin:/home/yyf/.cargo/bin:$PATH"
 export VLLM_TARGET_DEVICE=cuda
-export VLLM_MAIN_CUDA_VERSION=13.0
+export VLLM_MAIN_CUDA_VERSION=13.2
 if [[ -z "${VLLM_VERSION_OVERRIDE:-}" ]]; then
   BASE_VERSION=$(
     .venv/bin/python <<'PY'
@@ -28,10 +28,10 @@ PY
   if [[ "$BASE_VERSION" == *+* ]]; then
     VERSION_SEPARATOR="."
   fi
-  export VLLM_VERSION_OVERRIDE="${BASE_VERSION}${VERSION_SEPARATOR}cu130"
+  export VLLM_VERSION_OVERRIDE="${BASE_VERSION}${VERSION_SEPARATOR}cu132"
 fi
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
-export MAX_JOBS=${MAX_JOBS:-16}
+export MAX_JOBS=${MAX_JOBS:-8}
 export NVCC_THREADS=${NVCC_THREADS:-2}
 
 echo "=== START $(date +%T) | nvcc $(nvcc --version | tail -1) | arch=$TORCH_CUDA_ARCH_LIST | version=$VLLM_VERSION_OVERRIDE ==="
