@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-22 - vLLM upstream sync, DSpark k=7, and CUDA 13.2 wheels
+
+### 中文
+
+- 选择性回移植 vLLM v0.27.1 时期的 DeepSeek-V4 更新：#51727/#51296 tokenizer/parser 修复、#52288 加 #52809 语义的 DSpark backend 继承、#47914 DFlash hybrid causal metadata、#48137 mHC copy 消除、#48660/#47463 DSV4 top-k，以及 #49486/#50298/#52084/#51967/#48957 sparse-index 优化。
+- 从 #51538 抽取 SM89 适用的 sparse MLA/SWA correctness 修复；保留 #51430/#52401/#52492 的结构和 follow-up，但 SM89 FlashInfer sparse MLA 继续使用宽 eager CUDA Graph guard。未引入 #47808/#52436 adaptive verification，也未重新引入已回滚的 #50004/#49236。
+- 合入 SM89 paged MQA logits int32 地址溢出修复（PR #51）和 Triton per-shape kernel cache 增长修复（PR #61）。
+- DSpark 推荐参数更新为 `method=dspark`、`num_speculative_tokens=7`、`draft_sample_method=probabilistic`。4× RTX 4090 上 `8K / 32K -> 1K` 单并发 decode 为 366.95 / 327.38 tok/s。
+- CUDA 依赖同步到当前上游版本：`torch 2.13.0+cu130`、`triton 3.7.1`、CUTLASS DSL 4.6.2、QuACK 0.6.4、TileLang 0.1.12、Tokenspeed MLA 0.1.8；SM89 release 使用 CUDA toolkit 13.2、`flashinfer-python 0.6.17+sm89.1` 和 `flashinfer-cubin 0.6.17`。
+- 新 wheel 环境通过 `uv pip check`、原生扩展导入、SM89 sparse MLA、8K/32K 源码 A/B、工具调用和 UTF-8 输出测试。
+
+### English
+
+- Selectively backported vLLM v0.27.1-era DeepSeek-V4 updates: #51727/#51296 tokenizer/parser fixes, #52288 with #52809 semantics for DSpark backend inheritance, #47914 DFlash hybrid causal metadata, #48137 mHC copy removal, #48660/#47463 DSV4 top-k, and #49486/#50298/#52084/#51967/#48957 sparse-index optimizations.
+- Extracted the SM89-relevant sparse MLA/SWA correctness fixes from #51538. The #51430/#52401/#52492 structure and follow-ups are present, but SM89 FlashInfer sparse MLA retains its wide-eager CUDA Graph guard. #47808/#52436 adaptive verification and upstream-reverted #50004/#49236 remain excluded.
+- Included the SM89 paged-MQA-logits int32 addressing fix (PR #51) and Triton per-shape kernel-cache growth fix (PR #61).
+- Updated the recommended DSpark config to `method=dspark`, `num_speculative_tokens=7`, and `draft_sample_method=probabilistic`. Single-concurrency decode on 4× RTX 4090 is 366.95 / 327.38 tok/s for `8K / 32K -> 1K`.
+- Synced CUDA dependencies to current upstream versions: `torch 2.13.0+cu130`, `triton 3.7.1`, CUTLASS DSL 4.6.2, QuACK 0.6.4, TileLang 0.1.12, and Tokenspeed MLA 0.1.8. The SM89 release uses CUDA toolkit 13.2, `flashinfer-python 0.6.17+sm89.1`, and `flashinfer-cubin 0.6.17`.
+- The fresh wheel environment passed `uv pip check`, native-extension imports, SM89 sparse MLA detection, source-vs-wheel 8K/32K A/B runs, tool calling, and UTF-8 output checks.
+
 ## 2026-07-10 - FlashInfer 0.6.14 sparse MLA on SM89
 
 ### 中文
