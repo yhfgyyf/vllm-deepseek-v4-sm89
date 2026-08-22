@@ -3,10 +3,25 @@
 
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
+
+
+def _resolve_dspark_attention_backend(
+    draft_model_config: ModelConfig,
+    draft_backend: AttentionBackendEnum | None,
+    target_backend: AttentionBackendEnum | None,
+) -> AttentionBackendEnum | None:
+    if draft_backend is not None:
+        return draft_backend
+    # DeepSeek-V4 draft layers share the target's KV-cache layout. Other
+    # DSpark architectures may use a different attention kind.
+    if draft_model_config.hf_config.model_type == "deepseek_v4":
+        return target_backend
+    return None
 
 
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -18,12 +33,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     # DSpark uses non-causal attention.
     causal = False
+    draft_attention_backend = _resolve_dspark_attention_backend(
+        draft_model_config,
+        speculative_config.attention_backend,
+        vllm_config.attention_config.backend,
+    )
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=not causal,
-            backend=speculative_config.attention_backend,
+            backend=draft_attention_backend,
         ),
     )
 

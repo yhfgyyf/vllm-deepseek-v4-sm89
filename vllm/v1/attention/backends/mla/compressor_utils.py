@@ -3,6 +3,18 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+
+_DSPARK_SWA_INDEX_ALIGNMENT = 64
+
+
+def get_dspark_swa_index_width(
+    window_size: int,
+    num_speculative_tokens: int,
+) -> int:
+    """Return the padded width of non-causal DSpark SWA indices."""
+    width = max(int(window_size), 0) + max(int(num_speculative_tokens), 0)
+    return cdiv(width, _DSPARK_SWA_INDEX_ALIGNMENT) * _DSPARK_SWA_INDEX_ALIGNMENT
 
 
 @triton.jit
@@ -35,7 +47,7 @@ def _compressed_slot_mapping_kernel(
         mask = offset < query_len
 
         pos = start_pos + i + tl.arange(0, TRITON_BLOCK_SIZE)
-        is_valid = (pos + 1) % COMPRESS_RATIO == 0
+        is_valid = (pos >= 0) & ((pos + 1) % COMPRESS_RATIO == 0)
         pos_after_compress = pos // COMPRESS_RATIO
 
         block_ids = pos_after_compress // block_size

@@ -1,144 +1,126 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
-from benchmarks.kernels.deepseek_v4.common import GraphRunner
-from benchmarks.kernels.deepseek_v4.d01_factories import (
-    build_d01_prepare_dflash_inputs_case,
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    prepare_dflash_inputs,
 )
-from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="DFlash input preparation requires CUDA"
+    not torch.cuda.is_available(), reason="requires a CUDA device"
 )
 
 
-@pytest.mark.parametrize(
-    "factory_args",
-    [
-        {
-            "num_reqs": 1,
-            "total_target_tokens": 8,
-            "num_speculative_steps": 7,
-            "sample_from_anchor": True,
-            "num_rejected": [3],
-            "max_num_tokens": 2048,
-        },
-        {
-            "num_reqs": 4,
-            "total_target_tokens": 32,
-            "target_query_lens": [1, 7, 8, 16],
-            "num_rejected": [0, 2, 7, 3],
-            "num_sampled": [1, 0, 2, 0],
-            "num_speculative_steps": 7,
-            "sample_from_anchor": True,
-            "context_tokens": 32768,
-            "context_jitter": 127,
-            "max_num_tokens": 2048,
-        },
-        {
-            "num_reqs": 4,
-            "total_target_tokens": 64,
-            "target_query_lens": [1, 15, 17, 31],
-            "num_rejected": [0, 14, 3, 30],
-            "num_speculative_steps": 16,
-            "sample_from_anchor": False,
-            "context_tokens": 131072,
-            "context_jitter": 64,
-            "max_num_tokens": 2048,
-        },
-        {
-            "num_reqs": 4,
-            "total_target_tokens": 2048,
-            "target_query_lens": [1, 127, 512, 1408],
-            "num_rejected": [0, 1, 7, 3],
-            "num_speculative_steps": 7,
-            "sample_from_anchor": True,
-            "context_tokens": 131072,
-            "context_jitter": 511,
-            "max_num_tokens": 2048,
-        },
-        {
-            "num_reqs": 32,
-            "total_target_tokens": 256,
-            "num_speculative_steps": 7,
-            "sample_from_anchor": True,
-            "max_num_reqs": 128,
-            "max_num_tokens": 8192,
-            "block_size": 256,
-        },
-    ],
-)
-def test_prepare_dflash_inputs_matches_independent_reference(factory_args) -> None:
-    factory_args["candidate_mode"] = "dispatch"
-    case = build_d01_prepare_dflash_inputs_case(factory_args)
-    baseline_output = case.baseline.fn()
-    candidate_output = case.candidate.fn()
+def _run_prepare(*, target_positions: list[int], block_table_values: list[int]):
+    device = torch.device("cuda")
+    max_num_reqs = 4
+    max_num_tokens = 16
+    num_speculative_steps = 3
+    input_buffers = SimpleNamespace(
+        input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
+        positions=torch.full((max_num_tokens,), -1, dtype=torch.int64, device=device),
+        query_start_loc=torch.full(
+            (max_num_reqs + 1,), -1, dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.full((max_num_reqs,), -1, dtype=torch.int32, device=device),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
+    )
+    query_slots = torch.full((max_num_tokens,), -2, dtype=torch.int64, device=device)
+    context_positions = torch.full(
+        (max_num_tokens,), -1, dtype=torch.int64, device=device
+    )
+    context_slots = torch.full((max_num_tokens,), -2, dtype=torch.int64, device=device)
+    sample_indices = torch.full(
+        (max_num_reqs * num_speculative_steps,),
+        -1,
+        dtype=torch.int64,
+        device=device,
+    )
+    sample_pos = torch.full_like(sample_indices, -1)
+    sample_idx_mapping = torch.full(
+        sample_indices.shape, -1, dtype=torch.int32, device=device
+    )
+    last_sampled = torch.tensor([0, 0, 99, 0], dtype=torch.int64, device=device)
+    next_prefill_tokens = torch.zeros_like(last_sampled)
+    block_table = torch.tensor([block_table_values], dtype=torch.int32, device=device)
+
+    prepare_dflash_inputs(
+        input_buffers,
+        query_slots,
+        context_positions,
+        context_slots,
+        sample_indices,
+        sample_pos,
+        sample_idx_mapping,
+        input_batch,
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([2], dtype=torch.int32, device=device),
+        last_sampled,
+        next_prefill_tokens,
+        block_table,
+        4,
+        123,
+        num_speculative_steps,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        128,
+        sample_from_anchor=True,
+    )
     torch.accelerator.synchronize()
-    assert case.candidate.correctness_comparator is not None
-    comparison = case.candidate.correctness_comparator(
-        baseline_output, candidate_output, case.tolerances
+    return SimpleNamespace(
+        input_buffers=input_buffers,
+        query_slots=query_slots.cpu(),
+        context_positions=context_positions.cpu(),
+        context_slots=context_slots.cpu(),
+        sample_indices=sample_indices.cpu(),
+        sample_pos=sample_pos.cpu(),
+        sample_idx_mapping=sample_idx_mapping.cpu(),
     )
-    assert comparison["passed"], comparison
 
 
-def test_prepare_dflash_inputs_cuda_graph_replay() -> None:
-    case = build_d01_prepare_dflash_inputs_case(
-        {
-            "num_reqs": 4,
-            "total_target_tokens": 32,
-            "target_query_lens": [1, 7, 8, 16],
-            "num_rejected": [0, 2, 7, 3],
-            "num_sampled": [1, 0, 2, 0],
-            "num_speculative_steps": 7,
-            "sample_from_anchor": True,
-            "max_num_reqs": 128,
-            "max_num_tokens": 2048,
-            "candidate_mode": "dispatch",
-        }
+def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
     )
-    runner = GraphRunner(case.candidate, repeats=3)
-    runner.capture()
-    runner.replay()
-    torch.accelerator.synchronize()
-    baseline_output = case.baseline.fn()
-    torch.accelerator.synchronize()
-    assert runner.output is not None
-    assert case.candidate.correctness_comparator is not None
-    comparison = case.candidate.correctness_comparator(
-        baseline_output, runner.output, case.tolerances
-    )
-    assert comparison["passed"], comparison
+
+    assert out.context_positions[:4].tolist() == [10, 11, 0, 0]
+    assert out.context_slots[:4].tolist() == [30, 31, PAD_SLOT_ID, PAD_SLOT_ID]
+    assert out.input_buffers.input_ids[:3].cpu().tolist() == [99, 123, 123]
+    assert out.input_buffers.positions[:3].cpu().tolist() == [12, 13, 14]
+    assert out.query_slots[:3].tolist() == [32, 33, 34]
+    assert out.sample_indices[:3].tolist() == [0, 1, 2]
+    assert out.sample_pos[:3].tolist() == [13, 14, 15]
+    assert out.sample_idx_mapping[:3].tolist() == [2, 2, 2]
 
 
-@pytest.mark.parametrize(
-    ("max_tokens_per_req", "baseline", "sm120"),
-    [(1, 1, 128), (15, 16, 128), (48, 64, 128), (129, 256, 256), (4096, 256, 256)],
-)
-def test_prepare_dflash_block_size_dispatch(
-    monkeypatch,
-    max_tokens_per_req: int,
-    baseline: int,
-    sm120: int,
-) -> None:
-    monkeypatch.setattr(
-        dflash_speculator.current_platform,
-        "is_device_capability_family",
-        lambda family: False,
+def test_prepare_dflash_inputs_never_writes_the_null_block():
+    out = _run_prepare(
+        target_positions=[2, 3, 4, 5],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
     )
-    assert (
-        dflash_speculator._select_prepare_dflash_block_size(max_tokens_per_req)
-        == baseline
-    )
-    monkeypatch.setattr(
-        dflash_speculator.current_platform,
-        "is_device_capability_family",
-        lambda family: family == 120,
-    )
-    assert (
-        dflash_speculator._select_prepare_dflash_block_size(max_tokens_per_req) == sm120
-    )
+
+    assert out.context_slots[:4].tolist() == [
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+    ]
+    assert out.query_slots[:3].tolist() == [
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+    ]

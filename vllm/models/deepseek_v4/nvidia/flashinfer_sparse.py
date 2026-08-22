@@ -35,6 +35,19 @@ if TYPE_CHECKING:
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
+# Sparse MLA h_q counts accepted natively (flashinfer>=0.6.14, #3545).
+_SPARSE_MLA_SUPPORTED_Q_HEADS = (8, 16, 32, 64, 128)
+
+
+def _pad_to_supported_q_heads(num_heads: int) -> int:
+    for supported in _SPARSE_MLA_SUPPORTED_Q_HEADS:
+        if num_heads <= supported:
+            return supported
+    raise ValueError(
+        f"DeepseekV4 FlashInfer MLA Sparse does not support {num_heads} heads "
+        "(sparse MLA kernel requires h_q in {8, 16, 32, 64, 128})."
+    )
+
 
 def _is_flashinfer_sparse_jit_capability(capability: DeviceCapability) -> bool:
     """SM12 native; SM89 via ported sparse MLA JIT kernels."""
@@ -238,13 +251,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        # FP8 decode kernel only supports h_q = 64 or 128.
-        if num_heads > 128:
-            raise ValueError(
-                f"DeepseekV4 FlashInfer MLA Sparse does not support {num_heads} heads "
-                "(FP8 decode kernel requires h_q in {64, 128})."
-            )
-        return 64 if num_heads <= 64 else 128
+        return _pad_to_supported_q_heads(num_heads)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
@@ -298,9 +305,8 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        # The TRTLLM-gen kernel requires h_q in {64, 128}, so the output buffer
-        # is allocated at the padded head count while q arrives at the local
-        # head count; _forward pads q to match before the launcher.
+        # The output buffer is allocated at a supported padded head count while
+        # q arrives at the local head count; _forward pads q to match.
         assert output.shape[0] == q.shape[0] and output.shape[-1] == q.shape[-1], (
             f"output buffer shape {output.shape} incompatible with q shape {q.shape}"
         )
@@ -375,8 +381,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         assert swa_metadata.decode_swa_indices is not None
         assert swa_metadata.block_table is not None
 
-        decode_swa_width = swa_metadata.decode_swa_indices.shape[-1]
-        assert num_prefill_tokens == 0 or decode_swa_width == self.window_size
+        decode_swa_width = swa_metadata.decode_swa_width
         decode_swa_indices = swa_metadata.decode_swa_indices.reshape(
             num_decode_tokens, decode_swa_width
         )
@@ -468,7 +473,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 swa_metadata.block_size,
                 compressed_block_table,
                 compressed_block_size,
-                decode_swa_width,
+                self.window_size,
                 self.compress_ratio,
                 top_k,
                 decode_compressed_indices_are_local=decode_compressed_indices_are_local,
@@ -530,9 +535,8 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             assert query.dtype == torch.bfloat16
             query = query.contiguous()
 
-        # The TRTLLM-gen sparse-MLA kernel requires h_q in {64, 128}; zero-pad
-        # the query heads to the allocated output head count. Padded heads attend
-        # to the shared KV and are sliced off downstream (output is padded too).
+        # Zero-pad the query heads to the allocated supported output head count.
+        # Padded heads attend to the shared KV and are sliced off downstream.
         padded_heads = output.shape[1]
         if query.shape[1] < padded_heads:
             padded_query = query.new_zeros(
@@ -612,18 +616,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        if num_heads <= 16:
-            return 16
-        if num_heads <= 32:
-            return 32
-        if num_heads <= 64:
-            return 64
-        if num_heads <= 128:
-            return 128
-        raise ValueError(
-            f"DeepseekV4 FlashInfer MLA Sparse does not support {num_heads} heads "
-            "(SM120 kernel requires h_q in {16, 32, 64, 128})."
-        )
+        return _pad_to_supported_q_heads(num_heads)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -24,6 +26,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
@@ -180,41 +183,75 @@ class DraftModelSpeculator(BaseSpeculator):
                 num_unpadded_tokens,
             )
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """Config used by the draft attention metadata builders."""
+        return self.vllm_config
+
     def set_attn(
         self,
         model_state: ModelState,
         kv_cache_config: KVCacheConfig,
         block_tables: BlockTables,
+        target_input_buffers: InputBuffers,
+        target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
-        self.attn_groups, _, _ = init_attn_backend(
+        self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
-            self.vllm_config,
+            self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )
         self.block_tables = block_tables
+        self.target_input_buffers = target_input_buffers
+        self.target_attn_groups = target_attn_groups
 
     def _build_draft_attn_metadata(
         self,
         num_reqs: int,
         num_reqs_padded: int,
         num_tokens_padded: int,
+        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+        step: int = 0,
         num_query_per_req: int = 1,
-        causal: bool = True,
+        causal: bool | torch.Tensor | Mapping[int, bool] = True,
+        query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
-        # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
-        # Clamp keeps the series non-decreasing past num_reqs, which some
-        # attention backends require.
-        query_start_loc_cpu = (
-            torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
-            * num_query_per_req
-        )
+        if query_start_loc_np is not None:
+            query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
+            query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(
+                query_start_loc_np[: num_reqs + 1]
+            )
+            query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
+            max_query_len = int(
+                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()
+            )
+        else:
+            # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
+            # Clamp keeps the series non-decreasing past num_reqs, which some
+            # attention backends require.
+            query_start_loc_cpu = (
+                torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
+                * num_query_per_req
+            )
+            max_query_len = num_query_per_req
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
         slot_mappings = self.block_tables.slot_mappings[:, :num_tokens_padded]
+        draft_seq_lens_cpu_upper_bound = None
+        if seq_lens_cpu_upper_bound is not None:
+            draft_seq_lens_cpu_upper_bound = torch.zeros(
+                num_reqs_padded, dtype=torch.int32, device="cpu"
+            )
+            torch.add(
+                seq_lens_cpu_upper_bound[:num_reqs],
+                step,
+                out=draft_seq_lens_cpu_upper_bound[:num_reqs],
+            )
+            draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -223,12 +260,13 @@ class DraftModelSpeculator(BaseSpeculator):
                 : num_reqs_padded + 1
             ],
             query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=num_query_per_req,
+            max_query_len=max_query_len,
             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
             max_seq_len=self.draft_max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
             causal=causal,
         )
         return attn_metadata

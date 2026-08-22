@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -25,6 +28,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
@@ -71,8 +75,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
-        self.sample_idx_mapping = torch.zeros(
-            max_num_sampled_tokens, dtype=torch.int32, device=device
+        self.sample_idx_mapping = torch.full(
+            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
@@ -83,9 +87,31 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        return replace(
+            self.vllm_config,
+            attention_config=replace(
+                self.vllm_config.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        supports_full = (
+            self.attn_cg_support.min_cg_support.value
+            >= AttentionCGSupport.UNIFORM_BATCH.value
+        )
+        if wants_full and not supports_full:
+            logger.warning(
+                "%s draft attention (%s) does not support full CUDA graphs; "
+                "running the draft eagerly.",
+                self._speculator_name,
+                self.attn_cg_support.min_cg_attn_backend,
+            )
         # PIECEWISE cudagraphs are not supported for dflash
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+        if wants_full and supports_full:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
@@ -95,7 +121,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            causal=self.dflash_causal,
         )
 
     def capture(self, attn_states: dict | None = None) -> None:
@@ -112,6 +137,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             self.max_model_len,
+            causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
@@ -127,8 +153,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         model_state: ModelState,
         kv_cache_config: KVCacheConfig,
         block_tables: BlockTables,
+        target_input_buffers: InputBuffers,
+        target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
-        super().set_attn(model_state, kv_cache_config, block_tables)
+        super().set_attn(
+            model_state,
+            kv_cache_config,
+            block_tables,
+            target_input_buffers,
+            target_attn_groups,
+        )
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
@@ -151,7 +185,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # of the kv-cache group its cache belongs to. Models that share a single group
         # leave this as None and share one context slot mapping.
         self._layer_group_idx: list[int] | None = None
+        self._group_causal: bool | Mapping[int, bool] = self.dflash_causal
         if hasattr(self.model, "get_draft_kv_cache_layer_names"):
+            layer_names = self.model.get_draft_kv_cache_layer_names()
             name_to_gid = {
                 ln: gid
                 for gid, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -159,9 +195,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             }
             gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
             self._layer_group_idx = [
-                gid_to_idx[name_to_gid[name]]
-                for name in self.model.get_draft_kv_cache_layer_names()
+                gid_to_idx[name_to_gid[name]] for name in layer_names
             ]
+            if hasattr(self.model, "get_draft_attn_causal"):
+                self._group_causal = {
+                    name_to_gid[name]: layer_causal
+                    for name, layer_causal in zip(
+                        layer_names, self.model.get_draft_attn_causal()
+                    )
+                }
 
     @torch.inference_mode()
     def _run_model(
@@ -228,8 +270,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs: int,
         num_reqs_padded: int,
         num_tokens_padded: int,
+        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+        step: int = 0,
         num_query_per_req: int | None = None,
-        causal: bool = False,
+        causal: bool | torch.Tensor | Mapping[int, bool] = False,
+        query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -238,8 +283,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs,
             num_reqs_padded,
             num_tokens_padded,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            step=step,
             num_query_per_req=self.num_query_per_req,
             causal=causal,
+            query_start_loc_np=query_start_loc_np,
         )
 
     @torch.inference_mode()
@@ -337,7 +385,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 last_sampled,
                 next_prefill_tokens,
                 self.block_tables.input_block_tables[gid],
-                self.block_tables.block_sizes[gid],
+                self.block_tables.kernel_block_sizes[gid],
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -386,7 +434,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
-            causal=self.dflash_causal,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            step=self.num_query_per_req,
+            causal=self._group_causal,
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
@@ -488,13 +538,14 @@ def _prepare_dflash_inputs_kernel(
         mask=is_valid_ctx,
         other=0,
     ).to(tl.int64)
-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
-    tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
-    tl.store(
-        out_context_slot_mapping_ptr + ctx_start + j,
-        tl.where(is_valid_ctx, ctx_slot, PAD_SLOT_ID),
-        mask=is_ctx,
+    ctx_resident = is_valid_ctx & (ctx_block_id != 0)
+    ctx_slot = tl.where(
+        ctx_resident,
+        ctx_block_id * block_size + (ctx_pos % block_size),
+        PAD_SLOT_ID,
     )
+    tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
@@ -509,7 +560,12 @@ def _prepare_dflash_inputs_kernel(
         mask=is_query,
         other=0,
     ).to(tl.int64)
-    q_slot = q_block_id * block_size + (query_pos % block_size)
+    q_resident = is_query & (q_block_id != 0)
+    q_slot = tl.where(
+        q_resident,
+        q_block_id * block_size + (query_pos % block_size),
+        PAD_SLOT_ID,
+    )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)

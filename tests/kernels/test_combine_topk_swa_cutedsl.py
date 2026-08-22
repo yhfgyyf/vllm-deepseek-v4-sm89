@@ -12,6 +12,7 @@ import torch
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     _COMBINE_SWA_ONLY_CUTEDSL_MIN_TOKENS,
     _COMBINE_TOPK_CUTEDSL_MIN_TOKENS,
+    _combine_topk_swa_indices_triton_baseline,
     combine_topk_swa_indices_fused_triton,
 )
 from vllm.platforms import current_platform
@@ -286,6 +287,23 @@ def test_combine_topk_swa_fused_triton_matches_reference(
     output, output_lens = combine_topk_swa_indices_fused_triton(*args)
     assert torch.equal(output, expected)
     assert torch.equal(output_lens, expected_lens)
+
+
+@requires_sm120
+@torch.inference_mode()
+def test_combine_topk_swa_baseline_reinitializes_preallocated_padding():
+    args, expected, expected_lens = _make_case(512, 4)
+    output = torch.full_like(expected, -777)
+    output_lens = torch.full_like(expected_lens, -777)
+
+    actual, actual_lens = _combine_topk_swa_indices_triton_baseline(
+        *args, out=(output, output_lens)
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    assert actual_lens.data_ptr() == output_lens.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lens, expected_lens)
 
 
 @requires_sm120

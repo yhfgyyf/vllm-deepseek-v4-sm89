@@ -225,3 +225,63 @@ def test_vocab_size_not_multiple_of_block(vocab_size: int):
     df = vocab_size - 1
     if df >= 1:
         assert chi2 < df + 10 * math.sqrt(2 * df), f"chi2={chi2:.1f}, df={df}"
+
+
+@pytest.mark.parametrize("extra_cache_cols", [0, 1])
+def test_logits_cache_columns_stay_separate_across_steps(extra_cache_cols: int):
+    """Each drafting step must land in its own cache column."""
+    torch.manual_seed(0)
+    num_reqs, vocab_size, num_steps = 4, 1031, 3
+    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=DEVICE)
+    temp = torch.ones(num_reqs, dtype=torch.float32, device=DEVICE)
+    seed = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
+    pos = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
+
+    cache = torch.zeros(
+        num_reqs, num_steps, vocab_size + extra_cache_cols, device=DEVICE
+    )
+    cols = torch.arange(num_steps, dtype=torch.int32, device=DEVICE)
+    per_step = [
+        torch.randn(num_reqs, vocab_size, device=DEVICE) for _ in range(num_steps)
+    ]
+
+    for step, logits in enumerate(per_step):
+        gumbel_sample(
+            logits,
+            idx_mapping,
+            temp,
+            seed,
+            pos,
+            apply_temperature=True,
+            output_processed_logits=cache,
+            output_processed_logits_col=cols[step],
+        )
+
+    for step, logits in enumerate(per_step):
+        stored = cache[:, step, :vocab_size]
+        assert torch.equal(stored, logits), f"step {step} cache column was corrupted"
+    assert not cache[:, :, vocab_size:].any()
+
+
+def test_logits_cache_narrower_than_logits_is_rejected():
+    num_reqs, vocab_size, num_steps = 2, 64, 3
+    logits = torch.randn(num_reqs, vocab_size, device=DEVICE)
+    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=DEVICE)
+    temp = torch.ones(num_reqs, dtype=torch.float32, device=DEVICE)
+    seed = torch.zeros(num_reqs, dtype=torch.int64, device=DEVICE)
+    pos = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
+    cache = torch.zeros(num_reqs, num_steps, vocab_size - 1, device=DEVICE)
+
+    with pytest.raises(AssertionError, match="narrower"):
+        gumbel_sample(
+            logits,
+            idx_mapping,
+            temp,
+            seed,
+            pos,
+            apply_temperature=True,
+            output_processed_logits=cache,
+            output_processed_logits_col=torch.tensor(
+                0, dtype=torch.int32, device=DEVICE
+            ),
+        )

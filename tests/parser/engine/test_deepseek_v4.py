@@ -243,15 +243,26 @@ class TestThinkingModeConfig:
         cfg = deepseek_v4_config(thinking=False)
         assert cfg.initial_state.name == "CONTENT"
 
-    def test_enable_thinking_kwarg(self, mock_tokenizer):
-        p = DeepSeekV4Parser(
-            mock_tokenizer, chat_template_kwargs={"enable_thinking": True}
+    @pytest.mark.parametrize(
+        ("chat_template_kwargs", "expected_state"),
+        [
+            ({}, "REASONING"),
+            ({"thinking": True}, "REASONING"),
+            ({"enable_thinking": True}, "REASONING"),
+            ({"reasoning_effort": "high"}, "REASONING"),
+            ({"thinking": False}, "CONTENT"),
+            ({"enable_thinking": False}, "CONTENT"),
+            ({"enable_thinking": True, "reasoning_effort": "none"}, "CONTENT"),
+        ],
+    )
+    def test_parser_thinking_mode_matches_tokenizer_default(
+        self, mock_tokenizer, chat_template_kwargs, expected_state
+    ):
+        parser = DeepSeekV4Parser(
+            mock_tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
         )
-        assert p.parser_engine_config.initial_state.name == "REASONING"
-
-    def test_no_thinking_kwarg_defaults_to_content(self, mock_tokenizer):
-        p = DeepSeekV4Parser(mock_tokenizer)
-        assert p.parser_engine_config.initial_state.name == "CONTENT"
+        assert parser.parser_engine_config.initial_state.name == expected_state
 
     def test_thinking_mode_reasoning_without_tags(self, mock_tokenizer):
         parser = DeepSeekV4Parser(

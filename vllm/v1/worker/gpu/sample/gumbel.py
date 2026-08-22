@@ -91,8 +91,10 @@ def gumbel_block_argmax(
     temp_ptr,
     seeds_ptr,
     pos_ptr,
+    # [max_num_reqs, num_cols, vocab_size]
     processed_logits_ptr,
-    processed_logits_stride,
+    processed_logits_stride_0,
+    processed_logits_stride_1,
     processed_logits_col_ptr,
     vocab_size,
     APPLY_TEMPERATURE: tl.constexpr,
@@ -121,8 +123,8 @@ def gumbel_block_argmax(
             col = 0
         tl.store(
             processed_logits_ptr
-            + req_state_idx * processed_logits_stride
-            + col * vocab_size
+            + req_state_idx * processed_logits_stride_0
+            + col * processed_logits_stride_1
             + block,
             logits,
             mask=mask & is_valid_req,
@@ -164,8 +166,10 @@ def _gumbel_sample_kernel(
     local_argmax_stride,
     local_max_ptr,
     local_max_stride,
+    # [max_num_reqs, num_cols, vocab_size]
     processed_logits_ptr,
-    processed_logits_stride,
+    processed_logits_stride_0,
+    processed_logits_stride_1,
     processed_logits_col_ptr,
     logits_ptr,
     logits_stride,
@@ -200,7 +204,8 @@ def _gumbel_sample_kernel(
         seeds_ptr,
         pos_ptr,
         processed_logits_ptr,
-        processed_logits_stride,
+        processed_logits_stride_0,
+        processed_logits_stride_1,
         processed_logits_col_ptr,
         vocab_size,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
@@ -260,6 +265,12 @@ def gumbel_sample(
     if output_processed_logits_col is not None:
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
+    if output_processed_logits is not None:
+        assert output_processed_logits.size(-1) >= vocab_size, (
+            "draft logits cache vocab dim "
+            f"({output_processed_logits.size(-1)}) is narrower than the sampled "
+            f"logits ({vocab_size}). Cached logits would be truncated."
+        )
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
@@ -276,6 +287,7 @@ def gumbel_sample(
         local_max.stride(0),
         output_processed_logits,
         output_processed_logits.stride(0) if output_processed_logits is not None else 0,
+        output_processed_logits.stride(1) if output_processed_logits is not None else 0,
         output_processed_logits_col,
         logits,
         logits.stride(0),

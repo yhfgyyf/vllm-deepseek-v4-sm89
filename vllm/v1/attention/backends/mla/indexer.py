@@ -89,9 +89,13 @@ def _prepare_uniform_decode_kernel(
     req_id = idx // max_decode_len
     local_idx = idx % max_decode_len
 
-    # Compute number of KVs attended to by this token.
+    # Padding requests can have seq_len == 0. Clamp before optional
+    # compression so downstream uint32 consumers never see a wrapped -1.
     seq_len = tl.load(seq_lens_ptr + req_id)
-    per_token_seq_len = seq_len - max_decode_len + local_idx + 1
+    per_token_seq_len = tl.maximum(
+        seq_len - max_decode_len + local_idx + 1,
+        0,
+    )
     if COMPRESS_RATIO > 1:
         per_token_seq_len //= COMPRESS_RATIO
     tl.store(decode_seq_lens_ptr + idx, per_token_seq_len)
@@ -605,7 +609,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     - max_decode_len
                     + 1
                     + self.offsets_buffer[:max_decode_len]
-                )
+                ).clamp_(min=0)
                 seq_lens = seq_lens_buffer
             return (
                 seq_lens,

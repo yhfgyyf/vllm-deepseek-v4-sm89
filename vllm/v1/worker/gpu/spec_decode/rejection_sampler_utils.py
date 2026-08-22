@@ -108,6 +108,8 @@ def _compute_global_target_argmax(
         mask=blocks_mask,
         other=float("-inf"),
     )
+    # See _insert_resampled_kernel: NaN breaks tl.argmax index bounds.
+    local_max = tl.where(local_max != local_max, float("-inf"), local_max)
     max_block_idx = tl.argmax(local_max, axis=0)
     return tl.load(
         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
@@ -783,7 +785,8 @@ def _resample_kernel(
         seed_ptr,
         pos_ptr,
         None,  # processed_logits_ptr
-        0,  # processed_logits_stride
+        0,  # processed_logits_stride_0
+        0,  # processed_logits_stride_1
         None,  # processed_logits_col_ptr
         vocab_size,
         APPLY_TEMPERATURE=False,
@@ -848,6 +851,14 @@ def _insert_resampled_kernel(
         resampled_local_max_ptr + req_idx * resampled_local_max_stride + block,
         mask=mask,
         other=float("-inf"),
+    )
+    # NaN max values (from NaN target logits) make tl.argmax return an
+    # out-of-range block index (into the padded region), causing an OOB read
+    # of resampled_local_argmax. Map NaN to -inf so argmax stays in range.
+    resampled_local_max = tl.where(
+        resampled_local_max != resampled_local_max,
+        float("-inf"),
+        resampled_local_max,
     )
     resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
     resampled = tl.load(
