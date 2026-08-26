@@ -12,7 +12,7 @@
 ### 2026-08-26
 
 - 当前 CUDA 13.2 Release 中的 FlashInfer Python wheel 已从 `0.6.17+sm89.1` 替换为 `0.6.17+sm89.2`，增加 DSV4 sparse MLA prefill `num_heads=8` 的单缓存、双缓存分发和边界保护。
-- 旧 `sm89.1` wheel 已从 Release 删除。现有 vLLM wheel 的历史元数据仍锁定 `sm89.1`，因此快速安装命令使用 uv `--overrides` 选择 `sm89.2`；源码依赖已同步更新，后续 vLLM wheel 会直接锁定 `sm89.2`。
+- vLLM wheel 的依赖元数据已同步为 `flashinfer-python==0.6.17+sm89.2`，安装时不再需要 uv `--overrides`。除 `METADATA` 和重新生成的 `RECORD` 外，vLLM wheel 其余 4471 个文件逐字节一致。
 
 ### 2026-08-22
 
@@ -132,20 +132,14 @@ gh release download v0.23.1rc1.dev904-g998fd644b-cu132-sm89 \
   --pattern 'vllm-*.cu132-cp312-cp312-linux_x86_64.whl' \
   --dir /tmp/vllm-sm89-release
 
-printf '%s\n' \
-  'flashinfer-python @ file:///tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-py3-none-any.whl' \
-  > /tmp/vllm-sm89-release/uv-overrides.txt
-
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install \
   /tmp/vllm-sm89-release/flashinfer_cubin-0.6.17-*.whl \
+  /tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-*.whl \
   /tmp/vllm-sm89-release/vllm-*.cu132-cp312-cp312-linux_x86_64.whl \
-  --overrides /tmp/vllm-sm89-release/uv-overrides.txt \
   --torch-backend=cu130
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
-
-> 当前 Release 中的 vLLM wheel 早于 H8 hotfix 构建，包元数据仍声明 `flashinfer-python==0.6.17+sm89.1`。`--overrides` 用本地 wheel 的直接引用覆盖依赖解析，运行时实际安装的是 `sm89.2`；因此 `uv pip check` 会报告这一条已知的元数据不一致，直到下一次重新构建 vLLM wheel。
 
 **已验证过的环境**:
 

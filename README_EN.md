@@ -11,8 +11,8 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 ### 2026-08-26
 
-- Replaced the FlashInfer Python wheel in the current CUDA 13.2 release from `0.6.17+sm89.1` to `0.6.17+sm89.2`. The new wheel adds single-cache and dual-cache DSV4 sparse-MLA prefill dispatch and bounds protection for `num_heads=8`.
-- Removed the old `sm89.1` wheel from the release. The existing vLLM wheel's historical metadata still pins `sm89.1`, so the quick-install command uses uv `--overrides` to select `sm89.2`. The source dependency is updated so future vLLM wheels pin `sm89.2` directly.
+- Replaced the FlashInfer Python wheel in the current CUDA 13.2 Release from `0.6.17+sm89.1` with `0.6.17+sm89.2`, adding single-cache and dual-cache dispatch plus boundary guards for DSV4 sparse MLA prefill with `num_heads=8`.
+- Updated the vLLM wheel metadata to require `flashinfer-python==0.6.17+sm89.2`, so uv `--overrides` is no longer needed. All 4,471 vLLM wheel files other than `METADATA` and the regenerated `RECORD` remain byte-identical.
 
 ### 2026-08-22
 
@@ -132,20 +132,14 @@ gh release download v0.23.1rc1.dev904-g998fd644b-cu132-sm89 \
   --pattern 'vllm-*.cu132-cp312-cp312-linux_x86_64.whl' \
   --dir /tmp/vllm-sm89-release
 
-printf '%s\n' \
-  'flashinfer-python @ file:///tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-py3-none-any.whl' \
-  > /tmp/vllm-sm89-release/uv-overrides.txt
-
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install \
   /tmp/vllm-sm89-release/flashinfer_cubin-0.6.17-*.whl \
+  /tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-*.whl \
   /tmp/vllm-sm89-release/vllm-*.cu132-cp312-cp312-linux_x86_64.whl \
-  --overrides /tmp/vllm-sm89-release/uv-overrides.txt \
   --torch-backend=cu130
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
-
-> The vLLM wheel in this release predates the H8 hotfix and still declares `flashinfer-python==0.6.17+sm89.1` in its package metadata. `--overrides` replaces that dependency during resolution with a direct reference to the local wheel, so the installed runtime wheel is `sm89.2`. As a result, `uv pip check` reports this one known metadata mismatch until the next vLLM wheel rebuild.
 
 **Validated environment:**
 
