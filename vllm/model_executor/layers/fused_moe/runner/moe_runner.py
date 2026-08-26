@@ -4,6 +4,8 @@ from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -55,6 +57,13 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# R2-W6: reorder toggle. When True (default), the shared experts are launched
+# on the aux stream before the routed work and re-synced via
+# SharedExperts.wait_shared_experts() after it (W5 round-1 (c)); when False,
+# the stock late launch is used. Read at call time so it can be flipped for
+# in-process A/B (see reorder_ab.py).
+_W6_EARLY_SHARED = os.environ.get("W6_EARLY_SHARED", "1") == "1"
 
 
 def register_layer_for_moe_forward_op(
@@ -555,6 +564,17 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        # R2-W6: kernel reorder (W5 round-1 (c)). Launch the shared experts
+        # on the aux stream BEFORE the routed work (their input clone is
+        # ready and the aux stream already synced in
+        # maybe_sync_shared_experts_stream), so their w8a8 GEMMs overlap the
+        # gate/topk/marlin work. Toggle kept for in-process A/B; the
+        # re-sync (wait_shared_experts) happens after forward_modular below.
+        if _W6_EARLY_SHARED:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            )
+
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
@@ -579,10 +599,22 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
             )
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
+        if _W6_EARLY_SHARED:
+            # Already launched early; re-sync the main stream with the aux
+            # stream now that the routed experts (the bulk of the layer)
+            # have been enqueued.
+            if self._shared_experts is not None:
+                self._shared_experts.wait_shared_experts()
+        else:
+            # Stock path: launch after the routed work, then re-sync
+            # (the wait used to be inside _run_in_aux_stream; it is now
+            # explicit here so both paths share the same re-sync point).
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+            if self._shared_experts is not None:
+                self._shared_experts.wait_shared_experts()
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,

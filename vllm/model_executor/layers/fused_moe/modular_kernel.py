@@ -1265,20 +1265,20 @@ class FusedMoEKernelModularImpl:
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
-        # double-copy MoE write-back path).
-        if current_platform.is_rocm():
-            from vllm._aiter_ops import rocm_aiter_ops
-
-            if (
-                rocm_aiter_ops.is_fused_moe_enabled()
-                and output_alias is not None
-                and output_alias.shape == fused_out.shape
-                and output_alias.dtype == fused_out.dtype
-                and output_alias.device == fused_out.device
-                and output_alias.is_contiguous()
-            ):
-                fused_out = output_alias
+        # This eliminates the per-forward DtoD copy (output.copy_ of the whole
+        # (M, K) buffer) on CUDA as well as ~94% of __amd_rocclr_copyBuffer
+        # events (Copy 2 of the double-copy MoE write-back path) on ROCm.
+        # Safe for the marlin path: the marlin GEMMs write into the workspace
+        # intermediate caches, and `output` is only the moe_sum destination
+        # (a plain (M, K) write), which the aliased buffer satisfies exactly.
+        if (
+            output_alias is not None
+            and output_alias.shape == fused_out.shape
+            and output_alias.dtype == fused_out.dtype
+            and output_alias.device == fused_out.device
+            and output_alias.is_contiguous()
+        ):
+            fused_out = output_alias
 
         self.fused_experts.apply(
             output=fused_out,

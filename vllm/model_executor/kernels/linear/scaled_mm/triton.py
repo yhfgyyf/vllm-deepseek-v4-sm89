@@ -170,6 +170,24 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        # Perf (it.20): DSV4 stores weight scales in E8M0 (ue8m0). The op
+        # upcasts Bs to fp32 on EVERY call; Bs is static per layer, so cache
+        # the upcast once. Bit-identical result (same conversion), removes
+        # ~3 elementwise kernels per call (~2.8% of decode step measured).
+        # Keyed by data_ptr/shape to stay correct across weight reloads.
+        if Bs.dtype == torch.float8_e8m0fnu:
+            key = (Bs.data_ptr(), Bs.shape, Bs.dtype)
+            cache = getattr(self, "_bs_fp32_cache", None)
+            if cache is None or cache[0] != key:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                    _upcast_e8m0_to_fp32,
+                )
+                self._bs_fp32_cache = (
+                    key,
+                    _upcast_e8m0_to_fp32(Bs).contiguous(),
+                )
+                cache = self._bs_fp32_cache
+            Bs = cache[1]
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
