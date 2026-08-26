@@ -9,6 +9,11 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 ## Changelog
 
+### 2026-08-26
+
+- Replaced the FlashInfer Python wheel in the current CUDA 13.2 release from `0.6.17+sm89.1` to `0.6.17+sm89.2`. The new wheel adds single-cache and dual-cache DSV4 sparse-MLA prefill dispatch and bounds protection for `num_heads=8`.
+- Removed the old `sm89.1` wheel from the release. The existing vLLM wheel's historical metadata still pins `sm89.1`, so the quick-install command uses uv `--overrides` to select `sm89.2`. The source dependency is updated so future vLLM wheels pin `sm89.2` directly.
+
 ### 2026-08-22
 
 - Selectively backported vLLM v0.27.1-era DeepSeek-V4 fixes and optimizations: tokenizer/parser fixes, DSpark target/draft backend alignment, DFlash hybrid causal metadata, mHC broadcast, the specialized DSV4 top-k path, sparse-index metadata optimizations, and sparse MLA / SWA boundary fixes. The SM89 FlashInfer path keeps its wide-eager CUDA Graph guard.
@@ -80,7 +85,7 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer), 
 
 ### SM89 changes
 
-- The `flashinfer-python==0.6.17+sm89.1` sparse MLA JIT path admits exact capability `8.9`; other 8.x GPUs remain rejected.
+- The `flashinfer-python==0.6.17+sm89.2` sparse MLA JIT path admits exact capability `8.9`; other 8.x GPUs remain rejected. This version also supports DSV4 prefill with `num_heads=8`.
 - `vllm/v1/attention/backends/mla/indexer.py` uses `is_deep_gemm_supported()` for scheduler metadata, preventing SM89 from calling the DeepGEMM metadata API.
 - `vllm/models/deepseek_v4/compressor.py` and `vllm/utils/import_utils.py` select existing Triton/torch fallbacks on SM89 and avoid SM90+ CuTe-DSL instructions.
 - MXFP4 MoE continues to select Marlin on SM89 instead of Blackwell-only DeepGEMM FP4.
@@ -109,7 +114,7 @@ See [`deepseek-v4-sm89-upstream-pr-analysis.md`](deepseek-v4-sm89-upstream-pr-an
 | Driver / CUDA toolkit | 595.x / **CUDA 13.2** (nvcc 13.2) |
 | Python | 3.12 |
 | torch / Triton | **2.13.0+cu130 / 3.7.1** |
-| FlashInfer | **0.6.17+sm89.1 sparse MLA fork** + cubin 0.6.17 |
+| FlashInfer | **0.6.17+sm89.2 sparse MLA fork** + cubin 0.6.17 |
 | vLLM | `0.23.1rc1.dev904+sm89.cu132`, CPython 3.12, SM89/Ada |
 
 ---
@@ -120,28 +125,35 @@ See [`deepseek-v4-sm89-upstream-pr-analysis.md`](deepseek-v4-sm89-upstream-pr-an
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.17*sm89*.whl' \
+gh release download v0.23.1rc1.dev904-g998fd644b-cu132-sm89 \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.17+sm89.2-*.whl' \
   --pattern 'flashinfer_cubin-0.6.17-*.whl' \
   --pattern 'vllm-*.cu132-cp312-cp312-linux_x86_64.whl' \
   --dir /tmp/vllm-sm89-release
 
+printf '%s\n' \
+  'flashinfer-python @ file:///tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-py3-none-any.whl' \
+  > /tmp/vllm-sm89-release/uv-overrides.txt
+
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install \
   /tmp/vllm-sm89-release/flashinfer_cubin-0.6.17-*.whl \
-  /tmp/vllm-sm89-release/flashinfer_python-0.6.17*sm89*.whl \
   /tmp/vllm-sm89-release/vllm-*.cu132-cp312-cp312-linux_x86_64.whl \
+  --overrides /tmp/vllm-sm89-release/uv-overrides.txt \
   --torch-backend=cu130
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
+
+> The vLLM wheel in this release predates the H8 hotfix and still declares `flashinfer-python==0.6.17+sm89.1` in its package metadata. `--overrides` replaces that dependency during resolution with a direct reference to the local wheel, so the installed runtime wheel is `sm89.2`. As a result, `uv pip check` reports this one known metadata mismatch until the next vLLM wheel rebuild.
 
 **Validated environment:**
 
 - **Python 3.12**, Linux x86_64
 - **4× RTX 4090 (SM89/Ada, 48 GB)**, 595.x driver, CUDA toolkit 13.2
 - **torch 2.13.0+cu130**, **Triton 3.7.1**
-- **FlashInfer 0.6.17+sm89.1 fork**; official 0.6.17 does not contain the sparse MLA SM89 JIT patch required by this release
-- `flashinfer-cubin==0.6.17`; set `FLASHINFER_DISABLE_VERSION_CHECK=1` because the Python wheel carries the `+sm89.1` local-version suffix
+- **FlashInfer 0.6.17+sm89.2 fork**; official 0.6.17 does not contain the sparse MLA SM89 JIT patch required by this release
+- `flashinfer-cubin==0.6.17`; set `FLASHINFER_DISABLE_VERSION_CHECK=1` because the Python wheel carries the `+sm89.2` local-version suffix
 - Wheel built with `TORCH_CUDA_ARCH_LIST=8.9+PTX`, targeting Ada/SM89
 
 ---

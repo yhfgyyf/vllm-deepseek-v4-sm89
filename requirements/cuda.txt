@@ -12,7 +12,7 @@ torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
 # This branch requires the SM89-patched Python wheel from the matching release.
 # Install it together with the matching official cubin wheel from that release.
-flashinfer-python==0.6.17+sm89.1
+flashinfer-python==0.6.17+sm89.2
 flashinfer-cubin==0.6.17
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12

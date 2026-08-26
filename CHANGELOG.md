@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-08-26 - FlashInfer DSV4 prefill H8 hotfix
+
+### 中文
+
+- 将 CUDA 13.2 Release 的 `flashinfer-python` 从 `0.6.17+sm89.1` 替换为 `0.6.17+sm89.2`，增加 DSV4 sparse MLA prefill `num_heads=8` 的单缓存、双缓存分发和全局访问边界保护。
+- 删除 Release 中的旧 `sm89.1` wheel，并同步更新 `MANIFEST.json`、`SHA256SUMS`、中英文安装说明和源码依赖。
+- 现有 vLLM wheel 的历史元数据仍锁定 `sm89.1`；安装说明通过 uv `--overrides` 选择 `sm89.2`，后续重新构建的 vLLM wheel 将直接锁定新版本。
+
+### English
+
+- Replaced `flashinfer-python` in the CUDA 13.2 release from `0.6.17+sm89.1` to `0.6.17+sm89.2`, adding single-cache and dual-cache DSV4 sparse-MLA prefill dispatch and global-access bounds protection for `num_heads=8`.
+- Removed the old `sm89.1` wheel from the release and updated `MANIFEST.json`, `SHA256SUMS`, the Chinese and English installation instructions, and the source dependency.
+- The existing vLLM wheel's historical metadata still pins `sm89.1`; the installation instructions use uv `--overrides` to select `sm89.2`, while future rebuilt vLLM wheels will pin the new version directly.
+
 ## 2026-08-22 - vLLM upstream sync, DSpark k=7, and CUDA 13.2 wheels
 
 ### 中文

@@ -9,6 +9,11 @@
 
 ## Changelog
 
+### 2026-08-26
+
+- 当前 CUDA 13.2 Release 中的 FlashInfer Python wheel 已从 `0.6.17+sm89.1` 替换为 `0.6.17+sm89.2`，增加 DSV4 sparse MLA prefill `num_heads=8` 的单缓存、双缓存分发和边界保护。
+- 旧 `sm89.1` wheel 已从 Release 删除。现有 vLLM wheel 的历史元数据仍锁定 `sm89.1`，因此快速安装命令使用 uv `--overrides` 选择 `sm89.2`；源码依赖已同步更新，后续 vLLM wheel 会直接锁定 `sm89.2`。
+
 ### 2026-08-22
 
 - 选择性回移植 vLLM `v0.27.1` 时期的 DeepSeek-V4 修复与优化：tokenizer/parser 修复、DSpark target/draft backend 对齐、DFlash hybrid causal metadata、mHC broadcast、DSV4 专用 top-k、sparse index 元数据优化，以及 sparse MLA / SWA 边界修复；SM89 FlashInfer 路径继续保留宽 eager CUDA Graph guard。
@@ -80,7 +85,7 @@ DeepSeek-V4-Flash 使用 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 
 ### SM89 相关改动
 
-- `flashinfer-python==0.6.17+sm89.1` 的 sparse MLA JIT 路径开放到精确 capability `8.9`，其它 8.x GPU 仍拒绝。
+- `flashinfer-python==0.6.17+sm89.2` 的 sparse MLA JIT 路径开放到精确 capability `8.9`，其它 8.x GPU 仍拒绝；该版本同时支持 DSV4 prefill `num_heads=8`。
 - `vllm/v1/attention/backends/mla/indexer.py` 按 `is_deep_gemm_supported()` 生成 scheduler metadata，避免 SM89 误走 DeepGEMM metadata API。
 - `vllm/models/deepseek_v4/compressor.py` 和 `vllm/utils/import_utils.py` 在 SM89 上选择现有 Triton/torch fallback，避开 SM90+ CuTe-DSL 指令。
 - MXFP4 MoE 在 SM89 上继续选择 Marlin，不会误选 Blackwell-only DeepGEMM FP4。
@@ -109,7 +114,7 @@ DeepSeek-V4-Flash 使用 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 | 驱动 / CUDA toolkit | 595.x / **CUDA 13.2**（nvcc 13.2） |
 | Python | 3.12 |
 | torch / Triton | **2.13.0+cu130 / 3.7.1** |
-| FlashInfer | **0.6.17+sm89.1 sparse MLA fork** + cubin 0.6.17 |
+| FlashInfer | **0.6.17+sm89.2 sparse MLA fork** + cubin 0.6.17 |
 | vLLM | `0.23.1rc1.dev904+sm89.cu132`，CPython 3.12，SM89/Ada |
 
 ---
@@ -120,28 +125,35 @@ DeepSeek-V4-Flash 使用 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.17*sm89*.whl' \
+gh release download v0.23.1rc1.dev904-g998fd644b-cu132-sm89 \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.17+sm89.2-*.whl' \
   --pattern 'flashinfer_cubin-0.6.17-*.whl' \
   --pattern 'vllm-*.cu132-cp312-cp312-linux_x86_64.whl' \
   --dir /tmp/vllm-sm89-release
 
+printf '%s\n' \
+  'flashinfer-python @ file:///tmp/vllm-sm89-release/flashinfer_python-0.6.17+sm89.2-py3-none-any.whl' \
+  > /tmp/vllm-sm89-release/uv-overrides.txt
+
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install \
   /tmp/vllm-sm89-release/flashinfer_cubin-0.6.17-*.whl \
-  /tmp/vllm-sm89-release/flashinfer_python-0.6.17*sm89*.whl \
   /tmp/vllm-sm89-release/vllm-*.cu132-cp312-cp312-linux_x86_64.whl \
+  --overrides /tmp/vllm-sm89-release/uv-overrides.txt \
   --torch-backend=cu130
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
+
+> 当前 Release 中的 vLLM wheel 早于 H8 hotfix 构建，包元数据仍声明 `flashinfer-python==0.6.17+sm89.1`。`--overrides` 用本地 wheel 的直接引用覆盖依赖解析，运行时实际安装的是 `sm89.2`；因此 `uv pip check` 会报告这一条已知的元数据不一致，直到下一次重新构建 vLLM wheel。
 
 **已验证过的环境**:
 
 - **Python 3.12** · Linux x86_64
 - **4× RTX 4090 (SM89/Ada, 48GB)** · 驱动 595.x · CUDA toolkit 13.2
 - **torch 2.13.0+cu130** · **Triton 3.7.1**
-- **FlashInfer 0.6.17+sm89.1 fork**；官方 0.6.17 不包含本 release 所需的 SM89 sparse MLA JIT 补丁
-- `flashinfer-cubin==0.6.17`；由于 Python wheel 带 `+sm89.1` 本地版本后缀，运行前设置 `FLASHINFER_DISABLE_VERSION_CHECK=1`
+- **FlashInfer 0.6.17+sm89.2 fork**；官方 0.6.17 不包含本 release 所需的 SM89 sparse MLA JIT 补丁
+- `flashinfer-cubin==0.6.17`；由于 Python wheel 带 `+sm89.2` 本地版本后缀，运行前设置 `FLASHINFER_DISABLE_VERSION_CHECK=1`
 - wheel 使用 `TORCH_CUDA_ARCH_LIST=8.9+PTX` 编译，面向 Ada/SM89
 
 ---
