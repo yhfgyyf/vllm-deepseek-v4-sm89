@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Callable
 from functools import cache
@@ -17,6 +18,8 @@ if TYPE_CHECKING or current_platform.is_cuda():
             "tilelang is required for mhc but is not installed. Install it with "
             "`pip install tilelang`."
         )
+    with contextlib.suppress(Exception):
+        import flashinfer.comm  # noqa: F401
     import tilelang
     import tilelang.language as T
 else:
@@ -41,6 +44,8 @@ def _ensure_tilelang_imported() -> None:
             "tilelang is required for mhc but is not installed. Install it with "
             "`pip install tilelang`."
         )
+    with contextlib.suppress(Exception):
+        import flashinfer.comm  # noqa: F401
     import tilelang as tilelang_module
     import tilelang.language as tilelang_language
 

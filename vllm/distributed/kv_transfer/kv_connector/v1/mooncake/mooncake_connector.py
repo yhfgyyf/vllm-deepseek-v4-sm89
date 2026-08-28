@@ -56,6 +56,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -1675,11 +1676,12 @@ class MooncakeConnectorWorker:
                 block_len = region_cache.stride(0) * region_cache.element_size()
                 region_base_addresses.append(base_addr)
 
-                kv_block_len = (
-                    layer_spec.page_size_bytes
-                    if isinstance(layer_spec, AttentionSpec) and block_is_contiguous
-                    else block_len
-                )
+                if isinstance(layer_spec, KpoolTailSpec):
+                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
+                elif isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
+                    kv_block_len = layer_spec.page_size_bytes
+                else:
+                    kv_block_len = block_len
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
                 self.registered_layer_names.append(layer_name)
