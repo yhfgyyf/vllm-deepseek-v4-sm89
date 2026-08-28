@@ -9,7 +9,7 @@ Known Issues:
 """
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +25,7 @@ from vllm.config.vllm import set_current_vllm_config
 from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
+    MLACommonBaseImpl,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
     _use_masked_mha,
@@ -198,8 +199,12 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     cache_dtype: str, expected_quant_mode: KVQuantMode
 ):
     layer = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_name=lambda: "TRITON_MLA"),
         kv_cache_dtype=cache_dtype,
         head_size=576,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        kv_lora_rank=512,
         non_causal_multi_token_decode=False,
         sliding_window=None,
     )
@@ -213,7 +218,173 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     assert spec.cache_dtype_str == cache_dtype
     assert spec.kv_quant_mode == expected_quant_mode
     if cache_dtype == "fp8_ds_mla":
+        assert spec.state_content_bytes == 656
         assert spec.page_size_bytes == 64 * 656
+
+
+def test_mla_kv_cache_spec_uses_state_content_bytes_for_glm_nope_layout():
+    layer = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_name=lambda: "FLASHINFER_MLA_SPARSE_SM120"),
+        kv_cache_dtype="fp8_ds_mla",
+        head_size=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+        non_causal_multi_token_decode=False,
+        sliding_window=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next",
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                kv_lora_rank=512,
+            ),
+        ),
+    )
+
+    spec = MLAAttention.get_kv_cache_spec(layer, vllm_config)
+
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.cache_dtype_str == "fp8_ds_mla"
+    assert spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert spec.state_content_bytes == 528
+    assert spec.state_content_size_bytes == 528
+    assert spec.page_size_bytes == 128 * 528
+
+
+def test_mla_kv_cache_spec_keeps_standard_layout_for_non_sm120_backend():
+    layer = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_name=lambda: "TRITON_MLA"),
+        kv_cache_dtype="fp8_ds_mla",
+        head_size=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+        non_causal_multi_token_decode=False,
+        sliding_window=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next",
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                kv_lora_rank=512,
+            ),
+        ),
+    )
+
+    spec = MLAAttention.get_kv_cache_spec(layer, vllm_config)
+
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.state_content_bytes == 656
+    assert spec.page_size_bytes == 64 * 656
+
+
+def test_mla_kv_cache_spec_prefers_text_config_for_glm_nope_layout():
+    layer = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_name=lambda: "FLASHINFER_MLA_SPARSE_SM120"),
+        kv_cache_dtype="fp8_ds_mla",
+        head_size=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+        non_causal_multi_token_decode=False,
+        sliding_window=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="glm5_next"),
+            hf_text_config=SimpleNamespace(
+                model_type="deepseek_v3",
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                kv_lora_rank=512,
+            ),
+        ),
+    )
+
+    spec = MLAAttention.get_kv_cache_spec(layer, vllm_config)
+
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.state_content_bytes == 656
+    assert spec.page_size_bytes == 64 * 656
+
+
+def test_fp8_ds_mla_gather_uses_glm_nope_helper_for_528_byte_cache(monkeypatch):
+    calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+    flashinfer_module = ModuleType("flashinfer")
+    flashinfer_mla_module = ModuleType("flashinfer.mla")
+    cache_module = ModuleType("flashinfer.mla._sparse_mla_sm120_cache")
+
+    def fake_gather(src_cache, dst, *args, **kwargs):
+        calls.append(("glm", tuple(src_cache.shape), tuple(dst.shape)))
+
+    cache_module.__dict__["glm_nope_gather_and_dequantize"] = fake_gather
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
+    monkeypatch.setitem(sys.modules, "flashinfer.mla", flashinfer_mla_module)
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.mla._sparse_mla_sm120_cache", cache_module
+    )
+    monkeypatch.setattr(
+        ops,
+        "cp_gather_and_upconvert_fp8_kv_cache",
+        lambda **kwargs: calls.append(
+            ("vllm", tuple(kwargs["src_cache"].shape), tuple(kwargs["dst"].shape))
+        ),
+    )
+    layer = SimpleNamespace(
+        kv_cache_dtype="fp8_ds_mla",
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+    )
+
+    MLACommonBaseImpl._gather_fp8_ds_mla_context(
+        layer,
+        torch.empty((1, 64, 528), dtype=torch.uint8),
+        torch.empty((1, 512), dtype=torch.bfloat16),
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.empty((1,), dtype=torch.int32),
+        1,
+        torch.empty((1,), dtype=torch.int32),
+    )
+
+    assert calls == [("glm", (1, 64, 528), (1, 512))]
+
+
+def test_fp8_ds_mla_gather_falls_back_for_non_glm_nope_cache(monkeypatch):
+    calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+    monkeypatch.setattr(
+        ops,
+        "cp_gather_and_upconvert_fp8_kv_cache",
+        lambda **kwargs: calls.append(
+            ("vllm", tuple(kwargs["src_cache"].shape), tuple(kwargs["dst"].shape))
+        ),
+    )
+    layer = SimpleNamespace(
+        kv_cache_dtype="fp8_ds_mla",
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+    )
+
+    MLACommonBaseImpl._gather_fp8_ds_mla_context(
+        layer,
+        torch.empty((1, 64, 656), dtype=torch.uint8),
+        torch.empty((1, 512), dtype=torch.bfloat16),
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.empty((1,), dtype=torch.int32),
+        1,
+        torch.empty((1,), dtype=torch.int32),
+    )
+
+    assert calls == [("vllm", (1, 64, 656), (1, 512))]
 
 
 @pytest.mark.cpu_test

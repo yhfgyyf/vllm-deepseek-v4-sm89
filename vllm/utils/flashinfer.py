@@ -352,6 +352,74 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
 
 
 @functools.cache
+def has_flashinfer_sparse_mla_sm120_glm_nope() -> bool:
+    """Return ``True`` if FlashInfer has the SM120 GLM NoPE sparse MLA API."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    try:
+        import inspect
+
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+        from flashinfer.mla._sparse_mla_sm120_cache import (
+            glm_nope_gather_and_dequantize,
+            glm_nope_quantize_and_cache,
+        )
+    except ImportError:
+        return False
+    try:
+        params = inspect.signature(trtllm_batch_decode_with_kv_cache_mla).parameters
+    except (TypeError, ValueError):
+        return False
+    return (
+        "kv_scale_format" in params
+        and callable(glm_nope_gather_and_dequantize)
+        and callable(glm_nope_quantize_and_cache)
+    )
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm120_glm_nope_config(
+    num_q_heads: int,
+    top_k: int,
+    page_block_size: int,
+) -> bool:
+    """Return whether FlashInfer ships the SM120 GLM NoPE specialization."""
+    if (
+        not has_flashinfer_sparse_mla_sm120_glm_nope()
+        or int(top_k) != 2176
+        or int(page_block_size) != 64
+    ):
+        return False
+    num_q_heads = int(num_q_heads)
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
+    if mod is None:
+        return False
+    if getattr(mod, "_DECODE_GLM_NOPE_PAGE_BLOCK_SIZE", None) != 64:
+        return False
+    dispatch = getattr(mod, "_DECODE_GLM_NOPE_TOPK2176_DISPATCH", None) if mod else None
+    if dispatch is None:
+        return False
+    if isinstance(dispatch, dict):
+        candidates = (
+            num_q_heads,
+            (num_q_heads,),
+            (num_q_heads, top_k),
+            (num_q_heads, top_k, page_block_size),
+        )
+        return any(candidate in dispatch for candidate in candidates)
+    candidates = (
+        num_q_heads,
+        (num_q_heads,),
+        (num_q_heads, top_k),
+        (num_q_heads, top_k, page_block_size),
+    )
+    try:
+        return any(candidate in dispatch for candidate in candidates)
+    except TypeError:
+        return False
+
+
+@functools.cache
 def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (
@@ -1197,6 +1265,10 @@ __all__ = [
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "autotune",
     "has_flashinfer_moe",
+    "has_flashinfer_sparse_mla_sm120",
+    "has_flashinfer_sparse_mla_sm120_config",
+    "has_flashinfer_sparse_mla_sm120_glm_nope",
+    "has_flashinfer_sparse_mla_sm120_glm_nope_config",
     "has_flashinfer_comm",
     "has_flashinfer_nvlink_two_sided",
     "has_flashinfer_nvlink_one_sided",

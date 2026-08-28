@@ -309,6 +309,8 @@ logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 
+_GLM_NOPE_MODEL_TYPES = {"glm5_next", "glm5_next_text"}
+
 
 def _detect_output_quant_key(
     output: torch.Tensor,
@@ -344,6 +346,58 @@ def _detect_output_quant_key(
         assert output_scale is not None
         return kNvfp4Dynamic
     return kFp8StaticTensorSym
+
+
+def _get_hf_text_config(model_config: object | None) -> object | None:
+    if model_config is None:
+        return None
+    return getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+
+
+def _is_glm_nope_layout_config(
+    model_config: object | None,
+    *,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    head_size: int,
+) -> bool:
+    hf_text_config = _get_hf_text_config(model_config)
+    model_type = getattr(hf_text_config, "model_type", None)
+    return (
+        model_type in _GLM_NOPE_MODEL_TYPES
+        and getattr(hf_text_config, "qk_nope_head_dim", qk_nope_head_dim) == 256
+        and getattr(hf_text_config, "qk_rope_head_dim", qk_rope_head_dim) == 0
+        and getattr(hf_text_config, "kv_lora_rank", kv_lora_rank) == 512
+        and qk_nope_head_dim == 256
+        and qk_rope_head_dim == 0
+        and kv_lora_rank == 512
+        and head_size == 512
+    )
+
+
+def _fp8_ds_mla_state_content_bytes(
+    attn_backend: type[AttentionBackend],
+    model_config: ModelConfig,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    head_size: int,
+) -> int:
+    if (
+        attn_backend.get_name() == "FLASHINFER_MLA_SPARSE_SM120"
+        and _is_glm_nope_layout_config(
+            model_config,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            head_size=head_size,
+        )
+    ):
+        return 528
+    return 656
 
 
 def _canonicalize_sparse_mla_kv_cache_dtype(
@@ -1216,12 +1270,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             # Stamp the quant mode so runners don't take the unquantized
             # ("auto") shape path for quantized layouts like fp8_ds_mla,
-            # whose kernel page layout (656 B/token) differs from
+            # whose packed kernel page layout differs from
             # head_size * dtype_size.
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # fp8_ds_mla: 656-byte custom layout (kv_lora_rank=512 +
-            # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
-            state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
+            state_content_bytes=(
+                _fp8_ds_mla_state_content_bytes(
+                    self.attn_backend,
+                    vllm_config.model_config,
+                    self.qk_nope_head_dim,
+                    self.qk_rope_head_dim,
+                    self.kv_lora_rank,
+                    self.head_size,
+                )
+                if self.kv_cache_dtype == "fp8_ds_mla"
+                else None
+            ),
         )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(
@@ -2753,6 +2816,45 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             k[..., k_nope.shape[-1] :] = k_pe
         return k
 
+    def _gather_fp8_ds_mla_context(
+        self,
+        src_cache: torch.Tensor,
+        dst: torch.Tensor,
+        block_table: torch.Tensor,
+        workspace_starts: torch.Tensor,
+        batch_size: int,
+        seq_starts: torch.Tensor,
+    ) -> None:
+        if (
+            self.qk_nope_head_dim == 256
+            and self.qk_rope_head_dim == 0
+            and self.kv_lora_rank == 512
+            and src_cache.shape[-1] == 528
+            and dst.shape[-1] == 512
+        ):
+            from flashinfer.mla._sparse_mla_sm120_cache import (
+                glm_nope_gather_and_dequantize,
+            )
+
+            glm_nope_gather_and_dequantize(
+                src_cache.view(torch.uint8),
+                dst,
+                block_table,
+                workspace_starts,
+                batch_size,
+                seq_starts,
+            )
+            return
+
+        ops.cp_gather_and_upconvert_fp8_kv_cache(
+            src_cache=src_cache,
+            dst=dst,
+            block_table=block_table,
+            workspace_starts=workspace_starts,
+            batch_size=batch_size,
+            seq_starts=seq_starts,
+        )
+
     def _compute_prefill_context(
         self,
         q: torch.Tensor,
@@ -2781,13 +2883,13 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             toks = chunk.num_context_tokens
             block_table = prefill_metadata.block_table[chunk.request_slice]
             if self.kv_cache_dtype == "fp8_ds_mla":
-                ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=block_table,
-                    workspace_starts=chunk.cu_seq_lens,
-                    batch_size=chunk.num_requests,
-                    seq_starts=chunk.starts,
+                self._gather_fp8_ds_mla_context(
+                    kv_c_and_k_pe_cache,
+                    workspace[:toks],
+                    block_table,
+                    chunk.cu_seq_lens,
+                    chunk.num_requests,
+                    chunk.starts,
                 )
             elif current_platform.is_cpu():
                 assert not is_quantized_kv_cache(self.kv_cache_dtype), (
@@ -2902,13 +3004,13 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             padded_local_cu_seq_lens = chunk.padded_local_cu_seq_lens
             block_table = prefill_metadata.block_table[chunk.request_slice]
             if self.kv_cache_dtype == "fp8_ds_mla":
-                ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=block_table,
-                    workspace_starts=padded_local_cu_seq_lens,
-                    batch_size=chunk.num_requests,
-                    seq_starts=chunk.starts,
+                self._gather_fp8_ds_mla_context(
+                    kv_c_and_k_pe_cache,
+                    workspace[:toks],
+                    block_table,
+                    padded_local_cu_seq_lens,
+                    chunk.num_requests,
+                    chunk.starts,
                 )
             elif is_quantized_kv_cache(self.kv_cache_dtype):
                 assert k_scale is not None

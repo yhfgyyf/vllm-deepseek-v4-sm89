@@ -910,8 +910,8 @@ ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
-# FlashInfer is installed separately from release assets below for regular
-# CUDA images. Rubin prerelease images retain their pinned requirements.
+# FlashInfer is installed separately from the GLM fork release asset below for
+# regular CUDA images. Rubin prerelease images retain their pinned requirements.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
@@ -945,10 +945,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer from release assets.
-# https://docs.flashinfer.ai/installation.html
+# Install FlashInfer from release assets. Keep the official cubin/JIT-cache
+# wheels for generic FlashInfer paths, but use the GLM forked Python wheel for
+# NoPE sparse MLA APIs.
 ARG FLASHINFER_VERSION=0.6.18rc10
 ARG FLASHINFER_RELEASE_TAG=v0.6.18rc10
+ARG FLASHINFER_GLM_PYTHON_WHEEL_URL=https://github.com/yhfgyyf/vllm-GLM-5.3-Flash-sm120/releases/download/v0.27.2rc1.dev53906-g10e1ac87de-cu130-sm120/flashinfer_python-0.6.18%2Bglm53.sm120.cu130.pt213-py3-none-any.whl#sha256=c5f55ffd287c66351ea57330692dba3c257a37b883562240cdc09c486dd929a7
 ARG TARGETARCH
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
@@ -961,10 +963,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         FLASHINFER_CUDA_VERSION="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
         FLASHINFER_RELEASE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}"; \
         uv pip install --system --no-deps \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl" \
+            "${FLASHINFER_GLM_PYTHON_WHEEL_URL}" \
             "${FLASHINFER_RELEASE_URL}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
             "${FLASHINFER_RELEASE_URL}/flashinfer_jit_cache-${FLASHINFER_VERSION}%2B${FLASHINFER_CUDA_VERSION}-cp39-abi3-manylinux_2_28_${FLASHINFER_WHEEL_ARCH}.whl"; \
     fi
+
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -1038,12 +1042,12 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
-# The vLLM wheel still pins the stable FlashInfer Python package. Restore the
-# release candidate after installing vLLM so it matches the cubin and JIT cache.
+# The vLLM wheel may resolve a public FlashInfer package while installing
+# dependencies. Restore the GLM fork wheel after installing vLLM.
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
         uv pip install --system --no-deps --reinstall \
-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
+            "${FLASHINFER_GLM_PYTHON_WHEEL_URL}"; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -1163,11 +1167,11 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
-# Keep FlashInfer Python aligned with the release-candidate runtime packages.
+# Keep FlashInfer Python aligned with the GLM fork runtime wheel.
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
         uv pip install --system --no-deps --reinstall \
-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
+            "${FLASHINFER_GLM_PYTHON_WHEEL_URL}"; \
     fi
 
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH

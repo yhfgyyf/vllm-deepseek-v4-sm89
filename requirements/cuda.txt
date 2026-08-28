@@ -10,12 +10,11 @@ torchaudio==2.11.0
 torchvision==0.28.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
 torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
-# FlashInfer should be updated together with the Dockerfile
-# flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from
-# install_requires so the published wheel does not carry an unresolvable pin
---extra-index-url https://flashinfer.ai/whl/
-flashinfer-python==0.6.17
-flashinfer-cubin==0.6.17
+# FlashInfer should be updated together with the Dockerfile.
+# GLM-5.3-Flash NoPE sparse MLA requires the forked wheel with glm_nope
+# pack/gather APIs. Keep this direct wheel URL so source installs do not
+# silently resolve a public FlashInfer wheel that lacks those APIs.
+flashinfer-python @ https://github.com/yhfgyyf/vllm-GLM-5.3-Flash-sm120/releases/download/v0.27.2rc1.dev53906-g10e1ac87de-cu130-sm120/flashinfer_python-0.6.18%2Bglm53.sm120.cu130.pt213-py3-none-any.whl#sha256=c5f55ffd287c66351ea57330692dba3c257a37b883562240cdc09c486dd929a7
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

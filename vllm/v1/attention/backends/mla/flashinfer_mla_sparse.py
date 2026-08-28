@@ -39,6 +39,21 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_GLM_NOPE_MODEL_TYPES = {"glm5_next", "glm5_next_text"}
+_SM120_GLM_NOPE_PAGE_BLOCK_SIZE = 64
+_SM120_GLM_NOPE_TOPK_CAPACITY = 2176
+_SM120_GLM_NOPE_NUM_Q_HEADS = (8, 16, 32, 64)
+
+
+def _is_glm_nope_text_config(hf_text_config: object | None) -> bool:
+    model_type = getattr(hf_text_config, "model_type", None)
+    return (
+        model_type in _GLM_NOPE_MODEL_TYPES
+        and getattr(hf_text_config, "qk_nope_head_dim", None) == 256
+        and getattr(hf_text_config, "kv_lora_rank", None) == 512
+        and getattr(hf_text_config, "qk_rope_head_dim", None) == 0
+    )
+
 
 class _FlashInferMLASparseBackendBase(AttentionBackend):
     """Common metadata for concrete FlashInfer sparse MLA backends."""
@@ -160,6 +175,15 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is not None
+            and vllm_config.model_config is not None
+            and _is_glm_nope_text_config(vllm_config.model_config.hf_text_config)
+        ):
+            return [64]
         return [64, 256]
 
     @staticmethod
@@ -188,7 +212,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         device_capability: DeviceCapability,
     ) -> str | None:
         from vllm.config import get_current_vllm_config
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm120,
+            has_flashinfer_sparse_mla_sm120_glm_nope_config,
+        )
 
         if not has_flashinfer_sparse_mla_sm120():
             return (
@@ -219,6 +246,28 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
                     f"got {index_topk}"
                 )
+            is_glm_nope = head_size == 512 and _is_glm_nope_text_config(hf_text_config)
+            if is_glm_nope:
+                num_q_heads = vllm_config.model_config.get_num_attention_heads(
+                    vllm_config.parallel_config
+                )
+                if num_q_heads not in _SM120_GLM_NOPE_NUM_Q_HEADS:
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 GLM NoPE requires "
+                        f"num_q_heads in {_SM120_GLM_NOPE_NUM_Q_HEADS}; "
+                        f"got {num_q_heads}"
+                    )
+                if not has_flashinfer_sparse_mla_sm120_glm_nope_config(
+                    num_q_heads,
+                    _SM120_GLM_NOPE_TOPK_CAPACITY,
+                    _SM120_GLM_NOPE_PAGE_BLOCK_SIZE,
+                ):
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 GLM NoPE fp8_ds_mla "
+                        "requires FlashInfer sparse MLA with kv_scale_format, "
+                        "GLM NoPE cache pack/gather helpers, and "
+                        f"top_k capacity={_SM120_GLM_NOPE_TOPK_CAPACITY}"
+                    )
         return None
 
 
@@ -450,7 +499,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # mismatches the page_table when index_kpool > 1.
         sparse_topk_capacity = topk_indices_physical.shape[1]
 
-        extra_kwargs: dict[str, torch.Tensor] = {}
+        extra_kwargs: dict[str, torch.Tensor | str] = {}
+        kv_scale_format = getattr(self, "kv_scale_format", None)
+        if kv_scale_format is not None:
+            extra_kwargs["kv_scale_format"] = kv_scale_format
         empty_rows: torch.Tensor | None = None
         if self.is_nope_mla:
             # The native no-rope kernel takes the active top-k length per query

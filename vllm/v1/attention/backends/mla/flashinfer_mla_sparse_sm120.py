@@ -2,34 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM120 implementation variant for ``FLASHINFER_MLA_SPARSE_SM120``."""
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.v1.attention.backend import (
-    AttentionLayer,
-    AttentionType,
-    MLAAttentionImpl,
-)
+from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseImpl,
     FlashInferMLASparseMetadata,
-    _get_workspace_buffer,
-)
-from vllm.v1.attention.backends.mla.sparse_utils import (
-    triton_convert_req_index_to_global_index,
 )
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 
-def _kv_scale_format_for_model(model_type: str | None) -> str:
-    if model_type is not None and model_type.startswith("glm"):
+def _kv_scale_format_for_model(
+    model_type: str | None,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+) -> str:
+    if model_type in ("glm5_next", "glm5_next_text"):
+        if qk_nope_head_dim == 256 and qk_rope_head_dim == 0 and kv_lora_rank == 512:
+            return "arbitrary_fp32_nope"
         return "arbitrary_fp32"
     return "pow2_fp32"
 
 
-class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]):
+class FlashInferMLASparseSM120Impl(FlashInferMLASparseImpl):
     """SM120 FlashInfer sparse-MLA implementation."""
 
     is_sparse = True
@@ -50,30 +50,27 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         indexer: "Indexer | None" = None,
         **mla_args,
     ) -> None:
-        if any([alibi_slopes, sliding_window, logits_soft_cap]):
-            raise NotImplementedError(
-                "FLASHINFER_MLA_SPARSE_SM120 does not support alibi_slopes / "
-                "sliding_window / logits_soft_cap"
-            )
-        if attn_type != AttentionType.DECODER:
-            raise NotImplementedError(
-                "FLASHINFER_MLA_SPARSE_SM120 only supports decoder self-attention"
-            )
-
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = kv_cache_dtype
-        if self.kv_cache_dtype != "fp8_ds_mla":
+        if kv_cache_dtype != "fp8_ds_mla":
             raise NotImplementedError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "
                 f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
             )
 
-        self.kv_lora_rank: int = mla_args["kv_lora_rank"]
-        self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
-        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            indexer=indexer,
+            **mla_args,
+        )
+
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -82,26 +79,72 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             model_type = getattr(
                 vllm_config.model_config.hf_text_config, "model_type", None
             )
-        self.kv_scale_format = _kv_scale_format_for_model(model_type)
-
-        # Skip-topk layers are built with indexer=None and get the shared
-        # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
-        self.topk_indices_buffer: torch.Tensor | None = (
-            indexer.topk_indices_buffer
-            if indexer is not None
-            else mla_args.get("topk_indices_buffer")
+        self.kv_scale_format = _kv_scale_format_for_model(
+            model_type,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.kv_lora_rank,
         )
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm120,
+            has_flashinfer_sparse_mla_sm120_glm_nope,
+        )
 
         if not has_flashinfer_sparse_mla_sm120():
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
                 "sparse MLA decode API."
             )
+        if (
+            self.kv_scale_format == "arbitrary_fp32_nope"
+            and not has_flashinfer_sparse_mla_sm120_glm_nope()
+        ):
+            raise RuntimeError(
+                "FLASHINFER_MLA_SPARSE_SM120 GLM NoPE requires FlashInfer's "
+                "kv_scale_format API and GLM NoPE cache pack/gather helpers."
+            )
         assert self.topk_indices_buffer is not None
 
+        # The native SM120 operator accepts a BF16 query while dequantizing its
+        # packed FP8 KV tiles in-kernel.
         self.supports_quant_query_input = False
-        self._workspace_buffer: torch.Tensor | None = None
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if self.kv_scale_format != "arbitrary_fp32_nope":
+            return super().do_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+        if kv_cache.numel() == 0:
+            return
+        if k_pe.shape[-1] != 0:
+            raise ValueError(
+                "GLM NoPE cache update expects qk_rope_head_dim=0, "
+                f"got k_pe.shape={tuple(k_pe.shape)}"
+            )
+
+        from flashinfer.mla._sparse_mla_sm120_cache import (
+            glm_nope_quantize_and_cache,
+        )
+
+        glm_nope_quantize_and_cache(
+            kv_c_normed,
+            kv_cache.view(torch.uint8),
+            slot_mapping.flatten(),
+        )
 
     def forward_mqa(
         self,
@@ -110,51 +153,8 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         attn_metadata: FlashInferMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
-
-        num_actual_toks = q.shape[0]
-
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        topk_indices_physical = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
-        )
-
-        output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
-            dtype=q.dtype,
-        )
-
-        if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
-
-        from vllm.utils.flashinfer import (
-            flashinfer_trtllm_batch_decode_with_kv_cache_mla,
-        )
-
-        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
-            query=q.unsqueeze(1),
-            kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
-            workspace_buffer=self._workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=None,
-            max_seq_len=attn_metadata.topk_tokens,
-            out=output.unsqueeze(1),
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            sparse_mla_top_k=attn_metadata.topk_tokens,
-            kv_scale_format=self.kv_scale_format,
-        )
-        return out.squeeze(1), None
+        # fp8_ds_mla stores per-128-element scales inside each cache entry, so
+        # no separate per-tensor query/KV scale is part of this kernel contract.
+        self.bmm1_scale = self.scale
+        self.bmm2_scale = 1.0
+        return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)

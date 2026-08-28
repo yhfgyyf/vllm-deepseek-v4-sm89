@@ -61,11 +61,14 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    compute_layer_kv_cache_shape_bytes,
+    create_kv_cache_views,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
     is_full_attention_spec,
     iter_layer_specs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -3423,6 +3426,90 @@ def test_page_size_padded_wins():
         )
     )
     assert spec.page_size_bytes == 65536
+
+
+@pytest.mark.parametrize(
+    ("spec_cls", "extra_kwargs"),
+    [
+        (MLAAttentionSpec, {}),
+        (SlidingWindowMLASpec, {"sliding_window": 128}),
+    ],
+)
+def test_mla_fp8_ds_mla_state_content_bytes_define_glm_nope_page_shape(
+    spec_cls: type[MLAAttentionSpec],
+    extra_kwargs: dict[str, int],
+):
+    spec = spec_cls(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        state_content_bytes=528,
+        **extra_kwargs,
+    )
+
+    assert spec.state_content_size_bytes == 528
+    assert spec.real_page_size_bytes == 64 * 528
+    assert spec.page_size_bytes == spec.real_page_size_bytes
+    assert compute_layer_kv_cache_shape_bytes(spec, num_blocks=7) == (7, 1, 64, 528)
+
+
+def test_mla_fp8_ds_mla_528_byte_shape_splits_manager_blocks():
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        state_content_bytes=528,
+    )
+
+    assert spec.page_size_bytes == 256 * 528
+    assert compute_layer_kv_cache_shape_bytes(
+        spec, num_blocks=7, kernel_block_size=64
+    ) == (28, 1, 64, 528)
+
+
+def test_kv_cache_view_preserves_glm_nope_528_byte_layout():
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        state_content_bytes=528,
+    )
+    num_blocks = 3
+    layers = ["layers.0.attn", "layers.1.attn"]
+    page_size = spec.page_size_bytes
+    tensor = KVCacheTensor(
+        size=len(layers) * num_blocks * page_size,
+        layers=layers,
+        layer_stride=num_blocks * page_size,
+        block_stride=page_size,
+    )
+    raw_cache = torch.empty(tensor.size, dtype=torch.uint8)
+
+    views = create_kv_cache_views(
+        raw_cache,
+        spec,
+        num_blocks=num_blocks,
+        layout=KVCacheLayout.LBNHC,
+        kv_cache_tensor=tensor,
+    )
+
+    assert [tuple(view.shape) for view in views] == [
+        (num_blocks, 1, 64, 528),
+        (num_blocks, 1, 64, 528),
+    ]
+    assert views[0].stride()[-1] == 1
+    assert views[1].storage_offset() - views[0].storage_offset() == (
+        num_blocks * page_size
+    )
 
 
 def test_unify_hybrid_kv_cache_specs():
