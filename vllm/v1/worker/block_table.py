@@ -508,9 +508,9 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
         *,
         block_table_stride: int,
         block_size: int,
+        slot_mapping_policy: int,
         **compile_key_fields: int,
     ) -> CompileKey:
-        slot_mapping_policy = compile_key_fields.pop("slot_mapping_policy")
         return self.CompileKey(
             **compile_key_fields,
             block_table_stride=triton_scalar_specialization_rep(block_table_stride),

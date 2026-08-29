@@ -5,6 +5,7 @@
 import pytest
 
 from vllm.platforms import current_platform
+from vllm.v1.kv_cache_interface import SlotMappingPolicy
 
 if not current_platform.is_cuda_alike():
     pytest.skip("NVIDIA dispatch tests require CUDA", allow_module_level=True)
@@ -37,6 +38,7 @@ def test_compute_slot_mapping_warmup_matches_runtime_specializations(
         cp_kv_cache_interleave_size=1,
         block_table_stride=32768,
         block_size=block_size,
+        slot_mapping_policy=int(SlotMappingPolicy.PAGED),
     )
     expected = kernel.CompileKey(
         kv_cache_block_size=kv_cache_block_size,
@@ -46,6 +48,8 @@ def test_compute_slot_mapping_warmup_matches_runtime_specializations(
         cp_kv_cache_interleave_size=1,
         block_table_stride=16,
         block_size=block_size_rep,
+        slot_mapping_policy=int(SlotMappingPolicy.PAGED),
+        single_block_ring_slot_mapping_policy=int(SlotMappingPolicy.SINGLE_BLOCK_RING),
     )
 
     assert kernel.dispatch(**kwargs) == expected
