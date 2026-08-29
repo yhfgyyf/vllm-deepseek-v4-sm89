@@ -321,18 +321,60 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
     if not has_flashinfer():
         return False
     try:
+        import inspect
+
         from flashinfer.autotuner import autotune
         from flashinfer.decode import (
             trtllm_batch_decode_sparse_mla_dsv4,
             trtllm_batch_decode_with_kv_cache_mla,
         )
-    except ImportError:
+
+        mla_parameters = inspect.signature(
+            trtllm_batch_decode_with_kv_cache_mla
+        ).parameters
+    except (ImportError, RuntimeError, TypeError, ValueError):
         return False
     return (
         callable(trtllm_batch_decode_sparse_mla_dsv4)
         and callable(trtllm_batch_decode_with_kv_cache_mla)
         and callable(autotune)
+        and "kv_scale_format" in mla_parameters
     )
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm89() -> bool:
+    """Return whether FlashInfer enables native DSV4 sparse MLA on SM89."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    try:
+        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return _resolve_dsv4_sparse_mla_backend(device) == "sparse"
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm89_glm_nope() -> bool:
+    """Return whether FlashInfer enables native GLM NoPE sparse MLA on SM89."""
+    if not has_flashinfer_sparse_mla_sm120_glm_nope():
+        return False
+    try:
+        from flashinfer.mla._core import _resolve_mla_backend_for_device
+
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return (
+            _resolve_mla_backend_for_device(
+                device,
+                "auto",
+                sparse_mla_top_k=2176,
+            )
+            == "sparse"
+        )
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 @functools.cache
@@ -1266,6 +1308,8 @@ __all__ = [
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_sparse_mla_sm120",
+    "has_flashinfer_sparse_mla_sm89",
+    "has_flashinfer_sparse_mla_sm89_glm_nope",
     "has_flashinfer_sparse_mla_sm120_config",
     "has_flashinfer_sparse_mla_sm120_glm_nope",
     "has_flashinfer_sparse_mla_sm120_glm_nope_config",

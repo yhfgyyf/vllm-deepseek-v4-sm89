@@ -13,7 +13,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_sparse_mla_sm89
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
@@ -77,6 +77,14 @@ def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
     return max(0, min(num_tokens, max_tokens))
 
 
+def _flashinfer_sparse_mla_decode_autotune_supported() -> bool:
+    if current_platform.is_device_capability_family(120):
+        return has_flashinfer()
+    if current_platform.is_cuda() and current_platform.is_device_capability((8, 9)):
+        return has_flashinfer_sparse_mla_sm89()
+    return False
+
+
 def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     vllm_config = getattr(runner, "vllm_config", None)
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
@@ -94,7 +102,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
         return False
     if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not True:
         return False
-    if not has_flashinfer() or not current_platform.is_device_capability_family(120):
+    if not _flashinfer_sparse_mla_decode_autotune_supported():
         return False
 
     try:

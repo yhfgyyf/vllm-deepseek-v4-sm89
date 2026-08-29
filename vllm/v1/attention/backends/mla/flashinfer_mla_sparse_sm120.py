@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseImpl,
@@ -87,14 +89,26 @@ class FlashInferMLASparseSM120Impl(FlashInferMLASparseImpl):
         )
 
         from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm89,
+            has_flashinfer_sparse_mla_sm89_glm_nope,
             has_flashinfer_sparse_mla_sm120,
             has_flashinfer_sparse_mla_sm120_glm_nope,
         )
 
-        if not has_flashinfer_sparse_mla_sm120():
+        capability = current_platform.get_device_capability()
+        is_sm89 = capability == DeviceCapability(8, 9)
+        if is_sm89:
+            has_sparse_mla = (
+                has_flashinfer_sparse_mla_sm89_glm_nope()
+                if self.kv_scale_format == "arbitrary_fp32_nope"
+                else has_flashinfer_sparse_mla_sm89()
+            )
+        else:
+            has_sparse_mla = has_flashinfer_sparse_mla_sm120()
+        if not has_sparse_mla:
             raise RuntimeError(
-                "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
-                "sparse MLA decode API."
+                "FLASHINFER_MLA_SPARSE_SM120 requires a FlashInfer sparse MLA "
+                "build compatible with the current GPU."
             )
         if (
             self.kv_scale_format == "arbitrary_fp32_nope"

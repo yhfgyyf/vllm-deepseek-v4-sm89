@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -43,6 +43,14 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _has_cuda_indexer_mqa_backend(use_fp4_cache: bool) -> bool:
+    return has_deep_gemm() or (
+        HAS_TRITON
+        and not use_fp4_cache
+        and current_platform.is_device_capability((8, 9))
+    )
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -773,10 +781,12 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not _has_cuda_indexer_mqa_backend(
+            use_fp4_cache
+        ):
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM, or an "
+                "active Triton backend on SM89 with FP8 query cache."
             )
 
     def forward_native(

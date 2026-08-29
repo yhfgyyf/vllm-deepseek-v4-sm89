@@ -79,6 +79,8 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
+    _flashinfer_sparse_mla_support_error,
+    _is_flashinfer_sparse_jit_capability,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
@@ -1023,8 +1025,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    Without an explicit backend, SM89 and SM12 default to FlashInfer while the
+    other CUDA arches keep the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -1038,7 +1040,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "sparse MLA."
         )
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
-        if device_capability is not None and device_capability.major == 12:
+        if device_capability is not None and _is_flashinfer_sparse_jit_capability(
+            device_capability
+        ):
+            if error := _flashinfer_sparse_mla_support_error(device_capability):
+                raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend in (
@@ -1047,7 +1053,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
-    if device_capability is not None and device_capability.major == 12:
+    if device_capability is not None and _is_flashinfer_sparse_jit_capability(
+        device_capability
+    ):
+        if error := _flashinfer_sparse_mla_support_error(device_capability):
+            raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
 

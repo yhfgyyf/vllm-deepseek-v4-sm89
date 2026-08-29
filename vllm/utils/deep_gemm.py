@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
 
@@ -512,6 +513,29 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+def _use_sm89_mqa_fallback() -> bool:
+    return (
+        HAS_TRITON
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((8, 9))
+    )
+
+
+def _fp8_mqa_logits_sm89(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    return sm12x_deep_gemm_fallbacks._fp8_mqa_logits_sm12x(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+    )
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -544,6 +568,10 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if _use_sm89_mqa_fallback() and q[1] is None:
+        return _fp8_mqa_logits_sm89(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+        )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -650,6 +678,12 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if _use_sm89_mqa_fallback() and q[1] is None:
+        from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks._fp8_paged_mqa_logits_sm12x(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
@@ -688,6 +722,12 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
+    if _use_sm89_mqa_fallback():
+        from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks._tf32_hc_prenorm_gemm_sm12x(
+            x, fn, out, sqrsum, num_split
+        )
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()

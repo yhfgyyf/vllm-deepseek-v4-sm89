@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import MultipleOf
@@ -65,6 +66,26 @@ def _packed_block_span(pool: torch.Tensor) -> int:
 
 # Sparse MLA h_q counts accepted natively (flashinfer>=0.6.14, #3545).
 _SPARSE_MLA_SUPPORTED_Q_HEADS = (8, 16, 32, 64, 128)
+
+
+def _is_flashinfer_sparse_jit_capability(capability: DeviceCapability) -> bool:
+    return capability.major == 12 or capability == DeviceCapability(8, 9)
+
+
+def _flashinfer_sparse_mla_support_error(
+    capability: DeviceCapability,
+) -> str | None:
+    from vllm.utils.flashinfer import (
+        has_flashinfer_sparse_mla_sm89,
+        has_flashinfer_sparse_mla_sm120,
+    )
+
+    if capability == DeviceCapability(8, 9):
+        if not has_flashinfer_sparse_mla_sm89():
+            return "SM89 requires FlashInfer with native sparse MLA SM89 JIT support"
+    elif capability.major == 12 and not has_flashinfer_sparse_mla_sm120():
+        return "SM12x requires FlashInfer's sparse MLA decode API"
+    return None
 
 
 def _pad_to_supported_q_heads(num_heads: int) -> int:
@@ -127,7 +148,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [10, 12]
+        return capability.major in [10, 12] or capability == DeviceCapability(8, 9)
 
     @classmethod
     def supports_combination(
@@ -151,18 +172,13 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
             if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
                 return "kv_cache_dtype not supported"
             return None
-        if device_capability.major == 12:
+        if _is_flashinfer_sparse_jit_capability(device_capability):
             if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
                 return "kv_cache_dtype not supported"
-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
-
-            if not has_flashinfer_sparse_mla_sm120():
-                return (
-                    "FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's "
-                    "sparse MLA decode API"
-                )
+            if error := _flashinfer_sparse_mla_support_error(device_capability):
+                return f"FLASHINFER_MLA_SPARSE_DSV4 {error}"
             return None
-        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x"
+        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM89, SM10x, or SM12x"
 
 
 class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
@@ -567,6 +583,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
+
+        capability = current_platform.get_device_capability()
+        if capability is None:
+            raise RuntimeError("Unable to determine CUDA compute capability.")
+        if error := _flashinfer_sparse_mla_support_error(capability):
+            raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
 
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
         if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):

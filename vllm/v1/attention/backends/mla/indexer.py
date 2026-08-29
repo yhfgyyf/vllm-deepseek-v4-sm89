@@ -21,6 +21,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
@@ -48,6 +49,10 @@ logger = init_logger(__name__)
 # The DSA indexer K cache is always quantized; "auto" means fp8 (V3.2 layout)
 # and mxfp4 is the opt-in Blackwell path.
 DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
+
+
+def _uses_deep_gemm_scheduler_metadata() -> bool:
+    return current_platform.is_cuda() and is_deep_gemm_supported()
 
 
 def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
@@ -1196,7 +1201,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if _uses_deep_gemm_scheduler_metadata():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

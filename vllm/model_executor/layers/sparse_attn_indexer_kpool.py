@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -46,6 +47,15 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _has_cuda_indexer_mqa_backend(use_fp4_cache: bool) -> bool:
+    return has_deep_gemm() or (
+        HAS_TRITON
+        and not use_fp4_cache
+        and current_platform.is_device_capability((8, 9))
+    )
+
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -974,9 +984,12 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not _has_cuda_indexer_mqa_backend(
+            use_fp4_cache
+        ):
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM, or an "
+                "active Triton backend on SM89 with FP8 query cache."
             )
 
     def forward_native(

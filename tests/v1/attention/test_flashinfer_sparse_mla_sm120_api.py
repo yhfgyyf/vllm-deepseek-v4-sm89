@@ -14,6 +14,7 @@ from vllm.model_executor.layers.attention import (
 )
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
+    DeepseekV4FlashInferSM120Attention,
     _required_sm120_sparse_topk,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -124,6 +125,115 @@ def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
 
     assert impl_cls.is_sparse
     assert not impl_cls.supports_dense_mha_prefill
+
+
+def test_sm89_backend_requires_runtime_flashinfer_probe(monkeypatch) -> None:
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: True)
+    with set_current_vllm_config(_fake_vllm_config("glm5_next")):
+        assert (
+            FlashInferMLASparseSM120Backend.supports_combination(
+                head_size=576,
+                dtype=torch.bfloat16,
+                kv_cache_dtype="fp8_ds_mla",
+                block_size=64,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=True,
+                use_mm_prefix=False,
+                device_capability=DeviceCapability(8, 9),
+            )
+            is None
+        )
+
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: False)
+    with set_current_vllm_config(_fake_vllm_config("glm5_next")):
+        reason = FlashInferMLASparseSM120Backend.supports_combination(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            device_capability=DeviceCapability(8, 9),
+        )
+
+    assert reason is not None
+    assert "compatible with the current GPU" in reason
+
+
+def test_sm89_glm_nope_backend_uses_glm_specific_runtime_probe(monkeypatch) -> None:
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: False)
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm89_glm_nope",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm120_glm_nope_config",
+        lambda num_heads, top_k, page_block_size: (
+            (
+                num_heads,
+                top_k,
+                page_block_size,
+            )
+            == (32, 2176, 64)
+        ),
+    )
+
+    with set_current_vllm_config(
+        _fake_vllm_config("glm5_next", qk_nope_head_dim=256, qk_rope_head_dim=0)
+    ):
+        assert (
+            FlashInferMLASparseSM120Backend.supports_combination(
+                head_size=512,
+                dtype=torch.bfloat16,
+                kv_cache_dtype="fp8_ds_mla",
+                block_size=64,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=True,
+                use_mm_prefix=False,
+                device_capability=DeviceCapability(8, 9),
+            )
+            is None
+        )
+
+
+def test_sm89_dsv4_backend_selects_packed_flashinfer(monkeypatch) -> None:
+    from vllm.models.deepseek_v4.nvidia import model as dsv4_model
+
+    monkeypatch.setattr(
+        dsv4_model.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(8, 9),
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: True)
+    vllm_config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+
+    assert (
+        dsv4_model._select_dsv4_attn_cls(vllm_config)
+        is DeepseekV4FlashInferSM120Attention
+    )
+
+
+def test_sm89_dsv4_backend_rejects_unpatched_flashinfer(monkeypatch) -> None:
+    import pytest
+
+    from vllm.models.deepseek_v4.nvidia import model as dsv4_model
+
+    monkeypatch.setattr(
+        dsv4_model.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(8, 9),
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: False)
+    vllm_config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+
+    with pytest.raises(RuntimeError, match="native sparse MLA SM89"):
+        dsv4_model._select_dsv4_attn_cls(vllm_config)
 
 
 def test_sm120_kernel_block_sizes_are_glm_config_aware() -> None:
@@ -462,7 +572,7 @@ def test_glm_nope_cache_update_rejects_rope_payload(monkeypatch) -> None:
 
 def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     fake_module = SimpleNamespace(
-        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192)})
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192), (32, 256)})
     )
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(
@@ -473,7 +583,7 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
 
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
