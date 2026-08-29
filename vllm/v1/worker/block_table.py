@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import SlotMappingPolicy
 from vllm.v1.utils import CpuGpuBuffer
 
 logger = init_logger(__name__)
@@ -50,8 +51,9 @@ def get_block_table_width(
 
 
 class SlotMappingMode(Enum):
-    TOKEN_TO_KV_SLOT = "token_to_kv_slot"
-    NONE = "none"
+    TOKEN_TO_KV_SLOT = SlotMappingPolicy.PAGED
+    NONE = SlotMappingPolicy.NONE
+    SINGLE_BLOCK_RING = SlotMappingPolicy.SINGLE_BLOCK_RING
 
 
 class BlockTable:
@@ -65,7 +67,9 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
-        slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        slot_mapping_mode: SlotMappingMode | SlotMappingPolicy = (
+            SlotMappingMode.TOKEN_TO_KV_SLOT
+        ),
     ):
         """
         Args:
@@ -142,8 +146,10 @@ class BlockTable:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
-        self.slot_mapping_mode = slot_mapping_mode
-        if self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
+        self.slot_mapping_policy = self._normalize_slot_mapping_policy(
+            slot_mapping_mode
+        )
+        if self.slot_mapping_policy != SlotMappingPolicy.NONE:
             _COMPUTE_SLOT_MAPPING_KERNEL.register_warmup(
                 kv_cache_block_size=self.kv_cache_block_size,
                 blocks_per_kv_block=self.blocks_per_kv_block,
@@ -152,7 +158,16 @@ class BlockTable:
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 block_table_stride=self.block_table.gpu.stride(0),
                 block_size=self.block_size,
+                slot_mapping_policy=int(self.slot_mapping_policy),
             )
+
+    @staticmethod
+    def _normalize_slot_mapping_policy(
+        mode: SlotMappingMode | SlotMappingPolicy,
+    ) -> SlotMappingPolicy:
+        if isinstance(mode, SlotMappingMode):
+            return mode.value
+        return mode
 
     def append_row(
         self,
@@ -205,11 +220,14 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        if self.slot_mapping_mode == SlotMappingMode.NONE:
+        if self.slot_mapping_policy == SlotMappingPolicy.NONE:
             # Mamba/GDN groups consume the block table as recurrent state
             # indices and do not use per-token slot mappings.
             return
-        assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
+        assert self.slot_mapping_policy in (
+            SlotMappingPolicy.PAGED,
+            SlotMappingPolicy.SINGLE_BLOCK_RING,
+        )
 
         _COMPUTE_SLOT_MAPPING_KERNEL(
             num_reqs,
@@ -226,6 +244,7 @@ class BlockTable:
             self.dcp_world_size,
             self.dcp_rank,
             self.cp_kv_cache_interleave_size,
+            int(self.slot_mapping_policy),
         )
 
     def commit_block_table(self, num_reqs: int) -> None:
@@ -298,7 +317,7 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
-        slot_mapping_modes: list[SlotMappingMode] | None = None,
+        slot_mapping_modes: list[SlotMappingMode | SlotMappingPolicy] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -322,7 +341,8 @@ class MultiGroupBlockTable:
         max_num_blocks = [
             (
                 get_block_table_width(n, block_size, token_alignment=None)
-                if slot_mapping_mode == SlotMappingMode.NONE
+                if BlockTable._normalize_slot_mapping_policy(slot_mapping_mode)
+                == SlotMappingPolicy.NONE
                 else get_block_table_width(n, block_size)
             )
             for n, block_size, slot_mapping_mode in zip(
@@ -406,6 +426,8 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
         cp_kv_cache_interleave_size: int
         block_table_stride: int
         block_size: int
+        slot_mapping_policy: int
+        single_block_ring_slot_mapping_policy: int
 
     @staticmethod
     @triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])
@@ -423,6 +445,8 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
         TOTAL_CP_WORLD_SIZE: tl.constexpr,
         TOTAL_CP_RANK: tl.constexpr,
         CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+        SLOT_MAPPING_POLICY: tl.constexpr,
+        SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY: tl.constexpr,
         PAD_ID: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
@@ -460,9 +484,14 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
                 virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
             )
 
-            block_indices = (
+            paged_block_indices = (
                 virtual_block_indices * BLOCKS_PER_KV_BLOCK
                 + local_block_offsets // block_size
+            )
+            block_indices = tl.where(
+                SLOT_MAPPING_POLICY == SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY,
+                0,
+                paged_block_indices,
             )
             block_numbers = tl.load(
                 block_table_ptr + row_offset + block_indices,
@@ -481,10 +510,17 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
         block_size: int,
         **compile_key_fields: int,
     ) -> CompileKey:
+        slot_mapping_policy = compile_key_fields.pop("slot_mapping_policy")
         return self.CompileKey(
             **compile_key_fields,
             block_table_stride=triton_scalar_specialization_rep(block_table_stride),
             block_size=triton_scalar_specialization_rep(block_size),
+            slot_mapping_policy=triton_scalar_specialization_rep(slot_mapping_policy),
+            single_block_ring_slot_mapping_policy=(
+                triton_scalar_specialization_rep(
+                    int(SlotMappingPolicy.SINGLE_BLOCK_RING)
+                )
+            ),
         )
 
     def get_warmup_keys(self, **dispatch_kwargs: int) -> list[CompileKey]:
@@ -509,6 +545,10 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
             TOTAL_CP_WORLD_SIZE=compile_key.total_cp_world_size,
             TOTAL_CP_RANK=compile_key.total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=compile_key.cp_kv_cache_interleave_size,
+            SLOT_MAPPING_POLICY=compile_key.slot_mapping_policy,
+            SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY=(
+                compile_key.single_block_ring_slot_mapping_policy
+            ),
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=self.triton_block_size,
             grid=(2,),
@@ -519,8 +559,13 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
         num_reqs: int,
         *args: Any,
     ) -> None:
+        *kernel_args, slot_mapping_policy = args
         self.kernel[(num_reqs + 1,)](
-            *args,
+            *kernel_args,
+            SLOT_MAPPING_POLICY=slot_mapping_policy,
+            SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY=int(
+                SlotMappingPolicy.SINGLE_BLOCK_RING
+            ),
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=self.triton_block_size,
         )

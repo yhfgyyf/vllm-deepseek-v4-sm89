@@ -375,6 +375,8 @@ def _kpool_tail_seed_kernel(
     tslot_ptr,
     tail_ptr,
     n_tokens,
+    TAIL_BLOCK_ELEMS: tl.constexpr,
+    KPOOL_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -401,11 +403,16 @@ def _kpool_tail_seed_kernel(
         return
     offs = tl.arange(0, BLOCK_D)
     m = offs < HEAD_DIM
-    base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM
+    block_base = blk * TAIL_BLOCK_ELEMS
+    base = block_base + (t % KPOOL) * HEAD_DIM
     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
     tl.store(tail_ptr + base + offs, k, mask=m)
-    tl.store(tail_ptr + base + KPOOL * HEAD_DIM + offs, s, mask=m)
+    tl.store(
+        tail_ptr + block_base + KPOOL_HEAD + (t % KPOOL) * HEAD_DIM + offs,
+        s,
+        mask=m,
+    )
 
 
 def kpool_seed_tail_cache(
@@ -417,7 +424,11 @@ def kpool_seed_tail_cache(
     head_dim: int = INDEX_HEAD_DIM,
 ) -> None:
     """Seed the paged tail cache from a prefill batch (see the kernel)."""
+    assert tail_kv_cache.ndim == 4
+    assert tail_kv_cache.shape[1:] == (2, kpool, head_dim)
     assert tail_kv_cache.dtype == torch.bfloat16
+    assert tail_kv_cache.stride(2) == head_dim
+    assert tail_kv_cache.stride(3) == 1
     assert key.dtype == torch.bfloat16
     n = tslot.shape[0]
     if n == 0:
@@ -428,6 +439,8 @@ def kpool_seed_tail_cache(
         tslot,
         tail_kv_cache,
         n,
+        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
+        KPOOL_HEAD=tail_kv_cache.stride(1),
         HEAD_DIM=head_dim,
         KPOOL=kpool,
         BLOCK_D=triton.next_power_of_2(head_dim),
@@ -649,6 +662,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     assert tail_kv_cache.shape[2] == pool_size
     assert tail_kv_cache.shape[3] == head_dim
     assert tail_kv_cache.dtype == torch.bfloat16
+    assert tail_kv_cache.stride(2) == head_dim
+    assert tail_kv_cache.stride(3) == 1
     assert key.ndim == 3 and key.shape[2] == head_dim
     assert slot_score.shape == key.shape
     assert ape.shape == (pool_size, head_dim)

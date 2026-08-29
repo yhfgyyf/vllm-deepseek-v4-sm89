@@ -241,6 +241,46 @@ def test_builder_build_uses_circular_mapping():
     )
 
 
+def test_builder_preserves_cuda_graph_token_padding():
+    per_req = [list(range(10)), list(range(12))]
+    own_blocks = [5, 9]
+    cam = make_common_metadata(per_req, own_blocks)
+    num_tokens = cam.slot_mapping.shape[0]
+    num_real_tokens = int(cam.query_start_loc_cpu[-1])
+    cam.positions = torch.cat(
+        (cam.positions, torch.zeros(num_tokens - num_real_tokens, dtype=torch.int64))
+    )
+    cam.query_start_loc = torch.cat(
+        (cam.query_start_loc, torch.zeros(2, dtype=torch.int64))
+    )
+    cam.query_start_loc_cpu = cam.query_start_loc.clone()
+    cam.block_table_tensor = torch.cat(
+        (
+            cam.block_table_tensor,
+            torch.zeros(2, cam.block_table_tensor.shape[1], dtype=torch.int32),
+        )
+    )
+    cam.seq_lens = torch.cat((cam.seq_lens, torch.ones(2, dtype=torch.int64)))
+    cam.num_reqs = 4
+    cam.num_actual_tokens = num_tokens
+
+    meta = KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
+
+    expected_real = torch.tensor(
+        [
+            block * KPOOL + pos % KPOOL
+            for block, positions in zip(own_blocks, per_req, strict=True)
+            for pos in positions
+        ],
+        dtype=meta.slot_mapping.dtype,
+    )
+    assert torch.equal(meta.slot_mapping[:num_real_tokens], expected_real)
+    assert torch.equal(
+        meta.slot_mapping[num_real_tokens:],
+        torch.full_like(meta.slot_mapping[num_real_tokens:], -1),
+    )
+
+
 def test_builder_build_falls_back_without_positions():
     """Capture / dummy builds without positions keep the generic mapping."""
     per_req = [list(range(10))]

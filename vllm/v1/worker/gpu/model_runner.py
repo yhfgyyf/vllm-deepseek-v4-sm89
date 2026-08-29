@@ -82,6 +82,7 @@ from vllm.v1.worker.gpu.async_utils import (
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
+    get_slot_mapping_policies,
     init_attn_backend,
     init_kv_cache,
 )
@@ -602,6 +603,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
+            slot_mapping_policies=get_slot_mapping_policies(kv_cache_config),
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,

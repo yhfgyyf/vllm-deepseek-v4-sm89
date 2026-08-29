@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.kv_cache_interface import SlotMappingPolicy
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
@@ -174,6 +175,156 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
         9 * 128, 10 * 128, dtype=torch.int64, device=device
     )
     assert torch.equal(actual, expected)
+
+
+def test_circular_slot_mapping_group_reuses_its_only_block():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[4, 4],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[3, 1],
+        device=device,
+        kernel_block_sizes=[4, 4],
+        slot_mapping_policies=[
+            SlotMappingPolicy.PAGED,
+            SlotMappingPolicy.SINGLE_BLOCK_RING,
+        ],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([10, 11, 12], [7]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 12], dtype=torch.int32, device=device)
+    positions = torch.arange(12, dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=16,
+    )
+
+    assert torch.equal(
+        actual[0, :12], torch.arange(40, 52, dtype=torch.int64, device=device)
+    )
+    assert torch.equal(
+        actual[1, :12],
+        torch.arange(12, dtype=torch.int64, device=device).remainder(4).add(28),
+    )
+    assert torch.equal(actual[:, 12:], torch.full_like(actual[:, 12:], -1))
+
+
+def test_single_block_ring_isolates_multiple_requests_across_large_positions():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[1],
+        device=device,
+        kernel_block_sizes=[128],
+        slot_mapping_policies=[SlotMappingPolicy.SINGLE_BLOCK_RING],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5],),
+        overwrite=True,
+    )
+    block_tables.append_block_ids(
+        req_index=1,
+        new_block_ids=([9],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.arange(2, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 5, 10], dtype=torch.int32, device=device)
+    positions = torch.tensor(
+        [0, 127, 128, 511, 512, 0, 127, 128, 511, 512],
+        dtype=torch.int64,
+        device=device,
+    )
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=16,
+    )[0]
+
+    expected = torch.tensor(
+        [640, 767, 640, 767, 640, 1152, 1279, 1152, 1279, 1152],
+        dtype=torch.int64,
+        device=device,
+    )
+    assert torch.equal(actual[:10], expected)
+
+
+def test_paged_slot_mapping_keeps_block_indices_across_large_positions():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128],
+        max_num_reqs=1,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[5],
+        device=device,
+        kernel_block_sizes=[128],
+        slot_mapping_policies=[SlotMappingPolicy.PAGED],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([3, 4, 5, 6, 7],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 5], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 127, 128, 511, 512], dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=8,
+    )[0]
+
+    expected = torch.tensor([384, 511, 512, 895, 896], device=device)
+    assert torch.equal(actual[:5], expected)
+
+
+def test_compute_slot_mappings_pads_cuda_graph_slots_to_minus_one():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128],
+        max_num_reqs=1,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[1],
+        device=device,
+        kernel_block_sizes=[128],
+        slot_mapping_policies=[SlotMappingPolicy.SINGLE_BLOCK_RING],
+    )
+    block_tables.slot_mappings.fill_(1234)
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=8,
+    )[0]
+
+    assert torch.equal(actual[2:], torch.full_like(actual[2:], -1))
 
 
 def test_v1_block_table_move_row_clears_vacated_row():

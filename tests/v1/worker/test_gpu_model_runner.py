@@ -35,7 +35,10 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV4IndexerBackend,
+    DeepseekV32IndexerBackend,
+)
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     ROCMAiterMLASparseBackend,
 )
@@ -44,9 +47,12 @@ from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_con
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    SlotMappingPolicy,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -56,6 +62,7 @@ from vllm.v1.worker.block_table import (
     SlotMappingMode,
     get_block_table_width,
 )
+from vllm.v1.worker.gpu.attn_utils import get_slot_mapping_policies
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
@@ -1455,6 +1462,124 @@ def test_mamba_state_table_width_is_not_aligned():
     )
 
     assert block_tables[0].max_num_blocks_per_req == 1
+
+
+def test_kpool_tail_group_uses_single_block_ring_policy():
+    tail_spec = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=4,
+        kv_cache_specs={"tail.0": tail_spec, "tail.1": tail_spec},
+    )
+
+    assert tail_spec.slot_mapping_policy is SlotMappingPolicy.SINGLE_BLOCK_RING
+    assert wrapped.slot_mapping_policy is SlotMappingPolicy.SINGLE_BLOCK_RING
+    assert _full_attention_spec(4).slot_mapping_policy is SlotMappingPolicy.PAGED
+
+
+def _full_attention_spec(block_size: int = 128) -> FullAttentionSpec:
+    return FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+
+
+def _kpool_tail_spec(block_size: int = 128) -> KpoolTailSpec:
+    return KpoolTailSpec(
+        block_size=block_size,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=block_size,
+    )
+
+
+def test_deepseek_indexer_specs_keep_paged_slot_mapping_policy():
+    spec = _full_attention_spec(block_size=256)
+
+    assert DeepseekV32IndexerBackend.customize_spec(spec).slot_mapping_policy is (
+        SlotMappingPolicy.PAGED
+    )
+    assert DeepseekV4IndexerBackend.customize_spec(spec).slot_mapping_policy is (
+        SlotMappingPolicy.PAGED
+    )
+
+
+def test_kpool_tail_spec_uses_single_block_ring_policy():
+    assert _kpool_tail_spec().slot_mapping_policy is (
+        SlotMappingPolicy.SINGLE_BLOCK_RING
+    )
+
+
+def test_uniform_spec_keeps_wrapped_slot_mapping_policy():
+    paged = UniformTypeKVCacheSpecs(
+        block_size=128,
+        kv_cache_specs={
+            "indexer.0": _full_attention_spec(),
+            "indexer.1": _full_attention_spec(),
+        },
+    )
+    ring = UniformTypeKVCacheSpecs(
+        block_size=128,
+        kv_cache_specs={
+            "tail.0": _kpool_tail_spec(),
+            "tail.1": _kpool_tail_spec(),
+        },
+    )
+
+    assert paged.slot_mapping_policy is SlotMappingPolicy.PAGED
+    assert ring.slot_mapping_policy is SlotMappingPolicy.SINGLE_BLOCK_RING
+
+
+def test_uniform_spec_rejects_mixed_slot_mapping_policies():
+    mixed = UniformTypeKVCacheSpecs(
+        block_size=128,
+        kv_cache_specs={
+            "indexer.0": _full_attention_spec(),
+            "tail.0": _kpool_tail_spec(),
+        },
+    )
+
+    with pytest.raises(AssertionError, match="same slot mapping policy"):
+        _ = mixed.slot_mapping_policy
+
+
+def test_gpu_runner_assigns_paged_policy_to_deepseek_indexer_groups():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["deepseek.v32.indexer"], _full_attention_spec()),
+            KVCacheGroupSpec(["deepseek.v4.indexer"], _full_attention_spec(256)),
+            KVCacheGroupSpec(["glm.tail"], _kpool_tail_spec()),
+            KVCacheGroupSpec(
+                ["glm.tail.0", "glm.tail.1"],
+                UniformTypeKVCacheSpecs(
+                    block_size=128,
+                    kv_cache_specs={
+                        "glm.tail.0": _kpool_tail_spec(),
+                        "glm.tail.1": _kpool_tail_spec(),
+                    },
+                ),
+            ),
+        ],
+    )
+
+    assert get_slot_mapping_policies(kv_cache_config) == [
+        SlotMappingPolicy.PAGED,
+        SlotMappingPolicy.PAGED,
+        SlotMappingPolicy.SINGLE_BLOCK_RING,
+        SlotMappingPolicy.SINGLE_BLOCK_RING,
+    ]
 
 
 def test_input_batch_with_kernel_block_sizes():

@@ -167,6 +167,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheSpecKind,
     SlidingWindowSpec,
+    SlotMappingPolicy,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -255,6 +256,14 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _slot_mapping_mode_from_policy(policy: SlotMappingPolicy) -> SlotMappingMode:
+    if policy == SlotMappingPolicy.NONE:
+        return SlotMappingMode.NONE
+    if policy == SlotMappingPolicy.SINGLE_BLOCK_RING:
+        return SlotMappingMode.SINGLE_BLOCK_RING
+    return SlotMappingMode.TOKEN_TO_KV_SLOT
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -7330,10 +7339,9 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
-                slot_mapping_modes.append(SlotMappingMode.NONE)
-            else:
-                slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            slot_mapping_modes.append(
+                _slot_mapping_mode_from_policy(kv_cache_spec.slot_mapping_policy)
+            )
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
                 self.vllm_config, max_model_len
             )

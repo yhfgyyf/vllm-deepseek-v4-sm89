@@ -141,6 +141,14 @@ class KVCacheSpecKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class SlotMappingPolicy(IntEnum):
+    """How scheduled tokens map to cache slots for a KV cache group."""
+
+    NONE = 0
+    PAGED = 1
+    SINGLE_BLOCK_RING = 2
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
@@ -154,6 +162,11 @@ class KVCacheSpec:
     def participates_in_prefix_caching(self) -> bool:
         """Whether this spec's group participates in prefix caching."""
         return True
+
+    @property
+    def slot_mapping_policy(self) -> SlotMappingPolicy:
+        """How this spec maps scheduled tokens to cache slots."""
+        return SlotMappingPolicy.PAGED
 
     @property
     def num_heads(self) -> int:
@@ -840,6 +853,10 @@ class KpoolTailSpec(SlidingWindowSpec):
     def participates_in_prefix_caching(self) -> bool:
         return False
 
+    @property
+    def slot_mapping_policy(self) -> SlotMappingPolicy:
+        return SlotMappingPolicy.SINGLE_BLOCK_RING
+
 
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
@@ -874,6 +891,10 @@ class MambaSpec(KVCacheSpec):
             assert self.page_size_padded >= page_size
             return self.page_size_padded
         return page_size
+
+    @property
+    def slot_mapping_policy(self) -> SlotMappingPolicy:
+        return SlotMappingPolicy.NONE
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
@@ -1002,6 +1023,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return all(
             spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
         )
+
+    @property
+    def slot_mapping_policy(self) -> SlotMappingPolicy:
+        policies = {spec.slot_mapping_policy for spec in self.kv_cache_specs.values()}
+        assert len(policies) == 1, (
+            "All layers in the same KV cache group must use the same slot "
+            f"mapping policy, got {sorted(policy.name for policy in policies)}."
+        )
+        return next(iter(policies))
 
     @property
     def page_size_bytes(self) -> int:

@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    SlotMappingPolicy,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -63,6 +64,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 spec = attn_module.get_attn_backend().customize_spec(spec)
             kv_cache_spec[layer_name] = spec
     return kv_cache_spec
+
+
+def get_slot_mapping_policies(
+    kv_cache_config: KVCacheConfig,
+) -> list[SlotMappingPolicy]:
+    return [
+        group.kv_cache_spec.slot_mapping_policy
+        for group in kv_cache_config.kv_cache_groups
+    ]
 
 
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):

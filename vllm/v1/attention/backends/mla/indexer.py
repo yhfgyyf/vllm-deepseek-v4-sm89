@@ -545,13 +545,16 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         if positions is not None:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            num_reqs = int(torch.argmax(query_start_loc_cpu).item())
+            num_tokens = int(query_start_loc_cpu[num_reqs].item())
             slot_mapping = compute_kpool_tail_slot_mapping(
                 slot_mapping,
                 common_attn_metadata.block_table_tensor,
-                common_attn_metadata.query_start_loc,
+                common_attn_metadata.query_start_loc[: num_reqs + 1],
                 positions,
-                common_attn_metadata.num_actual_tokens,
-                common_attn_metadata.num_reqs,
+                num_tokens,
+                num_reqs,
                 self.kv_cache_spec.block_size,
             )
         return DeepseekV32IndexerMetadata(

@@ -6,6 +6,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import SlotMappingPolicy
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
@@ -26,6 +27,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        slot_mapping_policies: list[SlotMappingPolicy] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -39,6 +41,10 @@ class BlockTables:
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
+        if slot_mapping_policies is None:
+            slot_mapping_policies = [SlotMappingPolicy.PAGED] * self.num_kv_cache_groups
+        assert len(slot_mapping_policies) == self.num_kv_cache_groups
+        self.slot_mapping_policies = slot_mapping_policies
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -99,6 +105,11 @@ class BlockTables:
         )
         self.kernel_block_sizes_tensor = torch.tensor(
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
+        )
+        self.slot_mapping_policies_tensor = torch.tensor(
+            [int(policy) for policy in self.slot_mapping_policies],
+            dtype=torch.int32,
+            device=self.device,
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
@@ -202,11 +213,16 @@ class BlockTables:
             self.block_table_strides,
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
+            self.slot_mapping_policies_tensor,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
+            NONE_SLOT_MAPPING_POLICY=int(SlotMappingPolicy.NONE),
+            SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY=int(
+                SlotMappingPolicy.SINGLE_BLOCK_RING
+            ),
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
@@ -274,11 +290,14 @@ def _compute_slot_mappings_kernel(
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
+    slot_mapping_policies,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
+    NONE_SLOT_MAPPING_POLICY: tl.constexpr,
+    SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
@@ -302,6 +321,8 @@ def _compute_slot_mappings_kernel(
     block_table_stride = tl.load(block_table_strides + group_id)
     kv_block_size = tl.load(block_sizes + group_id)
     kernel_block_size = tl.load(kernel_block_sizes + group_id)
+    slot_mapping_policy = tl.load(slot_mapping_policies + group_id)
+    has_slot_mapping = slot_mapping_policy != NONE_SLOT_MAPPING_POLICY
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -325,7 +346,12 @@ def _compute_slot_mappings_kernel(
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets
 
-        block_indices = local_positions // kernel_block_size
+        is_local = is_local & has_slot_mapping
+        block_indices = tl.where(
+            slot_mapping_policy == SINGLE_BLOCK_RING_SLOT_MAPPING_POLICY,
+            0,
+            local_positions // kernel_block_size,
+        )
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
@@ -333,7 +359,6 @@ def _compute_slot_mappings_kernel(
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
-        if CP_SIZE != 1:
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
