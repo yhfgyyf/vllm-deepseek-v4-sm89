@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
 
 
@@ -50,6 +51,46 @@ def test_sm89_fp8_einsum_triton_matches_reference() -> None:
 
     fp8_einsum_module._deepseek_v4_sm89_fp8_einsum(a, a_scale, b, b_scale, out)
 
+    ref = torch.einsum(
+        "tgh,grh->tgr",
+        a.float() * a_scale.float(),
+        b.float() * b_scale.float(),
+    )
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_sm89_fp8_einsum_accepts_checkpoint_scale_layout(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fp8_einsum_module.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(8, 9),
+    )
+    torch.manual_seed(4)
+    num_tokens, num_groups, hidden_size, out_rank = 3, 2, 128, 128
+    a = _to_fp8(torch.randn((num_tokens, num_groups, hidden_size), device="cuda"))
+    b = _to_fp8(torch.randn((num_groups * out_rank, hidden_size), device="cuda"))
+    a_scale = torch.rand((num_tokens, num_groups, 1), device="cuda") * 0.1 + 0.01
+    b_scale = torch.tensor([[123], [125]], dtype=torch.uint8, device="cuda").view(
+        torch.float8_e8m0fnu
+    )
+    out = torch.empty(
+        (num_tokens, num_groups, out_rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    fp8_einsum_module.deepseek_v4_fp8_einsum(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        out,
+        "bhr,hdr->bhd",
+        (1, 128, 128),
+    )
+
+    b = b.view(num_groups, out_rank, hidden_size)
+    b_scale = fp8_einsum_module._upcast_e8m0_to_fp32(b_scale).view(num_groups, 1, 1)
     ref = torch.einsum(
         "tgh,grh->tgr",
         a.float() * a_scale.float(),
