@@ -60,7 +60,7 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc0.dev110-g86f8ff6b5a-glm53-dsv4-sm89sm120-cu130 \
+gh release download v0.28.1rc0-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
   --pattern 'flashinfer_python-0.6.18+glm53.dsv4.sm89sm120.cu130.pt213-*.whl' \
   --pattern 'vllm-*sm89sm120.cu130-*.whl' \

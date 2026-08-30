@@ -13,7 +13,7 @@ PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile.
 # GLM-5.3-Flash and DeepSeek-V4-Flash require the paired SM89+SM120 fork.
 # Keep this direct wheel URL so source installs resolve the validated build.
-flashinfer-python @ https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0.dev110-g86f8ff6b5a-glm53-dsv4-sm89sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=2bb642881118be275914546162782539138db3ddbda07ee8c759418001e59851
+flashinfer-python @ https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=2bb642881118be275914546162782539138db3ddbda07ee8c759418001e59851
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

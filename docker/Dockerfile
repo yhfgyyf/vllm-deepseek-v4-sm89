@@ -950,7 +950,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # NoPE sparse MLA APIs.
 ARG FLASHINFER_VERSION=0.6.18rc10
 ARG FLASHINFER_RELEASE_TAG=v0.6.18rc10
-ARG FLASHINFER_GLM_PYTHON_WHEEL_URL=https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0.dev110-g86f8ff6b5a-glm53-dsv4-sm89sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=2bb642881118be275914546162782539138db3ddbda07ee8c759418001e59851
+ARG FLASHINFER_GLM_PYTHON_WHEEL_URL=https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=2bb642881118be275914546162782539138db3ddbda07ee8c759418001e59851
 ARG TARGETARCH
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
