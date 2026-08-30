@@ -839,7 +839,7 @@ py-cpuinfo==9.0.0
     # via -r requirements/test/../common.txt
 py-spy==0.4.0
     # via ray
-pyarrow==23.0.0
+pyarrow==25.0.1
     # via
     #   datasets
     #   genai-perf
