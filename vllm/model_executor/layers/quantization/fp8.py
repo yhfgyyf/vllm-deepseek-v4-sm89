@@ -367,6 +367,14 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_marlin:
+            capability = current_platform.get_device_capability()
+            if (
+                getattr(layer, "is_bmm", False)
+                and self.block_quant
+                and capability is not None
+                and (capability.major, capability.minor) == (8, 9)
+            ):
+                return
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
                 replace_parameter(layer, "weight", layer.weight.t())

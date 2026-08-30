@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_fp8.py --forked`.
 """
 
 import logging
+from unittest.mock import Mock
 
 import pytest
 import regex as re
@@ -36,6 +37,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -58,6 +60,34 @@ def test_static_fp8_moe_input_scales_remain_scalar() -> None:
     )
 
     assert a1_scale.ndim == a2_scale.ndim == 0
+
+
+@pytest.mark.parametrize(
+    ("capability", "is_bmm", "block_quant", "expected_calls"),
+    [
+        (DeviceCapability(8, 9), True, True, 0),
+        (DeviceCapability(8, 9), True, False, 1),
+        (DeviceCapability(8, 9), False, True, 1),
+        (DeviceCapability(12, 0), True, True, 1),
+    ],
+)
+def test_fp8_marlin_preserves_sm89_bmm_weights(
+    monkeypatch, capability, is_bmm, block_quant, expected_calls
+) -> None:
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda: capability)
+    method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+    method.use_marlin = True
+    method.block_quant = block_quant
+    method.fp8_linear = Mock(spec=MarlinFP8ScaledMMLinearKernel)
+    layer = torch.nn.Module()
+    layer.is_bmm = is_bmm
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(1, 1), requires_grad=False)
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert method.fp8_linear.process_weights_after_loading.call_count == expected_calls
 
 
 @pytest.mark.skipif(
