@@ -74,11 +74,11 @@ cd /tmp/vllm-sm89-sm120-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install \
-  ./flashinfer_python-*.whl \
-  ./vllm-*.whl \
-  --torch-backend=cu130
+uv pip install ./vllm-*.whl --torch-backend=cu130
 ```
+
+The vLLM wheel installs its paired FlashInfer wheel from a pinned URL in the
+same release. `SHA256SUMS` verifies both wheels downloaded above.
 
 If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
 mirror.

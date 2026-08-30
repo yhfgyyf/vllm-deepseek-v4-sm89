@@ -71,11 +71,11 @@ cd /tmp/vllm-sm89-sm120-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install \
-  ./flashinfer_python-*.whl \
-  ./vllm-*.whl \
-  --torch-backend=cu130
+uv pip install ./vllm-*.whl --torch-backend=cu130
 ```
+
+vLLM wheel 会通过锁定的依赖 URL，从同一 Release 自动安装配套的
+FlashInfer wheel。下载到本地的两个 wheel 均由 `SHA256SUMS` 校验。
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
