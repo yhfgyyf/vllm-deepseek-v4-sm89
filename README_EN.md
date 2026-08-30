@@ -17,7 +17,7 @@ FlashInfer `0.6.18`. It has been validated on **4× RTX 4090 48 GB** and
 
 | GPU architecture | Validated GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
 |---|---|---:|---:|
-| SM89 / Ada | 4× RTX 4090 48 GB | Yes | No |
+| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Pending validation |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes |
 
 ---

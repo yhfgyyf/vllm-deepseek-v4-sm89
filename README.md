@@ -15,7 +15,7 @@
 
 | GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
 |---|---|---:|---:|
-| SM89 / Ada | 4× RTX 4090 48GB | 是 | 否 |
+| SM89 / Ada | 8× RTX 4090 48GB | 是 | 待验证 |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 |
 
 ---
