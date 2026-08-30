@@ -1197,7 +1197,7 @@ termcolor==3.1.0
     # via gpt-oss
 threadpoolctl==3.5.0
     # via scikit-learn
-tifffile==2025.3.30
+tifffile==2025.5.10
     # via scikit-image
 tiktoken==0.12.0
     # via
