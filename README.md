@@ -26,6 +26,7 @@
 
 - 社区用户已在 8× RTX 4090 48GB（SM89）上成功运行 GLM-5.3-Flash，参见
   [Issue #74 的验证记录](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
+- 发布统一的 SM89+SM120 Docker 镜像到阿里云上海 ACR。
 
 ### 2026-08-30
 
@@ -59,7 +60,9 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ---
 
-## 2. 快速安装（预编译 wheel）
+## 2. 快速安装
+
+### 2.1 预编译 wheel
 
 ```bash
 uv venv --python 3.12 --seed
@@ -83,6 +86,53 @@ vLLM wheel 会通过锁定的依赖 URL，从同一 Release 自动安装配套�
 FlashInfer wheel。下载到本地的两个 wheel 均由 `SHA256SUMS` 校验。
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
+
+### 2.2 Docker 镜像（阿里云上海 ACR）
+
+镜像地址：
+
+```text
+crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
+```
+
+| 项目 | 值 |
+|---|---|
+| 平台 | Linux x86_64 / `linux/amd64` |
+| vLLM | `0.28.1rc0.dev110+g5911abc0a1.glm53.dsv4.sm89sm120.cu130` |
+| FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
+| PyTorch / CUDA | `2.13.0+cu130` / CUDA 13.0 JIT toolchain |
+| 镜像大小 | 9.25 GB 未压缩；约 4.55 GB Registry 传输量 |
+| Digest | `sha256:2adecc7cb455b84353a4efe266760f3946dd0026778aa5a7f42e51e4712edda9` |
+
+登录并拉取版本化标签：
+
+```bash
+docker login --username=yhfg_yyf \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com
+
+docker pull \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
+```
+
+生产部署可以按 digest 固定镜像内容：
+
+```bash
+docker pull \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89@sha256:2adecc7cb455b84353a4efe266760f3946dd0026778aa5a7f42e51e4712edda9
+```
+
+镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
+`vllm serve /path/to/model` 替换为：
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130 \
+  /models/model-directory
+```
+
+其余模型参数保持不变。镜像已完成 SM120 GPU 运行验证和 SM89 目标编译验证。
 
 ---
 
