@@ -6,23 +6,27 @@
 >
 > This repository is based on
 > [vllm-project/vllm](https://github.com/vllm-project/vllm). It runs
-> DeepSeek-V4-Flash on SM89/Ada and SM120/RTX Blackwell, and GLM-5.3-Flash on
-> SM120.
+> DeepSeek-V4-Flash and GLM-5.3-Flash on SM89/Ada and SM120/RTX Blackwell.
 
 The current source is based on vLLM `v0.28.1rc0-110` and is paired with
-FlashInfer `0.6.18`. It has been validated on **4× RTX 4090 48 GB** and
-**4× RTX PRO 6000 Blackwell 96 GB** systems.
+FlashInfer `0.6.18`. Validated configurations include
+**4×/8× RTX 4090 48 GB** and **4× RTX PRO 6000 Blackwell 96 GB** systems.
 
 ## Support matrix
 
 | GPU architecture | Validated GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
 |---|---|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Pending validation |
+| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Yes |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes |
 
 ---
 
 ## Changelog
+
+### 2026-08-31
+
+- A community user successfully ran GLM-5.3-Flash on 8× RTX 4090 48 GB
+  (SM89); see the [Issue #74 validation record](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993).
 
 ### 2026-08-30
 
@@ -49,7 +53,7 @@ Earlier SM89 builds and environments remain available in
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
 | vLLM | `0.28.1rc0.dev110` SM89+SM120 build |
-| SM89 | 4× RTX 4090 48 GB |
+| SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
 The FlashInfer wheel is a Python/JIT source package. The first unseen model
@@ -234,6 +238,8 @@ Repeating the same prompt produced:
   512-token tests on SM120.
 - DeepSeek-V4-Flash passed 8K/32K/128K, four-concurrency, tool-calling, and UTF-8
   output tests on SM89.
+- A community user successfully served and ran GLM-5.3-Flash on 8× RTX 4090
+  48 GB (SM89); see [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993).
 - Both models passed multilingual output plus streaming and non-streaming tool
   calling checks.
 

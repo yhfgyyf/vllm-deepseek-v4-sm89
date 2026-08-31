@@ -5,22 +5,27 @@
 > English version: [`README_EN.md`](README_EN.md)
 >
 > 本仓库基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，用于在
-> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash，并在 SM120 上运行
+> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash 和
 > GLM-5.3-Flash。
 
-当前代码基于 vLLM `v0.28.1rc0-110`，配套 FlashInfer `0.6.18`。已验证的平台是
-**4× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
+当前代码基于 vLLM `v0.28.1rc0-110`，配套 FlashInfer `0.6.18`。已验证配置包括
+**4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
 
 ## 支持矩阵
 
 | GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
 |---|---|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48GB | 是 | 待验证 |
+| SM89 / Ada | 8× RTX 4090 48GB | 是 | 是 |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 |
 
 ---
 
 ## Changelog
+
+### 2026-08-31
+
+- 社区用户已在 8× RTX 4090 48GB（SM89）上成功运行 GLM-5.3-Flash，参见
+  [Issue #74 的验证记录](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
 
 ### 2026-08-30
 
@@ -46,7 +51,7 @@
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
 | vLLM | `0.28.1rc0.dev110` SM89+SM120 build |
-| SM89 | 4× RTX 4090 48GB |
+| SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
 FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时会进行一次 JIT
@@ -226,6 +231,8 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
   输入和 512 输出测试。
 - DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8
   输出测试。
+- GLM-5.3-Flash 已由社区用户在 8× RTX 4090 48GB（SM89）上成功启动并完成
+  推理，参见 [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
 - 两个模型均通过中英文、多语言字符、流式与非流式工具调用检查。
 
 ---
