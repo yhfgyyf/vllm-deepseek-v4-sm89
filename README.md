@@ -104,12 +104,10 @@ crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek
 | 镜像大小 | 9.25 GB 未压缩；约 4.55 GB Registry 传输量 |
 | Digest | `sha256:2adecc7cb455b84353a4efe266760f3946dd0026778aa5a7f42e51e4712edda9` |
 
-登录并拉取版本化标签：
+该仓库已开放匿名拉取，下载镜像不需要执行 `docker login`。登录仅用于维护者
+推送镜像。直接拉取版本化标签：
 
 ```bash
-docker login --username=yhfg_yyf \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com
-
 docker pull \
   crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
 ```
