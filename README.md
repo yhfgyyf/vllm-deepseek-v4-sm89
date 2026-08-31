@@ -112,13 +112,6 @@ docker pull \
   crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
 ```
 
-生产部署可以按 digest 固定镜像内容：
-
-```bash
-docker pull \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89@sha256:2adecc7cb455b84353a4efe266760f3946dd0026778aa5a7f42e51e4712edda9
-```
-
 镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
 `vllm serve /path/to/model` 替换为：
 
