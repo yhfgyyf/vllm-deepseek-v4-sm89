@@ -1,0 +1,90 @@
+FROM nvidia/cuda:13.0.3-base-ubuntu24.04 AS runtime-base
+
+ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -Ei \
+        "s#https?://(archive|security).ubuntu.com/ubuntu/?#${UBUNTU_MIRROR}/#g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        libibverbs-dev \
+        libnuma-dev \
+        ninja-build \
+        numactl \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base AS python-deps
+
+ARG UV_VERSION=0.10.7
+ARG PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG VLLM_WHEEL_URL="https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-sm89-sm120-cu130/vllm-0.28.1rc0.dev110%2Bg5911abc0a1.glm53.dsv4.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e5af611dfff4b28296079ef10c9519118d4e658d17b6be8516c67739b21bf911"
+
+RUN python3.12 -m venv /tmp/uv-bootstrap \
+    && /tmp/uv-bootstrap/bin/pip install \
+        --no-cache-dir \
+        --index-url "${PYPI_INDEX_URL}" \
+        "uv==${UV_VERSION}" \
+    && /tmp/uv-bootstrap/bin/uv venv \
+        --python /usr/bin/python3.12 \
+        --seed \
+        /opt/venv \
+    && UV_DEFAULT_INDEX="${PYPI_INDEX_URL}" \
+        UV_INDEX_STRATEGY=unsafe-best-match \
+        UV_NO_CACHE=1 \
+        /tmp/uv-bootstrap/bin/uv pip install \
+        --python /opt/venv/bin/python \
+        --torch-backend=cu130 \
+        "${VLLM_WHEEL_URL}" \
+    && /tmp/uv-bootstrap/bin/uv pip uninstall \
+        --python /opt/venv/bin/python \
+        torchaudio torchcodec torchvision \
+    && find /opt/venv/lib/python3.12/site-packages/vllm \
+        -type f -name '*.so' -exec strip --strip-debug {} + \
+    && /opt/venv/bin/python -c \
+        'import importlib.metadata as m; print(m.version("vllm"), m.version("flashinfer-python"), m.version("torch"))' \
+    && rm -rf /tmp/uv-bootstrap /root/.cache
+
+FROM runtime-base AS cuda-jit-runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cuda-cuobjdump-13-0 \
+        cuda-nvcc-13-0 \
+        cuda-nvrtc-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM cuda-jit-runtime
+
+ARG SOURCE_COMMIT=5911abc0a15483f1deffb2235f4cd07113870065
+ARG IMAGE_VERSION=0.28.1rc0-sm89-sm120-cu130
+
+COPY --from=python-deps /opt/venv /opt/venv
+
+ENV CUDA_HOME=/usr/local/cuda \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/opt/venv/lib/python3.12/site-packages/nvidia/cu13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TORCH_CUDA_ARCH_LIST="8.9 12.0" \
+    VLLM_USAGE_SOURCE=production-docker-image
+
+LABEL org.opencontainers.image.description="Run DeepSeek-V4-Flash and GLM-5.3-Flash on SM89 and SM120 with vLLM" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/yhfgyyf/vllm-deepseek-v4-sm89" \
+      org.opencontainers.image.version="${IMAGE_VERSION}"
+
+WORKDIR /workspace
+EXPOSE 8000
+ENTRYPOINT ["vllm", "serve"]
