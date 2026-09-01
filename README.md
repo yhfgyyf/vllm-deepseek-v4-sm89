@@ -28,6 +28,8 @@
   8× RTX 4090 48GB（SM89）均已支持。
 - 增加 DeepSeek-V4-Flash-Vision-Exp 的 SM89 部署说明和 8 卡 DSpark
   启动命令。
+- 增加 8× RTX 4090 48GB 的 GLM-5.3-Flash 启动命令，并将 DeepSeek-V4-Flash
+  的 SM89 示例改为 `--max-model-len auto`。
 
 ### 2026-08-31
 
@@ -148,7 +150,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --kv-cache-dtype fp8_ds_mla \
   --block-size 256 \
-  --max-model-len 131584 \
+  --max-model-len auto \
   --max-num-seqs 4 \
   --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.986 \
@@ -256,7 +258,40 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
 上述 8 卡命令是推荐部署配置；本轮 SM89 实机回归使用 4× RTX 4090 48GB，
 且未启用 DSpark。
 
-## 5. GLM-5.3-Flash 启动命令（SM120）
+## 5. GLM-5.3-Flash 启动命令
+
+### 5.1 SM89：8× RTX 4090 48GB
+
+以下参数参考社区用户在
+[Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)
+中使用官方 FP8 权重完成的部署验证：
+
+```bash
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export NCCL_P2P_DISABLE=1
+export VLLM_ENGINE_READY_TIMEOUT=3600
+
+vllm serve /path/to/GLM-5.3-Flash \
+  --served-model-name zai-org/GLM-5.3-Flash \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHINFER_MLA_SPARSE_SM120 \
+  --kv-cache-dtype fp8 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":5}' \
+  --reasoning-parser glm45 \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --block-size 2304 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 \
+  --gpu-memory-utilization 0.96 \
+  --enable-prefix-caching \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### 5.2 SM120：4× RTX PRO 6000 96GB
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -277,7 +312,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### 关键参数
+### 5.3 SM120 关键参数
 
 | 参数 | 推荐值 | 说明 |
 |---|---:|---|

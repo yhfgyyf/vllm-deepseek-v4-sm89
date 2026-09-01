@@ -30,6 +30,8 @@ FlashInfer `0.6.18`. Validated configurations include
   8× RTX 4090 48 GB (SM89).
 - Added SM89 deployment guidance and an 8-GPU DSpark launch command for
   DeepSeek-V4-Flash-Vision-Exp.
+- Added an 8× RTX 4090 48 GB GLM-5.3-Flash launch command and changed the SM89
+  DeepSeek-V4-Flash example to `--max-model-len auto`.
 
 ### 2026-08-31
 
@@ -112,7 +114,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --kv-cache-dtype fp8_ds_mla \
   --block-size 256 \
-  --max-model-len 131584 \
+  --max-model-len auto \
   --max-num-seqs 4 \
   --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.986 \
@@ -221,7 +223,40 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
-## 5. GLM-5.3-Flash launch command (SM120)
+## 5. GLM-5.3-Flash launch commands
+
+### 5.1 SM89: 8× RTX 4090 48 GB
+
+The following configuration is based on the community deployment validation
+with the official FP8 weights in
+[Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993):
+
+```bash
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export NCCL_P2P_DISABLE=1
+export VLLM_ENGINE_READY_TIMEOUT=3600
+
+vllm serve /path/to/GLM-5.3-Flash \
+  --served-model-name zai-org/GLM-5.3-Flash \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHINFER_MLA_SPARSE_SM120 \
+  --kv-cache-dtype fp8 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":5}' \
+  --reasoning-parser glm45 \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --block-size 2304 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 \
+  --gpu-memory-utilization 0.96 \
+  --enable-prefix-caching \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### 5.2 SM120: 4× RTX PRO 6000 96 GB
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -242,7 +277,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### Key parameters
+### 5.3 SM120 key parameters
 
 | Option | Recommended value | Purpose |
 |---|---:|---|
