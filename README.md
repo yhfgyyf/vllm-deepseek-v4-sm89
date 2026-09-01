@@ -15,7 +15,7 @@
 
 | GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
 |---|---|---:|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48GB | 是 | 待验证 | 是 |
+| SM89 / Ada | 8× RTX 4090 48GB | 是 | 是 | 是 |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 | 是 |
 
 ---
@@ -24,8 +24,10 @@
 
 ### 2026-09-01
 
-- 增加 DeepSeek-V4-Flash-Vision-Exp 支持；4× RTX PRO 6000（SM120）已验证，
-  8× RTX 4090 48GB（SM89）待验证。
+- 增加 DeepSeek-V4-Flash-Vision-Exp 支持；4× RTX PRO 6000（SM120）和
+  8× RTX 4090 48GB（SM89）均已支持。
+- 增加 DeepSeek-V4-Flash-Vision-Exp 的 SM89 部署说明和 8 卡 DSpark
+  启动命令。
 
 ### 2026-08-31
 
@@ -192,7 +194,14 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. DeepSeek-V4-Flash-Vision-Exp 启动命令（SM120）
+## 4. DeepSeek-V4-Flash-Vision-Exp 启动命令
+
+4× RTX 4090 48GB 可以运行 DeepSeek-V4-Flash-Vision-Exp，但不建议启用
+DSpark：目标模型和 draft model 会占用大部分显存，剩余空间不足以提供实用的
+draft KV cache。8× RTX 4090 48GB 可以启用 DSpark，建议将
+`--max-num-batched-tokens` 设置为 `4096`。
+
+### 4.1 SM120：4× RTX PRO 6000 96GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -217,6 +226,35 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   '{"method":"dspark","num_speculative_tokens":3}' \
   --port 8000
 ```
+
+### 4.2 SM89：8× RTX 4090 48GB（DSpark）
+
+```bash
+vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.98 \
+  --enable-prefix-caching \
+  --interleave-mm-strings \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4 \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":3}' \
+  --port 8000
+```
+
+上述 8 卡命令是推荐部署配置；本轮 SM89 实机回归使用 4× RTX 4090 48GB，
+且未启用 DSpark。
 
 ## 5. GLM-5.3-Flash 启动命令（SM120）
 
@@ -253,8 +291,6 @@ vllm serve /path/to/GLM-5.3-Flash \
 | `--speculative-config` | MTP 5 | 启用五 token MTP 推测解码 |
 | `--enable-prefix-caching` | 开启 | 复用重复或共享前缀 |
 | `glm45` / `glm47` | reasoning / tool parser | 推理输出和工具调用解析 |
-
-命令没有设置 `--enforce-eager`，因此保持 CUDA Graph 默认开启。
 
 ---
 
@@ -305,6 +341,9 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
   512 输出测试。
 - DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8
   输出测试。
+- DeepSeek-V4-Flash-Vision-Exp 在 4× RTX 4090 48GB（SM89）上通过服务启动、
+  单图、多图、视频、工具调用、8K/32K 输入和 UTF-8 输出测试；该 4 卡配置未启用
+  DSpark。
 - GLM-5.3-Flash 已由社区用户在 8× RTX 4090 48GB（SM89）上成功启动并完成
   推理，参见 [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
 - 两个模型均通过中英文、多语言字符、流式与非流式工具调用检查。

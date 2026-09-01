@@ -17,7 +17,7 @@ FlashInfer `0.6.18`. Validated configurations include
 
 | GPU architecture | Validated GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
 |---|---|---:|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48 GB | Yes | To be verified | Yes |
+| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Yes | Yes |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes | Yes |
 
 ---
@@ -26,8 +26,10 @@ FlashInfer `0.6.18`. Validated configurations include
 
 ### 2026-09-01
 
-- Added DeepSeek-V4-Flash-Vision-Exp support; 4× RTX PRO 6000 (SM120) is
-  verified, and 8× RTX 4090 48 GB (SM89) is to be verified.
+- Added DeepSeek-V4-Flash-Vision-Exp support for 4× RTX PRO 6000 (SM120) and
+  8× RTX 4090 48 GB (SM89).
+- Added SM89 deployment guidance and an 8-GPU DSpark launch command for
+  DeepSeek-V4-Flash-Vision-Exp.
 
 ### 2026-08-31
 
@@ -157,7 +159,43 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. DeepSeek-V4-Flash-Vision-Exp launch command (SM120)
+## 4. DeepSeek-V4-Flash-Vision-Exp launch commands
+
+### 4.1 SM89: 8× RTX 4090 48 GB
+
+```bash
+vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.98 \
+  --enable-prefix-caching \
+  --interleave-mm-strings \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4 \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":3}' \
+  --port 8000
+```
+
+4× RTX 4090 48 GB is not recommended for Vision-Exp with DSpark because the
+draft model and KV cache do not have enough memory headroom. 8× RTX 4090
+48 GB can enable DSpark with the command above; set
+`--max-num-batched-tokens` to `4096`.
+
+The 8-GPU command above is the recommended deployment configuration. This
+round of SM89 runtime regression used 4× RTX 4090 48 GB without DSpark.
+
+### 4.2 SM120: 4× RTX PRO 6000 96 GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -219,8 +257,6 @@ vllm serve /path/to/GLM-5.3-Flash \
 | `--enable-prefix-caching` | enabled | Reuses repeated or shared prefixes |
 | `glm45` / `glm47` | reasoning / tool parser | Parses reasoning output and tool calls |
 
-The command does not set `--enforce-eager`, so CUDA Graph remains enabled.
-
 ---
 
 ## 6. GLM-5.3-Flash SM120 throughput baseline
@@ -273,6 +309,9 @@ Repeating the same prompt produced:
   SM120.
 - DeepSeek-V4-Flash passed 8K/32K/128K, four-concurrency, tool-calling, and UTF-8
   output tests on SM89.
+- DeepSeek-V4-Flash-Vision-Exp passed server startup, single-image,
+  multi-image, video, tool-calling, 8K/32K input, and UTF-8 output tests on
+  4× RTX 4090 48 GB (SM89) without DSpark.
 - A community user successfully served and ran GLM-5.3-Flash on 8× RTX 4090
   48 GB (SM89); see [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993).
 - Both models passed multilingual output plus streaming and non-streaming tool

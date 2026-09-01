@@ -116,3 +116,26 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+def test_update_max_model_len_updates_cudagraph_consumers(monkeypatch):
+    class _DraftModelSpeculator:
+        max_model_len = 1_048_576
+        draft_max_seq_len = 32_768
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", _DraftModelSpeculator
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_model_len = 1_048_576
+    runner.req_states = SimpleNamespace(max_model_len=1_048_576)
+    runner.model_state = SimpleNamespace(max_model_len=1_048_576)
+    runner.speculator = _DraftModelSpeculator()
+
+    runner.update_max_model_len(8_192)
+
+    assert runner.max_model_len == 8_192
+    assert runner.req_states.max_model_len == 8_192
+    assert runner.model_state.max_model_len == 8_192
+    assert runner.speculator.max_model_len == 8_192
+    assert runner.speculator.draft_max_seq_len == 8_192
