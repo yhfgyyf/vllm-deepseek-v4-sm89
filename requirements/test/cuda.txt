@@ -714,7 +714,7 @@ opentelemetry-semantic-conventions-ai==0.4.13
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
-optuna==3.6.1
+optuna==4.9.0
     # via genai-perf
 orjson==3.11.5
     # via genai-perf
