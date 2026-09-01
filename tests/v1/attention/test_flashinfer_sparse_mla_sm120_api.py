@@ -6,6 +6,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -21,6 +22,7 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as sparse_module
+from vllm.v1.attention.backends.mla import sparse_swa as sparse_swa_module
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -231,8 +233,6 @@ def test_sm89_dsv4_backend_selects_packed_flashinfer(monkeypatch) -> None:
 
 
 def test_sm89_dsv4_backend_rejects_unpatched_flashinfer(monkeypatch) -> None:
-    import pytest
-
     from vllm.models.deepseek_v4.nvidia import model as dsv4_model
 
     monkeypatch.setattr(
@@ -245,6 +245,53 @@ def test_sm89_dsv4_backend_rejects_unpatched_flashinfer(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="native sparse MLA SM89"):
         dsv4_model._select_dsv4_attn_cls(vllm_config)
+
+
+@pytest.mark.parametrize("flashmla_supported", [False, True])
+def test_dsv4_swa_metadata_uses_only_supported_flashmla(
+    monkeypatch, flashmla_supported: bool
+) -> None:
+    builder = object.__new__(sparse_swa_module.DeepseekSparseSWAMetadataBuilder)
+    builder._layer_types = {"c4a"}
+    metadata_calls: list[object] = []
+
+    monkeypatch.setattr(
+        sparse_swa_module,
+        "is_flashmla_sparse_supported",
+        lambda: (
+            flashmla_supported,
+            None if flashmla_supported else "unsupported",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(sparse_swa_module.current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(sparse_swa_module.current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(
+        sparse_swa_module.current_platform,
+        "is_device_capability_family",
+        lambda _: False,
+    )
+
+    def fake_get_mla_metadata():
+        metadata = object()
+        metadata_calls.append(metadata)
+        return metadata, None
+
+    monkeypatch.setattr(
+        sparse_swa_module,
+        "get_mla_metadata",
+        fake_get_mla_metadata,
+    )
+
+    tile_scheduler = builder.build_tile_scheduler(1)
+
+    assert tile_scheduler["swaonly"] is None
+    assert tile_scheduler["c128a"] is None
+    if flashmla_supported:
+        assert tile_scheduler["c4a"] is metadata_calls[0]
+    else:
+        assert tile_scheduler["c4a"] is None
+    assert len(metadata_calls) == int(flashmla_supported)
 
 
 def test_sm120_kernel_block_sizes_are_glm_config_aware() -> None:

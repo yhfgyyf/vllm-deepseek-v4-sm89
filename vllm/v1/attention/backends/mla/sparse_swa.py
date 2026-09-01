@@ -29,7 +29,11 @@ from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm.v1.attention.ops.flashmla import (
+    FlashMLASchedMeta,
+    get_mla_metadata,
+    is_flashmla_sparse_supported,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -746,20 +750,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         call of each type. Subsequent same-type calls reuse the plan because
         the tensors (and ``have_initialized``) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step, so
-        ``_forward_decode`` sees a clean sentinel.
+        Returns all-``None`` when there are no decode tokens or FlashMLA sparse
+        is unsupported, so non-FlashMLA backends see a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-            or current_platform.is_device_capability_family(120)
-        ):
+        if num_decode_tokens == 0 or not is_flashmla_sparse_supported()[0]:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
