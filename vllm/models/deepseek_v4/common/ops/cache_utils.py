@@ -536,10 +536,22 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    mm_prefix_query_ranges: torch.Tensor | None = None,
+    swa_index_width: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
+    if swa_index_width is None:
+        swa_index_width = window_size
+    has_mm_prefix = mm_prefix_query_ranges is not None
+    if mm_prefix_query_ranges is not None:
+        assert mm_prefix_query_ranges.dtype == torch.int32
+        assert mm_prefix_query_ranges.dim() == 2
+        assert mm_prefix_query_ranges.shape[0] >= num_tokens
+        assert mm_prefix_query_ranges.shape[1] == 2
+    else:
+        mm_prefix_query_ranges = query_start_loc
     combined_topk = (
-        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        (topk + swa_index_width + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
@@ -563,11 +575,14 @@ def combine_topk_swa_indices(
         query_start_loc,
         seq_lens,
         gather_lens,
+        mm_prefix_query_ranges,
         M,
         N,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        SWA_INDEX_WIDTH=swa_index_width,
+        HAS_MM_PREFIX=has_mm_prefix,
     )
     return combined_indices, combined_lens
 
@@ -582,18 +597,21 @@ _COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
         query_start_loc=True,
         seq_lens=True,
         gather_lens=True,
+        mm_prefix_query_ranges=True,
     ),
     dict(
         topk_indices=True,
         query_start_loc=False,
         seq_lens=False,
         gather_lens=True,
+        mm_prefix_query_ranges=False,
     ),
     dict(
         topk_indices=False,
         query_start_loc=False,
         seq_lens=False,
         gather_lens=False,
+        mm_prefix_query_ranges=False,
     ),
 )
 
@@ -628,7 +646,9 @@ class CombineTopkSwaIndicesKernel(
         TOP_K: int
         COMPRESS_RATIO: int
         WINDOW_SIZE: int
+        SWA_INDEX_WIDTH: int
         PADDED_TOP_K: int
+        HAS_MM_PREFIX: bool
         input_variant: TritonPointerInputVariant
 
     @staticmethod
@@ -649,12 +669,15 @@ class CombineTopkSwaIndicesKernel(
         query_start_loc_ptr,
         seq_lens_ptr,
         gather_lens_ptr,
+        mm_prefix_query_ranges_ptr,
         M,
         N,
         TOP_K: tl.constexpr,
         COMPRESS_RATIO: tl.constexpr,
         WINDOW_SIZE: tl.constexpr,
+        SWA_INDEX_WIDTH: tl.constexpr,
         PADDED_TOP_K: tl.constexpr,
+        HAS_MM_PREFIX: tl.constexpr,
     ):
         batch_idx = tl.program_id(0)
         worker_id = tl.program_id(1)
@@ -683,6 +706,15 @@ class CombineTopkSwaIndicesKernel(
             pos = start_pos + token_idx_in_query
             topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
             swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+            swa_start_pos = pos - swa_len + 1
+            if HAS_MM_PREFIX:
+                mm_start = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2)
+                mm_end = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2 + 1)
+                in_mm_span = (mm_start >= 0) & (mm_start <= mm_end)
+                swa_start_pos = tl.where(
+                    in_mm_span, tl.minimum(swa_start_pos, mm_start), swa_start_pos
+                )
+                swa_len = tl.where(in_mm_span, mm_end - swa_start_pos + 1, swa_len)
 
             offset = tl.arange(0, PADDED_TOP_K)
             mask = offset < topk_len
@@ -695,7 +727,7 @@ class CombineTopkSwaIndicesKernel(
                 topk_indices + M * batch_idx,
                 mask=mask,
             )
-            offset = tl.arange(0, WINDOW_SIZE)
+            offset = tl.arange(0, SWA_INDEX_WIDTH)
             # Index into gathered buffer: N + (position - gather_start)
             # For positions [pos - swa_len + 1, pos], the buffer indices are:
             # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
@@ -704,8 +736,8 @@ class CombineTopkSwaIndicesKernel(
                 + token_idx * combined_indices_stride
                 + topk_len
                 + offset,
-                M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
-                mask=offset < swa_len,
+                M * batch_idx + N + offset + swa_start_pos - gather_start,
+                mask=(offset < swa_len) & (offset < SWA_INDEX_WIDTH),
             )
 
             combined_len = topk_len + swa_len
@@ -719,9 +751,12 @@ class CombineTopkSwaIndicesKernel(
         query_start_loc: bool,
         seq_lens: bool,
         gather_lens: bool,
+        mm_prefix_query_ranges: bool,
         topk: int,
         compress_ratio: int,
         WINDOW_SIZE: int,
+        SWA_INDEX_WIDTH: int,
+        HAS_MM_PREFIX: bool,
     ) -> CompileKey:
         padded_topk = next_power_of_2(topk_width)
         input_variant = TritonPointerInputVariant.from_alignment(
@@ -729,12 +764,15 @@ class CombineTopkSwaIndicesKernel(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             gather_lens=gather_lens,
+            mm_prefix_query_ranges=mm_prefix_query_ranges,
         )
         return self.CompileKey(
             TOP_K=topk,
             COMPRESS_RATIO=compress_ratio,
             WINDOW_SIZE=WINDOW_SIZE,
+            SWA_INDEX_WIDTH=SWA_INDEX_WIDTH,
             PADDED_TOP_K=padded_topk,
+            HAS_MM_PREFIX=HAS_MM_PREFIX,
             input_variant=input_variant,
         )
 
@@ -743,11 +781,35 @@ class CombineTopkSwaIndicesKernel(
             return []
 
         window_size = _hf_config_int(vllm_config, "sliding_window", 128)
-        return self._trace_dispatch(self.dispatch)(
+        model_config = getattr(vllm_config, "model_config", None)
+        has_mm_prefix = bool(getattr(model_config, "is_mm_prefix_lm", False))
+        swa_index_width = window_size
+        if has_mm_prefix:
+            swa_index_width += _hf_config_int(
+                vllm_config,
+                "vision_max_n_token",
+                384,
+            )
+
+        trace = self._trace_dispatch(self.dispatch)
+        keys = trace(
             _DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS,
             _COMBINE_TOPK_SWA_POINTER_INPUTS,
             WINDOW_SIZE=window_size,
+            SWA_INDEX_WIDTH=swa_index_width,
+            HAS_MM_PREFIX=False,
         )
+        if has_mm_prefix:
+            keys.extend(
+                trace(
+                    _DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS,
+                    _COMBINE_TOPK_SWA_POINTER_INPUTS,
+                    WINDOW_SIZE=window_size,
+                    SWA_INDEX_WIDTH=swa_index_width,
+                    HAS_MM_PREFIX=True,
+                )
+            )
+        return list(dict.fromkeys(keys))
 
     def compile(self, compile_key: CompileKey) -> None:
         warmup = getattr(self.kernel, "warmup", None)
@@ -763,12 +825,15 @@ class CombineTopkSwaIndicesKernel(
             input_variant.pointer("query_start_loc", torch.int32),
             input_variant.pointer("seq_lens", torch.int32),
             input_variant.pointer("gather_lens", torch.int32),
+            input_variant.pointer("mm_prefix_query_ranges", torch.int32),
             1,  # do not specialize M
             1,  # do not specialize N
             TOP_K=compile_key.TOP_K,
             COMPRESS_RATIO=compile_key.COMPRESS_RATIO,
             WINDOW_SIZE=compile_key.WINDOW_SIZE,
+            SWA_INDEX_WIDTH=compile_key.SWA_INDEX_WIDTH,
             PADDED_TOP_K=compile_key.PADDED_TOP_K,
+            HAS_MM_PREFIX=compile_key.HAS_MM_PREFIX,
             grid=(1, _COMBINE_TOPK_SWA_NUM_WORKERS),
         )
 
@@ -780,12 +845,15 @@ class CombineTopkSwaIndicesKernel(
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
         gather_lens: torch.Tensor,
+        mm_prefix_query_ranges: torch.Tensor,
         M: int,
         N: int,
         *,
         TOP_K: int,
         COMPRESS_RATIO: int,
         WINDOW_SIZE: int,
+        SWA_INDEX_WIDTH: int,
+        HAS_MM_PREFIX: bool,
     ) -> None:
         num_reqs = seq_lens.shape[0]
         self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](
@@ -797,12 +865,15 @@ class CombineTopkSwaIndicesKernel(
             query_start_loc,
             seq_lens,
             gather_lens,
+            mm_prefix_query_ranges,
             M,
             N,
             TOP_K=TOP_K,
             COMPRESS_RATIO=COMPRESS_RATIO,
             WINDOW_SIZE=WINDOW_SIZE,
+            SWA_INDEX_WIDTH=SWA_INDEX_WIDTH,
             PADDED_TOP_K=next_power_of_2(topk_indices.shape[-1]),
+            HAS_MM_PREFIX=HAS_MM_PREFIX,
         )
 
 
@@ -828,6 +899,7 @@ def build_flashinfer_mixed_sparse_indices(
     decode_is_valid_token: torch.Tensor | None = None,
     swa_block_span: int | None = None,
     compressed_block_span: int | None = None,
+    mm_prefix_query_ranges: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the FlashInfer DSV4 sparse-index matrix for decode-first batches.
 
@@ -854,6 +926,15 @@ def build_flashinfer_mixed_sparse_indices(
     num_decode_tokens = decode_swa_indices.shape[0]
     num_prefill_tokens = prefill_topk_indices.shape[0]
     num_tokens = num_decode_tokens + num_prefill_tokens
+    has_mm_prefix = mm_prefix_query_ranges is not None
+    if mm_prefix_query_ranges is not None:
+        assert mm_prefix_query_ranges.dtype == torch.int32
+        assert mm_prefix_query_ranges.dim() == 2
+        assert mm_prefix_query_ranges.shape[0] >= num_tokens
+        assert mm_prefix_query_ranges.shape[1] == 2
+    else:
+        mm_prefix_query_ranges = query_start_loc
+
     assert token_to_req_indices.shape[0] >= num_tokens
     if decode_compressed_topk_lens is not None:
         assert decode_compressed_topk_lens.shape[0] >= num_decode_tokens
@@ -935,6 +1016,7 @@ def build_flashinfer_mixed_sparse_indices(
         compressed_block_table.stride(0),
         compressed_block_size,
         compressed_span,
+        mm_prefix_query_ranges,
         NUM_DECODE_TOKENS=num_decode_tokens,
         WINDOW_SIZE=window_size,
         SWA_INDEX_WIDTH=swa_index_width,
@@ -945,6 +1027,7 @@ def build_flashinfer_mixed_sparse_indices(
         DECODE_COMPRESSED_TOPK=decode_compressed_topk,
         DECODE_COMPRESSED_INDICES_ARE_LOCAL=decode_compressed_indices_are_local,
         HAS_DECODE_COMPRESSED_LENS=has_decode_compressed_lens,
+        HAS_MM_PREFIX=has_mm_prefix,
         WINDOW_BLOCK_SIZE=window_block_size,
         TOPK_BLOCK_SIZE=topk_block_size,
         num_warps=num_warps,
@@ -1003,6 +1086,7 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     compressed_block_table_stride,
     compressed_block_size,
     compressed_block_span,
+    mm_prefix_query_ranges_ptr,
     NUM_DECODE_TOKENS,
     WINDOW_SIZE: tl.constexpr,
     SWA_INDEX_WIDTH: tl.constexpr,
@@ -1013,6 +1097,7 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     DECODE_COMPRESSED_TOPK: tl.constexpr,
     DECODE_COMPRESSED_INDICES_ARE_LOCAL: tl.constexpr,
     HAS_DECODE_COMPRESSED_LENS: tl.constexpr,
+    HAS_MM_PREFIX: tl.constexpr,
     WINDOW_BLOCK_SIZE: tl.constexpr,
     TOPK_BLOCK_SIZE: tl.constexpr,
 ):
@@ -1095,6 +1180,14 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     pos = start_pos + token_idx_in_query
     swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
     swa_start_pos = pos - swa_len + 1
+    if HAS_MM_PREFIX:
+        mm_start = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2)
+        mm_end = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2 + 1)
+        in_mm_span = (mm_start >= 0) & (mm_start <= mm_end)
+        swa_start_pos = tl.where(
+            in_mm_span, tl.minimum(swa_start_pos, mm_start), swa_start_pos
+        )
+        swa_len = tl.where(in_mm_span, mm_end - swa_start_pos + 1, swa_len)
     topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
 
     for i in range(0, SWA_INDEX_WIDTH, WINDOW_BLOCK_SIZE):

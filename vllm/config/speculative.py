@@ -1387,12 +1387,18 @@ class SpeculativeConfig:
                 n_predict = getattr(
                     self.draft_model_config.hf_config, "n_predict", None
                 )
+                is_deepseek_v4_dspark = (
+                    self.method == "dspark"
+                    and "DSparkDraftModel" in self.draft_model_config.architectures
+                    and self.draft_model_config.hf_config.model_type == "deepseek_v4"
+                )
                 if n_predict is not None:
                     if self.num_speculative_tokens is None:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        not is_deepseek_v4_dspark
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
                         # Ensure divisibility for MTP module reuse.

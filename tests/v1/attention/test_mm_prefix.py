@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
+from vllm.v1.worker.gpu.attn_utils import extract_mm_prefix_ranges
 
 
 def _fa4_available() -> bool:
@@ -95,6 +96,34 @@ def _query_ranges(mm_ranges, query_lens, seq_lens):
     if num_tokens == 0:
         return None
     return torch.from_numpy(out[:num_tokens])
+
+
+def test_explicit_prefix_tokens_exclude_leading_pad_from_range():
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    vocab_size = 129280
+    prompt_token_ids = [
+        11,
+        vocab_size + 1,
+        vocab_size,
+        vocab_size + 2,
+        vocab_size + 3,
+        vocab_size + 1,
+        vocab_size + 4,
+        12,
+    ]
+    ranges = extract_mm_prefix_ranges(
+        PlaceholderRange(offset=1, length=6),
+        prompt_token_ids=prompt_token_ids,
+        start_token_id=vocab_size,
+        end_token_id=vocab_size + 4,
+    )
+
+    assert ranges == [(2, 6)]
+    query_ranges = _query_ranges({0: ranges}, query_lens=[7], seq_lens=[7])
+    assert query_ranges is not None
+    assert query_ranges.tolist()[1] == [-1, -1]
+    assert query_ranges.tolist()[2] == [2, 6]
 
 
 def test_matches_range_scan_semantics_with_context_offset():
@@ -183,9 +212,10 @@ def test_returns_none_when_no_range_covers_a_query_token():
     """
     # Text-only batch on an mm_prefix model: every request present, no ranges.
     assert _query_ranges({0: [], 1: []}, query_lens=[2, 2], seq_lens=[2, 2]) is None
-    # Degenerate single-token ranges are skipped, matching the Triton path's
-    # `start < end` validity check.
-    assert _query_ranges({0: [(1, 1)]}, query_lens=[4], seq_lens=[4]) is None
+    # Ranges are inclusive; a single-token image/sentinel range is valid.
+    single = _query_ranges({0: [(1, 1)]}, query_lens=[4], seq_lens=[4])
+    assert single is not None
+    assert single.tolist() == [[-1, -1], [1, 1], [-1, -1], [-1, -1]]
     # Decode rows: the query token is generated, so it is in no range.
     assert _query_ranges({0: [(1, 3)]}, query_lens=[1], seq_lens=[9]) is None
 

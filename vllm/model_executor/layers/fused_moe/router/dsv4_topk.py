@@ -15,11 +15,14 @@ _TOPK = 6
 def can_use_dsv4_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor | None,
+    correction_bias_vl: torch.Tensor | None,
     topk: int,
     renormalize: bool,
     indices_dtype: torch.dtype,
+    input_tokens: torch.Tensor | None = None,
+    input_vocab_size: int | None = None,
 ) -> bool:
-    return (
+    if not (
         current_platform.is_cuda()
         and gating_output.dtype == torch.float32
         and gating_output.ndim == 2
@@ -32,6 +35,21 @@ def can_use_dsv4_topk(
         and topk == _TOPK
         and renormalize
         and indices_dtype in (torch.int32, torch.uint32, torch.int64)
+    ):
+        return False
+
+    if correction_bias_vl is None:
+        return True
+
+    return (
+        correction_bias_vl.dtype == torch.float32
+        and correction_bias_vl.shape == (gating_output.shape[1],)
+        and correction_bias_vl.is_contiguous()
+        and input_tokens is not None
+        and input_tokens.ndim == 1
+        and input_tokens.shape[0] == gating_output.shape[0]
+        and input_tokens.is_contiguous()
+        and input_vocab_size is not None
     )
 
 
@@ -41,19 +59,34 @@ if current_platform.is_cuda():
     def _dsv4_topk_kernel(
         gating_output_ptr,
         correction_bias_ptr,
+        correction_bias_vl_ptr,
+        input_tokens_ptr,
         topk_weights_ptr,
         topk_ids_ptr,
         routed_scaling_factor,
+        input_vocab_size: tl.constexpr,
         NUM_EXPERTS: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_VL_BIAS: tl.constexpr,
         launch_pdl: tl.constexpr,
     ):
         row = tl.program_id(0)
         expert_offsets = tl.arange(0, BLOCK_N)
         expert_mask = expert_offsets < NUM_EXPERTS
+        is_image = False
+        if HAS_VL_BIAS:
+            token = tl.load(input_tokens_ptr + row)
+            is_image = token >= input_vocab_size
         bias = tl.load(
             correction_bias_ptr + expert_offsets, mask=expert_mask, other=0.0
         ).to(tl.float32)
+        if HAS_VL_BIAS:
+            bias_vl = tl.load(
+                correction_bias_vl_ptr + expert_offsets,
+                mask=expert_mask,
+                other=0.0,
+            ).to(tl.float32)
+            bias = tl.where(is_image, bias_vl, bias)
 
         if launch_pdl:
             tl.extra.cuda.gdc_wait()
@@ -101,20 +134,31 @@ def dsv4_topk(
     correction_bias: torch.Tensor,
     indices_dtype: torch.dtype,
     routed_scaling_factor: float,
+    correction_bias_vl: torch.Tensor | None = None,
+    input_tokens: torch.Tensor | None = None,
+    input_vocab_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens, num_experts = gating_output.shape
     shape = (num_tokens, _TOPK)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
     if num_tokens > 0:
+        correction_bias_vl_arg = (
+            correction_bias_vl if correction_bias_vl is not None else correction_bias
+        )
+        input_tokens_arg = input_tokens if input_tokens is not None else topk_ids[:, 0]
         _dsv4_topk_kernel[(num_tokens,)](
             gating_output,
             correction_bias,
+            correction_bias_vl_arg,
+            input_tokens_arg,
             topk_weights,
             topk_ids,
             routed_scaling_factor,
+            0 if input_vocab_size is None else input_vocab_size,
             NUM_EXPERTS=num_experts,
             BLOCK_N=triton.next_power_of_2(num_experts),
+            HAS_VL_BIAS=correction_bias_vl is not None,
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )

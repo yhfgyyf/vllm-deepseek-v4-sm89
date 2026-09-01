@@ -203,6 +203,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.n_groups = config.o_groups
+        assert self.n_groups % tp_size == 0, (
+            f"o_groups ({self.n_groups}) must be divisible by tensor parallel "
+            f"size ({tp_size})"
+        )
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         # NOTE(zyongye) Compress ratio can't be 0

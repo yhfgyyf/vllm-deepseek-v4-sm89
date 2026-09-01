@@ -25,7 +25,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    fill_mm_prefix_query_ranges,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -54,6 +57,11 @@ def _layer_type_for(compress_ratio: int) -> str:
         f"Unsupported DeepseekV4 compress_ratio={compress_ratio}; "
         "expected 1, 4, or 128."
     )
+
+
+def _get_mm_prefix_swa_index_width(hf_config: object, window_size: int) -> int:
+    max_image_tokens = int(getattr(hf_config, "vision_max_n_token", 384) or 384)
+    return next_power_of_2(int(window_size) + max_image_tokens)
 
 
 class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
@@ -135,6 +143,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         return [512]
 
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
+
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
         if current_platform.is_rocm():
@@ -166,6 +178,7 @@ class DeepseekSparseSWAMetadata:
         None  # [num_prefill_tokens, 1, window_size]
     )
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
+    mm_prefix_query_ranges: torch.Tensor | None = None  # [num_tokens, 2]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -423,6 +436,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
         self.window_size = hf_config.sliding_window
+        self.swa_index_width = (
+            _get_mm_prefix_swa_index_width(hf_config, self.window_size)
+            if self.vllm_config.model_config.is_mm_prefix_lm
+            else self.window_size
+        )
 
         # Detect which DeepseekV4 layer types this model uses so we only build a
         # FlashMLA tile-scheduler plan for types that will actually be called.
@@ -441,7 +459,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            self.swa_index_width,
             dtype=torch.int32,
             device=self.device,
         )
@@ -455,7 +473,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.prefill_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            self.swa_index_width,
             dtype=torch.int32,
             device=self.device,
         )
@@ -469,6 +487,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.bool,
             device=self.device,
         )
+        self.mm_prefix_query_ranges_cpu: torch.Tensor | None = None
+        self.mm_prefix_query_ranges_gpu: torch.Tensor | None = None
+        if self.vllm_config.model_config.is_mm_prefix_lm:
+            self.mm_prefix_query_ranges_cpu = torch.empty(
+                (max_tokens, 2),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self.mm_prefix_query_ranges_gpu = torch.empty(
+                (max_tokens, 2),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
@@ -526,9 +557,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (
-            self.noncausal_index_width if non_causal else self.window_size
+            self.noncausal_index_width if non_causal else self.swa_index_width
         )
         decode_swa_indices = self.decode_swa_indices
+        mm_prefix_query_ranges = self._build_mm_prefix_query_ranges(
+            common_attn_metadata
+        )
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
             if non_causal:
@@ -558,6 +592,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
+                    mm_prefix_query_ranges,
+                    mm_prefix_query_ranges is not None,
                     token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
                 )
@@ -567,6 +603,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     decode_swa_indices.stride(0),
                     self.decode_swa_lens,
                     self.window_size,
+                    self.swa_index_width,
                     query_start_loc,
                     seq_lens,
                     token_to_req_indices,
@@ -574,6 +611,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
+                    mm_prefix_query_ranges,
+                    mm_prefix_query_ranges is not None,
                     token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
                 )
@@ -589,6 +628,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 prefill_swa_indices.stride(0),
                 prefill_swa_lens,
                 self.window_size,
+                self.swa_index_width,
                 query_start_loc,
                 seq_lens,
                 token_to_req_indices,
@@ -596,6 +636,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table,
                 block_table.stride(0),
                 self.block_size,
+                mm_prefix_query_ranges,
+                mm_prefix_query_ranges is not None,
                 token_offset=num_decode_tokens,
                 TRITON_BLOCK_SIZE=1024,
             )
@@ -637,6 +679,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 if num_prefill_tokens > 0
                 else None
             ),
+            mm_prefix_query_ranges=mm_prefix_query_ranges,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -672,6 +715,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             metadata.decode_swa_indices,
             metadata.decode_swa_indices.stride(0),
             metadata.decode_swa_lens,
+            self.window_size,
             metadata.decode_swa_indices.shape[-1],
             metadata.query_start_loc,
             metadata.seq_lens,
@@ -680,6 +724,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             metadata.block_table,
             metadata.block_table.stride(0),
             self.block_size,
+            metadata.mm_prefix_query_ranges,
+            metadata.mm_prefix_query_ranges is not None,
             token_offset=0,
             TRITON_BLOCK_SIZE=1024,
         )
@@ -722,6 +768,34 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             # that already go through the same stub.
             out[layer_type] = get_mla_metadata()[0]
         return out
+
+    def _build_mm_prefix_query_ranges(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        mm_ranges = common_attn_metadata.mm_req_doc_ranges
+        if mm_ranges is None or self.mm_prefix_query_ranges_cpu is None:
+            return None
+
+        assert common_attn_metadata.seq_lens_cpu_upper_bound is not None, (
+            "DeepSeek V4 sparse MLA mm_prefix requires seq_lens_cpu_upper_bound"
+        )
+        assert self.mm_prefix_query_ranges_gpu is not None
+        num_mm_tokens = fill_mm_prefix_query_ranges(
+            self.mm_prefix_query_ranges_cpu.numpy(),
+            mm_ranges,
+            common_attn_metadata.query_start_loc_cpu,
+            common_attn_metadata.seq_lens_cpu_upper_bound,
+        )
+        if num_mm_tokens == 0:
+            return None
+
+        mm_prefix_query_ranges = self.mm_prefix_query_ranges_gpu[:num_mm_tokens]
+        mm_prefix_query_ranges.copy_(
+            self.mm_prefix_query_ranges_cpu[:num_mm_tokens],
+            non_blocking=True,
+        )
+        return mm_prefix_query_ranges
 
     def _build_deepseek_v4_metadata(
         self,
@@ -777,6 +851,7 @@ def _compute_swa_indices_and_lens_kernel(
     swa_indices_stride,
     swa_lens_ptr,
     window_size,
+    index_width,
     query_start_loc_ptr,
     seq_lens_ptr,
     token_to_req_indices_ptr,
@@ -784,6 +859,8 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    mm_prefix_query_ranges_ptr,
+    HAS_MM_PREFIX: tl.constexpr,
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
@@ -793,12 +870,12 @@ def _compute_swa_indices_and_lens_kernel(
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
         # Clear the row so a padded token cannot gather through stale indices.
-        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
             offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
             tl.store(
                 swa_indices_ptr + pid * swa_indices_stride + offset,
                 -1,
-                mask=offset < window_size,
+                mask=offset < index_width,
             )
         return
 
@@ -814,11 +891,17 @@ def _compute_swa_indices_and_lens_kernel(
     pos = prefix_len + token_idx - query_start
     start_pos = tl.maximum(pos - window_size + 1, 0)
     end_pos = pos + 1
+    if HAS_MM_PREFIX:
+        mm_start = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2)
+        mm_end = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2 + 1)
+        in_mm_span = (mm_start >= 0) & (mm_start <= mm_end)
+        start_pos = tl.where(in_mm_span, tl.minimum(start_pos, mm_start), start_pos)
+        end_pos = tl.where(in_mm_span, mm_end + 1, end_pos)
 
     swa_len = end_pos - start_pos
     tl.store(swa_lens_ptr + pid, swa_len)
 
-    for i in range(0, window_size, TRITON_BLOCK_SIZE):
+    for i in range(0, index_width, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
 
         pos_offset = start_pos + offset
@@ -834,7 +917,7 @@ def _compute_swa_indices_and_lens_kernel(
         tl.store(
             swa_indices_ptr + pid * swa_indices_stride + offset,
             slot_ids,
-            mask=offset < window_size,
+            mask=offset < index_width,
         )
 
 
@@ -853,6 +936,8 @@ def _compute_dspark_noncausal_swa_indices_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    mm_prefix_query_ranges_ptr,
+    HAS_MM_PREFIX: tl.constexpr,
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):

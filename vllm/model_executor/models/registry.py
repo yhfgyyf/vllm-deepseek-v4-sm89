@@ -212,6 +212,9 @@ _TEXT_GENERATION_MODELS = {
     "Zamba2ForCausalLM": ("zamba2", "Zamba2ForCausalLM"),
 }
 
+_DEEPSEEK_V4_TEXT_ARCH = "DeepseekV4ForCausalLM"
+_DEEPSEEK_V4_VISION_ARCH = "DeepseekV4ForConditionalGeneration"
+
 _EMBEDDING_MODELS = {
     # [Text-only]
     "BertModel": ("bert", "BertEmbeddingModel"),
@@ -359,6 +362,10 @@ _MULTIMODAL_MODELS = {
     "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
     "DeepseekOCRForCausalLM": ("deepseek_ocr", "DeepseekOCRForCausalLM"),
     "DeepseekOCR2ForCausalLM": ("deepseek_ocr2", "DeepseekOCR2ForCausalLM"),
+    "DeepseekV4ForConditionalGeneration": (
+        "vllm.models.deepseek_v4",
+        "DeepseekV4ForConditionalGeneration",
+    ),
     "Dots3NoteForCausalLM": (
         "vllm.models.dots3_note",
         "Dots3NoteForCausalLM",
@@ -1258,6 +1265,13 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
+        if (
+            architecture == _DEEPSEEK_V4_TEXT_ARCH
+            and _DEEPSEEK_V4_VISION_ARCH in self.models
+            and getattr(model_config.hf_config, "vision_n_layers", 0) > 0
+        ):
+            return _DEEPSEEK_V4_VISION_ARCH
+
         if architecture in self.models:
             return architecture
 
@@ -1316,7 +1330,7 @@ class _ModelRegistry:
             normalized_arch = self._normalize_arch(arch, model_config)
             model_info = self._try_inspect_model_cls(normalized_arch)
             if model_info is not None:
-                return (model_info, arch)
+                return (model_info, normalized_arch)
 
         # Fallback to transformers impl (before resolving runner_type)
         if (
@@ -1370,7 +1384,7 @@ class _ModelRegistry:
             normalized_arch = self._normalize_arch(arch, model_config)
             model_cls = self._try_load_model_cls(normalized_arch)
             if model_cls is not None:
-                return (model_cls, arch)
+                return (model_cls, normalized_arch)
 
         # Fallback to transformers impl (before resolving runner_type)
         if (

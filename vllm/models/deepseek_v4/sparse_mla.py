@@ -85,6 +85,10 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         if capability.major in [9, 10, 12]:
             return True

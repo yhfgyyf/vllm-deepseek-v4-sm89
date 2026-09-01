@@ -72,6 +72,23 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    @staticmethod
+    def _should_enable_mm_atomic_spans(model_config: Any) -> bool:
+        hf_config = model_config.hf_config
+        vision_n_layers = getattr(hf_config, "vision_n_layers", 0)
+        if vision_n_layers <= 0:
+            return False
+
+        architectures = set(model_config.architectures)
+        architectures.add(model_config.architecture)
+        return bool(
+            architectures
+            & {
+                "DeepseekV4ForCausalLM",
+                "DeepseekV4ForConditionalGeneration",
+            }
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -89,6 +106,9 @@ class Scheduler(SchedulerInterface):
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.model_uses_xdrope = vllm_config.model_config.uses_xdrope
+        self.enable_mm_atomic_spans = self._should_enable_mm_atomic_spans(
+            vllm_config.model_config
+        )
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -498,6 +518,101 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _get_mm_atomic_boundary(
+        self,
+        request: Request,
+        boundary: int,
+    ) -> int:
+        """Move a token boundary out of any multimodal placeholder span."""
+        if not self.enable_mm_atomic_spans or not request.mm_features:
+            return boundary
+
+        for mm_feature in request.mm_features:
+            position = mm_feature.mm_position
+            start = position.offset
+            end = start + position.length
+            if start < boundary < end:
+                return start - (start % self.block_size)
+
+        return boundary
+
+    def _truncate_mm_atomic_prefix_cache_hit(
+        self,
+        request: Request,
+        computed_blocks: KVCacheBlocks,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> tuple[KVCacheBlocks, int, int]:
+        num_computed_tokens = num_local_computed_tokens + num_external_computed_tokens
+        atomic_boundary = self._get_mm_atomic_boundary(request, num_computed_tokens)
+        if atomic_boundary == num_computed_tokens:
+            return (
+                computed_blocks,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+
+        if atomic_boundary <= num_local_computed_tokens:
+            computed_blocks = self.kv_cache_manager.truncate_computed_blocks(
+                computed_blocks, atomic_boundary
+            )
+            return computed_blocks, atomic_boundary, 0
+
+        return (
+            computed_blocks,
+            num_local_computed_tokens,
+            atomic_boundary - num_local_computed_tokens,
+        )
+
+    def _trim_mm_atomic_chunk(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        shift_computed_tokens: int = 0,
+    ) -> int:
+        """Avoid ending a scheduled prefill chunk inside an MM placeholder."""
+        if (
+            num_new_tokens == 0
+            or not self.enable_mm_atomic_spans
+            or not request.has_encoder_inputs
+        ):
+            return num_new_tokens
+
+        window_start = num_computed_tokens + shift_computed_tokens
+        window_end = window_start + num_new_tokens
+        atomic_span_budget = self.max_num_scheduled_tokens
+        long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < long_prefill_threshold < atomic_span_budget:
+            atomic_span_budget = long_prefill_threshold
+
+        assert request.mm_features is not None
+        for mm_feature in request.mm_features:
+            position = mm_feature.mm_position
+            start = position.offset
+            end = start + position.length
+            if window_end <= start or window_start >= end:
+                continue
+
+            if window_start < start:
+                if window_end < end:
+                    return start - window_start
+                continue
+
+            remaining_span = end - window_start
+            if remaining_span > atomic_span_budget:
+                raise ValueError(
+                    "DeepSeek-V4 Vision image span cannot fit in the configured "
+                    "scheduler token budget. Increase max_num_batched_tokens "
+                    f"and long_prefill_token_threshold to at least "
+                    f"{position.length}."
+                )
+
+            if num_new_tokens < remaining_span:
+                return 0
+
+        return num_new_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -607,6 +722,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            num_new_tokens = self._trim_mm_atomic_chunk(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                shift_computed_tokens=self.num_prefill_lookahead,
+            )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -899,10 +1021,34 @@ class Scheduler(SchedulerInterface):
                                 request.shared_prefix_boundary,
                             ) = self.kv_cache_manager.get_computed_blocks(request)
 
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        ) = self._truncate_mm_atomic_prefix_cache_hit(
+                            request,
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
+                        if num_external_computed_tokens == 0:
+                            load_kv_async = False
+
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+                    else:
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        ) = self._truncate_mm_atomic_prefix_cache_hit(
+                            request,
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1008,6 +1154,15 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             break
+
+                    num_new_tokens = self._trim_mm_atomic_chunk(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        shift_computed_tokens=self.num_prefill_lookahead,
+                    )
+                    if num_new_tokens == 0:
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

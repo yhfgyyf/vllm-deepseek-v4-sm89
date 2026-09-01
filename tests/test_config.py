@@ -6,7 +6,7 @@ import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pydantic
 import pytest
@@ -2125,6 +2125,69 @@ def test_draft_sample_method_gumbel_is_rejected():
             method="ngram",
             num_speculative_tokens=1,
             draft_sample_method="gumbel",
+        )
+
+
+def test_deepseek_v4_dspark_does_not_require_mtp_layer_divisibility():
+    target = MagicMock(
+        model_weights=None,
+        model="fake-deepseek-v4",
+        quantization=None,
+        hf_overrides=None,
+        max_model_len=32768,
+    )
+    target.hf_config = SimpleNamespace(
+        model_type="deepseek_v4",
+        architectures=["DeepseekV4ForCausalLM"],
+    )
+    target.architectures = ["DeepseekV4ForCausalLM"]
+
+    def make_draft_config():
+        draft = MagicMock(model="fake-deepseek-v4", max_model_len=32768)
+        draft.hf_config = SimpleNamespace(
+            model_type="deepseek_mtp",
+            architectures=["DeepSeekV4MTPModel"],
+            n_predict=3,
+            vocab_size=129280,
+        )
+        draft.architectures = ["DeepSeekV4MTPModel"]
+        return draft
+
+    def update_arch(config):
+        config.draft_model_config.architectures = list(
+            config.draft_model_config.hf_config.architectures
+        )
+
+    parallel = ParallelConfig()
+    with (
+        patch(
+            "vllm.config.speculative.ModelConfig",
+            side_effect=lambda *_, **__: make_draft_config(),
+        ),
+        patch.object(SpeculativeConfig, "update_arch_", update_arch),
+    ):
+        dspark = SpeculativeConfig(
+            method="dspark",
+            num_speculative_tokens=5,
+            target_model_config=target,
+            target_parallel_config=parallel,
+        )
+
+    assert dspark.parallel_drafting
+    assert dspark.num_speculative_tokens == 5
+
+    with (
+        patch(
+            "vllm.config.speculative.ModelConfig",
+            side_effect=lambda *_, **__: make_draft_config(),
+        ),
+        pytest.raises(ValueError, match="must be divisible by n_predict=3"),
+    ):
+        SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=5,
+            target_model_config=target,
+            target_parallel_config=parallel,
         )
 
 

@@ -9,14 +9,20 @@ import torch
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
+from vllm.models.deepseek_v4.nvidia import mtp as mtp_module
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
     DeepseekV4MoE,
+    _init_deepseek_v4_gate_routing_parameters,
+    _make_deepseek_v4_weights_mapper,
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
+from vllm.models.deepseek_v4.nvidia.mtp import (
+    DeepSeekV4MTP,
+    DeepSeekV4MultiTokenPredictorLayer,
+)
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 
@@ -37,6 +43,37 @@ def test_deepseek_v4_mega_moe_expert_mapping():
         ("experts.w2_", "experts.1.w2.", 1, "w2"),
         ("experts.w13_", "experts.1.w3.", 1, "w3"),
     ]
+
+
+def test_deepseek_v4_maps_gate_bias_vl():
+    mapper = _make_deepseek_v4_weights_mapper("fp4")
+
+    assert (
+        mapper._map_name("layers.0.ffn.gate.bias_vl")
+        == "model.layers.0.ffn.gate.e_score_correction_bias_vl"
+    )
+
+
+def test_deepseek_v4_flat_vision_config_registers_hash_gate_biases():
+    gate = torch.nn.Module()
+    config = SimpleNamespace(
+        vision_n_layers=32,
+        n_routed_experts=8,
+        vocab_size=16,
+        num_experts_per_tok=2,
+        topk_method="noaux_tc",
+    )
+
+    _init_deepseek_v4_gate_routing_parameters(
+        gate,
+        config,
+        is_hash_moe=True,
+        hash_indices_dtype=torch.int32,
+    )
+
+    assert gate.e_score_correction_bias.shape == (8,)
+    assert gate.e_score_correction_bias_vl.shape == (8,)
+    assert gate.tid2eid.shape == (16, 2)
 
 
 def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
@@ -268,6 +305,7 @@ def test_deepseek_v4_mega_moe_does_not_double_add_fused_shared_expert(
     class FakeGate(torch.nn.Module):
         tid2eid = None
         e_score_correction_bias = None
+        e_score_correction_bias_vl = None
 
         def forward(self, hidden_states):
             return torch.empty(hidden_states.shape[0], 2), None
@@ -297,6 +335,7 @@ def test_deepseek_v4_mega_moe_does_not_double_add_fused_shared_expert(
     moe.hash_indices_dtype = torch.int64
     moe.routed_scaling_factor = 1.0
     moe.swiglu_limit = 10.0
+    moe.input_vocab_size = 1024
     monkeypatch.setattr(
         "vllm.models.deepseek_v4.nvidia.model.fused_topk_bias",
         lambda **kwargs: (
@@ -310,6 +349,142 @@ def test_deepseek_v4_mega_moe_does_not_double_add_fused_shared_expert(
     expected = 1 if fused else 3
     assert torch.all(output == expected)
     assert moe.shared_experts.calls == (0 if fused else 1)
+
+
+def test_deepseek_v4_mega_moe_passes_mixed_routing_metadata(monkeypatch):
+    captured = {}
+
+    class FakeGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tid2eid = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+            self.e_score_correction_bias = None
+            self.e_score_correction_bias_vl = torch.nn.Parameter(torch.ones(2))
+
+        def forward(self, hidden_states):
+            return torch.empty(hidden_states.shape[0], 2), None
+
+    class FakeExperts(torch.nn.Module):
+        has_fused_shared_experts = True
+
+        def forward(self, hidden_states, *args, **kwargs):
+            return torch.ones_like(hidden_states)
+
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.use_mega_moe = True
+    moe.gate = FakeGate()
+    moe.experts = FakeExperts()
+    moe.shared_experts = None
+    moe.scoring_func = "sqrtsoftplus"
+    moe.n_activated_experts = 2
+    moe.renormalize = True
+    moe.hash_indices_dtype = torch.int64
+    moe.routed_scaling_factor = 1.0
+    moe.swiglu_limit = None
+    moe.input_vocab_size = 2
+
+    def fake_fused_topk_bias(**kwargs):
+        captured.update(kwargs)
+        return (
+            torch.ones(kwargs["hidden_states"].shape[0], 2),
+            torch.zeros(kwargs["hidden_states"].shape[0], 2, dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.fused_topk_bias",
+        fake_fused_topk_bias,
+    )
+
+    input_ids = torch.tensor([0, 3], dtype=torch.int64)
+    output = moe(torch.zeros(2, 8), input_ids=input_ids)
+
+    assert torch.all(output == 1)
+    assert captured["input_tokens"] is input_ids
+    assert captured["hash_indices_table"] is moe.gate.tid2eid
+    assert (
+        captured["e_score_correction_bias_vl"].data_ptr()
+        == moe.gate.e_score_correction_bias_vl.data_ptr()
+    )
+    assert captured["input_vocab_size"] == 2
+
+
+def test_deepseek_v4_mega_moe_requires_input_ids_for_vl_bias():
+    class FakeGate(torch.nn.Module):
+        tid2eid = None
+        e_score_correction_bias = None
+
+        def __init__(self):
+            super().__init__()
+            self.e_score_correction_bias_vl = torch.nn.Parameter(torch.ones(2))
+
+        def forward(self, hidden_states):
+            return torch.empty(hidden_states.shape[0], 2), None
+
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.use_mega_moe = True
+    moe.gate = FakeGate()
+
+    with pytest.raises(ValueError, match="mixed text/image MoE routing"):
+        moe(torch.zeros(2, 8))
+
+
+def test_deepseek_v4_mtp_sequence_parallel_shards_input_ids(monkeypatch):
+    layer = DeepSeekV4MultiTokenPredictorLayer.__new__(
+        DeepSeekV4MultiTokenPredictorLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.hc_mult = 1
+    layer.config = SimpleNamespace(hidden_size=4)
+    layer.enorm = SimpleNamespace(
+        weight=torch.nn.Parameter(torch.ones(4)),
+        variance_epsilon=1e-6,
+    )
+    layer.hnorm = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(4)))
+    layer.h_proj = torch.nn.Identity()
+    layer.e_proj = torch.nn.Identity()
+
+    class FakeMTPBlock(torch.nn.Module):
+        use_sequence_parallel = True
+
+        def forward(self, positions, x, input_ids):
+            assert input_ids is sharded_input_ids
+            return x, torch.zeros_like(x), torch.zeros_like(x), torch.zeros_like(x)
+
+    layer.mtp_block = FakeMTPBlock()
+
+    def fake_fused_mtp_input_rmsnorm(
+        inputs_embeds,
+        positions,
+        previous_hidden_states,
+        *args,
+    ):
+        return inputs_embeds, previous_hidden_states
+
+    def fake_sp_shard(tensor):
+        if tensor is input_ids:
+            return sharded_input_ids
+        return tensor[:2]
+
+    monkeypatch.setattr(
+        mtp_module, "fused_mtp_input_rmsnorm", fake_fused_mtp_input_rmsnorm
+    )
+    monkeypatch.setattr(mtp_module, "sp_shard", fake_sp_shard)
+    monkeypatch.setattr(mtp_module, "sp_all_gather", lambda tensor: tensor)
+    monkeypatch.setattr(mtp_module, "mhc_post_tilelang", lambda x, *args: x)
+
+    input_ids = torch.arange(4)
+    sharded_input_ids = input_ids[:2]
+    positions = torch.arange(4)
+    output = layer(
+        input_ids=input_ids,
+        positions=positions,
+        previous_hidden_states=torch.randn(4, 4),
+        inputs_embeds=torch.randn(4, 4),
+    )
+
+    assert output.shape == (2, 4)
 
 
 @pytest.mark.skipif(

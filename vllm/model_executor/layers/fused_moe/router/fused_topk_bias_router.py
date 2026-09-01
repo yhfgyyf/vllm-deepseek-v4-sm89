@@ -98,6 +98,49 @@ def vllm_topk_softplus_sqrt(
     return topk_weights, topk_indices
 
 
+def _mixed_text_image_topk(
+    scores: torch.Tensor,
+    e_score_correction_bias: torch.Tensor | None,
+    e_score_correction_bias_vl: torch.Tensor,
+    input_tokens: torch.Tensor,
+    input_vocab_size: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    indices_type: torch.dtype | None,
+    hash_indices_table: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    text_bias = (
+        torch.zeros_like(e_score_correction_bias_vl)
+        if e_score_correction_bias is None
+        else e_score_correction_bias
+    )
+    image_mask = input_tokens >= input_vocab_size
+    choice_bias = torch.where(
+        image_mask.unsqueeze(-1),
+        e_score_correction_bias_vl.unsqueeze(0),
+        text_bias.unsqueeze(0),
+    )
+    scores_for_choice = scores + choice_bias
+    biased_topk_ids = torch.topk(
+        scores_for_choice, k=topk, dim=-1, sorted=envs.VLLM_BATCH_INVARIANT
+    )[1]
+    if hash_indices_table is not None:
+        token_ids = input_tokens.clamp(min=0, max=input_vocab_size - 1)
+        hash_topk_ids = hash_indices_table[token_ids]
+        topk_ids = torch.where(image_mask.unsqueeze(-1), biased_topk_ids, hash_topk_ids)
+    else:
+        topk_ids = biased_topk_ids
+    topk_weights = scores.gather(1, topk_ids.long())
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(
+        torch.int32 if indices_type is None else indices_type
+    )
+
+
 @functools.lru_cache(maxsize=8)
 def _aiter_get_num_expert_group(num_experts: int) -> int:
     _AITER_MAX_EXPERTS_PER_GROUP = 32
@@ -115,13 +158,15 @@ def fused_topk_bias(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     scoring_func: str,
-    e_score_correction_bias: torch.Tensor,
+    e_score_correction_bias: torch.Tensor | None,
     topk: int,
     renormalize: bool,
     indices_type: torch.dtype | None = None,
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    e_score_correction_bias_vl: torch.Tensor | None = None,
+    input_vocab_size: int | None = None,
 ):
     if (
         input_tokens is not None
@@ -136,12 +181,19 @@ def fused_topk_bias(
         )
 
         output_indices_dtype = torch.int32 if indices_type is None else indices_type
-        if scoring_func == "sqrtsoftplus" and can_use_dsv4_topk(
-            gating_output,
-            e_score_correction_bias,
-            topk,
-            renormalize,
-            output_indices_dtype,
+        if (
+            scoring_func == "sqrtsoftplus"
+            and hash_indices_table is None
+            and can_use_dsv4_topk(
+                gating_output,
+                e_score_correction_bias,
+                e_score_correction_bias_vl,
+                topk,
+                renormalize,
+                output_indices_dtype,
+                input_tokens=input_tokens,
+                input_vocab_size=input_vocab_size,
+            )
         ):
             assert e_score_correction_bias is not None
             return dsv4_topk(
@@ -149,6 +201,9 @@ def fused_topk_bias(
                 e_score_correction_bias,
                 output_indices_dtype,
                 routed_scaling_factor,
+                correction_bias_vl=e_score_correction_bias_vl,
+                input_tokens=input_tokens,
+                input_vocab_size=input_vocab_size,
             )
 
         M, _ = hidden_states.size()
@@ -165,6 +220,32 @@ def fused_topk_bias(
         token_expert_indices = torch.empty(
             M, topk, dtype=torch.int32, device=hidden_states.device
         )
+
+        if e_score_correction_bias_vl is not None and scoring_func in (
+            "softmax",
+            "sigmoid",
+        ):
+            if input_tokens is None or input_vocab_size is None:
+                raise ValueError(
+                    "input_tokens and input_vocab_size are required for "
+                    "mixed text/image MoE routing."
+                )
+            if scoring_func == "softmax":
+                scores = gating_output.softmax(dim=-1)
+            else:
+                scores = gating_output.sigmoid()
+            return _mixed_text_image_topk(
+                scores=scores,
+                e_score_correction_bias=e_score_correction_bias,
+                e_score_correction_bias_vl=e_score_correction_bias_vl,
+                input_tokens=input_tokens,
+                input_vocab_size=input_vocab_size,
+                topk=topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                indices_type=indices_type,
+                hash_indices_table=hash_indices_table,
+            )
 
         if scoring_func == "softmax":
             topk_weights, topk_ids = vllm_topk_softmax(
@@ -190,6 +271,25 @@ def fused_topk_bias(
             )
             return topk_weights, topk_ids
         elif scoring_func == "sqrtsoftplus":
+            if e_score_correction_bias_vl is not None:
+                if input_tokens is None or input_vocab_size is None:
+                    raise ValueError(
+                        "input_tokens and input_vocab_size are required for "
+                        "DeepSeek V4 mixed text/image MoE routing."
+                    )
+                scores = torch.sqrt(torch.nn.functional.softplus(gating_output.float()))
+                return _mixed_text_image_topk(
+                    scores=scores,
+                    e_score_correction_bias=e_score_correction_bias,
+                    e_score_correction_bias_vl=e_score_correction_bias_vl,
+                    input_tokens=input_tokens,
+                    input_vocab_size=input_vocab_size,
+                    topk=topk,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    indices_type=indices_type,
+                    hash_indices_table=hash_indices_table,
+                )
             return vllm_topk_softplus_sqrt(
                 topk_weights,
                 topk_ids,
@@ -270,15 +370,47 @@ def fused_topk_bias(
         ) + e_score_correction_bias.unsqueeze(0)
     else:
         scores_for_choice = scores.view(-1, n_routed_experts)
+    mixed_topk_ids = None
+    if e_score_correction_bias_vl is not None:
+        if input_tokens is None or input_vocab_size is None:
+            raise ValueError(
+                "input_tokens and input_vocab_size are required for "
+                "mixed text/image MoE routing."
+            )
+        text_bias = (
+            torch.zeros_like(e_score_correction_bias_vl)
+            if e_score_correction_bias is None
+            else e_score_correction_bias
+        )
+        image_mask = input_tokens >= input_vocab_size
+        choice_bias = torch.where(
+            image_mask.unsqueeze(-1),
+            e_score_correction_bias_vl.unsqueeze(0),
+            text_bias.unsqueeze(0),
+        )
+        scores_for_choice = scores.view(-1, n_routed_experts) + choice_bias
+        mixed_topk_ids = torch.topk(
+            scores_for_choice, k=topk, dim=-1, sorted=envs.VLLM_BATCH_INVARIANT
+        )[1]
     # For batch invariance, use sorted=True to ensure deterministic expert selection
     if hash_indices_table is not None:
         assert input_tokens is not None
-        topk_indices = hash_indices_table[input_tokens]
+        if mixed_topk_ids is None:
+            topk_indices = hash_indices_table[input_tokens]
+        else:
+            assert input_vocab_size is not None
+            token_ids = input_tokens.clamp(min=0, max=input_vocab_size - 1)
+            hash_topk_ids = hash_indices_table[token_ids]
+            topk_indices = torch.where(
+                image_mask.unsqueeze(-1), mixed_topk_ids, hash_topk_ids
+            )
     else:
         use_sorted = envs.VLLM_BATCH_INVARIANT
-        topk_indices = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=use_sorted)[
-            1
-        ]
+        topk_indices = (
+            mixed_topk_ids
+            if mixed_topk_ids is not None
+            else torch.topk(scores_for_choice, k=topk, dim=-1, sorted=use_sorted)[1]
+        )
     topk_weights = scores.gather(1, topk_indices)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -298,6 +430,8 @@ class FusedTopKBiasRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         e_score_correction_bias: torch.Tensor | None = None,
+        e_score_correction_bias_vl: torch.Tensor | None = None,
+        input_vocab_size: int | None = None,
         renormalize: bool = True,
         routed_scaling_factor: float = 1.0,
         eplb_state: EplbLayerState | None = None,
@@ -313,10 +447,11 @@ class FusedTopKBiasRouter(BaseRouter):
             eplb_state=eplb_state,
         )
         self.e_score_correction_bias = e_score_correction_bias
+        self.e_score_correction_bias_vl = e_score_correction_bias_vl
+        self.input_vocab_size = input_vocab_size
         self.renormalize = renormalize
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
-        self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
         # Fused shared experts: append constant slots (ids immediately after
         # the routed experts, [global, global+n)) routed to by every token at
@@ -344,6 +479,15 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
+        if self.e_score_correction_bias_vl is not None:
+            if input_ids is None or self.input_vocab_size is None:
+                raise ValueError(
+                    "input_ids and input_vocab_size are required for "
+                    "mixed text/image MoE routing."
+                )
+            e_score_correction_bias_vl = self.e_score_correction_bias_vl.data
+        else:
+            e_score_correction_bias_vl = None
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -351,12 +495,14 @@ class FusedTopKBiasRouter(BaseRouter):
             e_score_correction_bias=self.e_score_correction_bias.data
             if self.e_score_correction_bias is not None
             else None,
+            e_score_correction_bias_vl=e_score_correction_bias_vl,
             topk=self.top_k,
             renormalize=self.renormalize,
             indices_type=indices_type,
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            input_vocab_size=self.input_vocab_size,
         )
 
         if self.num_fused_shared_experts > 0:

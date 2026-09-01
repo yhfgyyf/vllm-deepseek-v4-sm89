@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -5423,6 +5424,201 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_chunked_prefill_stops_before_mm_atomic_span():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=24,
+        max_model_len=128,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=16, length=32)]],
+    )[0]
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 16
+    assert request.request_id not in output.scheduled_encoder_inputs
+
+
+def test_chunked_prefill_before_mm_atomic_span_does_not_grow_chunk():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=128,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=16, length=32)]],
+    )[0]
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 8
+    assert request.request_id not in output.scheduled_encoder_inputs
+
+
+def test_chunked_prefill_defers_mm_atomic_span_when_step_budget_is_consumed():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=48,
+        max_model_len=128,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    text_request = create_requests(
+        num_requests=1,
+        num_tokens=40,
+        req_ids=["text"],
+    )[0]
+    image_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=0, length=32)]],
+        req_ids=["image"],
+    )[0]
+
+    scheduler.add_request(text_request)
+    scheduler.add_request(image_request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {text_request.request_id: 40}
+    assert image_request.request_id not in output.scheduled_encoder_inputs
+
+
+def test_mm_atomic_spans_enabled_only_for_deepseek_v4_vision():
+    def model_config(architecture: str, vision_n_layers: int):
+        return SimpleNamespace(
+            architecture=architecture,
+            architectures=[architecture],
+            hf_config=SimpleNamespace(vision_n_layers=vision_n_layers),
+        )
+
+    assert Scheduler._should_enable_mm_atomic_spans(
+        model_config("DeepseekV4ForConditionalGeneration", 1)
+    )
+    assert Scheduler._should_enable_mm_atomic_spans(
+        model_config("DeepseekV4ForCausalLM", 1)
+    )
+    assert not Scheduler._should_enable_mm_atomic_spans(
+        model_config("DeepseekV4ForCausalLM", 0)
+    )
+    assert not Scheduler._should_enable_mm_atomic_spans(
+        model_config("LlavaForConditionalGeneration", 1)
+    )
+
+
+def test_chunked_prefill_keeps_existing_multimodal_chunking_by_default():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=24,
+        max_model_len=128,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=16, length=32)]],
+    )[0]
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 24
+    assert output.scheduled_encoder_inputs[request.request_id] == [0]
+
+
+def test_chunked_prefill_schedules_whole_mm_atomic_span_when_it_fits():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=48,
+        max_model_len=128,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=16, length=32)]],
+    )[0]
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 48
+    assert output.scheduled_encoder_inputs[request.request_id] == [0]
+
+
+def test_chunked_prefill_rejects_mm_atomic_span_larger_than_token_budget():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=24,
+        max_model_len=128,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_positions=[[PlaceholderRange(offset=0, length=32)]],
+    )[0]
+
+    scheduler.add_request(request)
+    with pytest.raises(ValueError, match="image span cannot fit"):
+        scheduler.schedule()
+
+
+def test_prefix_cache_hit_is_truncated_before_mm_atomic_span():
+    block_size = 16
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        enable_prefix_caching=True,
+        block_size=block_size,
+    )
+    scheduler.enable_mm_atomic_spans = True
+    mm_positions = [[PlaceholderRange(offset=block_size, length=block_size * 2)]]
+    cached = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 4,
+        mm_hashes_list=[["img"]],
+        mm_positions=mm_positions,
+        block_size=block_size,
+        req_ids=["cached"],
+    )[0]
+    computed_blocks = scheduler.kv_cache_manager.empty_kv_cache_blocks
+    new_blocks = scheduler.kv_cache_manager.allocate_slots(
+        cached,
+        block_size * 2,
+        num_new_computed_tokens=0,
+        new_computed_blocks=computed_blocks,
+    )
+    assert new_blocks is not None
+    cached.num_computed_tokens = block_size * 2
+    scheduler.kv_cache_manager.cache_blocks(cached, cached.num_computed_tokens)
+    scheduler.kv_cache_manager.free(cached)
+
+    request = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 4,
+        mm_hashes_list=[["img"]],
+        mm_positions=mm_positions,
+        block_size=block_size,
+        req_ids=["req"],
+    )[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_new_reqs[0].req_id == request.request_id
+    assert output.scheduled_new_reqs[0].num_computed_tokens == block_size
+    assert output.num_scheduled_tokens[request.request_id] == block_size * 3
 
 
 def test_free_encoder_inputs_respects_unconfirmed_placeholders():

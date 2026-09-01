@@ -52,6 +52,8 @@ def create_fused_moe_router(
     # grouped topk + fused topk bias parameters
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
+    e_score_correction_bias_vl: torch.Tensor | None = None,
+    input_vocab_size: int | None = None,
     # custom routing parameters
     custom_routing_function: Callable | None = None,
     # eplb parameters
@@ -199,12 +201,18 @@ def create_fused_moe_router(
 
     assert scoring_func in ["sigmoid", "softmax", "sqrtsoftplus"]
 
-    if e_score_correction_bias is not None or hash_indices_table is not None:
+    if (
+        e_score_correction_bias is not None
+        or e_score_correction_bias_vl is not None
+        or hash_indices_table is not None
+    ):
         return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
             e_score_correction_bias=e_score_correction_bias,
+            e_score_correction_bias_vl=e_score_correction_bias_vl,
+            input_vocab_size=input_vocab_size,
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             scoring_func=scoring_func,

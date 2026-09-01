@@ -6,12 +6,14 @@ from collections.abc import Callable, Generator, ItemsView, Iterable, Mapping, S
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
+from inspect import Parameter, signature
 from typing import (
     TYPE_CHECKING,
     Generic,
     NamedTuple,
     Protocol,
     TypeAlias,
+    cast,
 )
 
 import torch
@@ -228,15 +230,49 @@ use [`PromptUpdateDetails`][vllm.multimodal.processing.PromptUpdateDetails] to
 specify which part.
 """
 
-PromptUpdateContent: TypeAlias = Callable[[int], PromptUpdateInfo] | PromptUpdateInfo
+PromptUpdateContent: TypeAlias = (
+    Callable[[int], PromptUpdateInfo]
+    | Callable[[int, int], PromptUpdateInfo]
+    | PromptUpdateInfo
+)
 """
 Given the index of the processed item within
 [`modality`][vllm.multimodal.processing.PromptUpdate.modality],
-output the corresponding token sequence.
+output the corresponding token sequence. A callable may optionally accept the
+output token offset where the update will be applied as a second argument.
 
 For convenience, you can directly pass in the token sequence
 instead of a function if it does not depend on the input.
 """
+
+
+def _is_offset_aware_content(content: object) -> bool:
+    if not callable(content):
+        return False
+
+    try:
+        parameters = signature(content).parameters.values()
+    except (TypeError, ValueError):
+        return False
+
+    positional_count = 0
+    for param in parameters:
+        if param.kind == Parameter.VAR_POSITIONAL:
+            return True
+        if param.kind in (
+            Parameter.POSITIONAL_ONLY,
+            Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+
+    return positional_count >= 2
+
+
+def _as_prompt_update_details(content: PromptUpdateInfo) -> "PromptUpdateDetails":
+    if not isinstance(content, PromptUpdateDetails):
+        content = PromptUpdateDetails.from_seq(content)
+
+    return content
 
 
 class UpdateMode(str, Enum):
@@ -285,12 +321,9 @@ class PromptUpdate(ABC):
     def _resolve_content(self, item_idx: int) -> PromptUpdateDetails:
         content = self.content
         if callable(content):
-            content = content(item_idx)
+            content = cast(Callable[[int], PromptUpdateInfo], content)(item_idx)
 
-        if not isinstance(content, PromptUpdateDetails):
-            content = PromptUpdateDetails.from_seq(content)
-
-        return content
+        return _as_prompt_update_details(content)
 
     def resolve(self, item_idx: int) -> "ResolvedPromptUpdate":
         """
@@ -298,12 +331,21 @@ class PromptUpdate(ABC):
         [`modality`][vllm.multimodal.processing.PromptUpdate.modality],
         output a copy of this object with its lazy attributes resolved.
         """
+        offset_aware_content = (
+            self.content if _is_offset_aware_content(self.content) else None
+        )
         return ResolvedPromptUpdate(
             modality=self.modality,
             item_idx=item_idx,
             mode=self.mode,
             target=self._resolve_target(item_idx),
-            content=self._resolve_content(item_idx),
+            content=(
+                PromptUpdateDetails.from_seq([])
+                if offset_aware_content is not None
+                else self._resolve_content(item_idx)
+            ),
+            offset_aware_content=offset_aware_content,
+            content_item_idx=item_idx if offset_aware_content is not None else None,
         )
 
 
@@ -481,6 +523,30 @@ class ResolvedPromptUpdate:
     content: PromptUpdateDetails = field(repr=False)
     """The placeholder tokens that are part of the update."""
 
+    offset_aware_content: PromptUpdateContent | None = field(
+        default=None,
+        repr=False,
+    )
+    """Callable content that also depends on the output token offset."""
+
+    content_item_idx: int | None = None
+    """The item index to use when resolving offset-aware content."""
+
+    def get_content(self, start_idx: int | None = None) -> PromptUpdateDetails:
+        if self.offset_aware_content is None:
+            return self.content
+
+        if start_idx is None:
+            raise ValueError("Offset-aware prompt update content requires start_idx")
+
+        resolve_content = cast(
+            Callable[[int, int], PromptUpdateInfo], self.offset_aware_content
+        )
+        item_idx = (
+            self.item_idx if self.content_item_idx is None else self.content_item_idx
+        )
+        return _as_prompt_update_details(resolve_content(item_idx, start_idx))
+
     def iter_token_matches(
         self,
         prompt: list[int],
@@ -504,10 +570,11 @@ class ResolvedPromptUpdate:
         return replace(self, target=target)
 
     def with_content(self, content: PromptUpdateInfo):
-        if not isinstance(content, PromptUpdateDetails):
-            content = PromptUpdateDetails.from_seq(content)
-
-        return replace(self, content=content)
+        return replace(
+            self,
+            content=_as_prompt_update_details(content),
+            offset_aware_content=None,
+        )
 
 
 class _TokenMatch(NamedTuple):
@@ -821,6 +888,7 @@ def _apply_matches(
     matched_updates, result = _plan_prompt_updates(prompt, mm_prompt_updates)
 
     prev_end_idx = 0
+    out_len = 0
     for matched_update in matched_updates:
         update = matched_update.update
         match = matched_update.match
@@ -832,8 +900,12 @@ def _apply_matches(
         else:
             assert_never(update.mode)
 
-        out_seqs.append(prompt[prev_end_idx:end_idx_to_insert])
-        out_seqs.append(update.content.full)
+        prompt_segment = prompt[prev_end_idx:end_idx_to_insert]
+        out_seqs.append(prompt_segment)
+        out_len += len(prompt_segment)
+        content = update.get_content(out_len).full
+        out_seqs.append(content)
+        out_len += len(content)
         prev_end_idx = match.end_idx
 
     out_seqs.append(prompt[prev_end_idx:])
@@ -886,9 +958,10 @@ def _apply_token_matches_with_placeholders(
         new_token_ids.extend(token_ids[prev_end_idx:end_idx_to_insert])
         start_idx = len(new_token_ids)
 
-        tokens = update.content.full
+        content = update.get_content(start_idx)
+        tokens = content.full
         if tokens:
-            content_is_embed = update.content.is_embed
+            content_is_embed = content.is_embed
             if content_is_embed is not None:
                 content_is_embed = content_is_embed(tokens)
 
@@ -939,7 +1012,7 @@ def _iter_placeholders(
     while start_idx < prompt_len:
         if candidates is None:
             candidates = [
-                (modality, update, update.content.full)
+                (modality, update, update.get_content().full)
                 for modality, modality_updates in mm_prompt_updates.items()
                 if item_idx_by_modality[modality] < mm_item_counts.get(modality, 0)
                 for update in modality_updates[item_idx_by_modality[modality]]
@@ -995,6 +1068,17 @@ def find_mm_placeholders(
 ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
     it = _iter_placeholders(prompt, mm_prompt_updates)
     return dict(full_groupby_modality(it))
+
+
+def _has_offset_aware_updates(
+    mm_prompt_updates: "MultiModalPromptUpdates",
+) -> bool:
+    return any(
+        update.offset_aware_content is not None
+        for modality_updates in mm_prompt_updates.values()
+        for updates in modality_updates
+        for update in updates
+    )
 
 
 MultiModalIsCached = dict[str, list[bool]]
@@ -1251,6 +1335,12 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         """
         return prompt
 
+    def _get_mm_hashes(self, inputs: ProcessorInputs) -> MultiModalHashes:
+        return inputs.get_mm_hashes(
+            self.info.model_id,
+            self.info.ctx.get_mm_config().mm_hasher_algorithm,
+        )
+
     def _get_cache_missing_items(
         self,
         cache: BaseMultiModalProcessorCache,
@@ -1370,10 +1460,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         # Use overrides if provided; fallback to data-dependent hashing.
         with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(
-                self.info.model_id,
-                self.info.ctx.get_mm_config().mm_hasher_algorithm,
-            )
+            mm_hashes = self._get_mm_hashes(inputs)
 
         mm_prompt_updates = self._get_mm_prompt_updates(
             inputs.mm_data_items,
@@ -1405,10 +1492,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             return self._apply_hf_processor(inputs, timing_ctx)
 
         with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(
-                self.info.model_id,
-                self.info.ctx.get_mm_config().mm_hasher_algorithm,
-            )
+            mm_hashes = self._get_mm_hashes(inputs)
 
         with timing_ctx.record("get_cache_missing_items"):
             mm_is_cached, mm_missing_data_items = self._get_cache_missing_items(
@@ -1613,6 +1697,12 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 if modality_placeholders
             }
             return new_token_ids, placeholders
+
+        if _has_offset_aware_updates(mm_prompt_updates):
+            raise ValueError(
+                "Offset-aware multimodal prompt updates must match token IDs "
+                "directly; text-space fallback cannot preserve output offsets."
+            )
 
         # A non-special-token target may be tokenized differently inside
         # the prompt, so fall back to performing the updates on the

@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
+from vllm.v1.attention.backends.mla.sparse_swa import _get_mm_prefix_swa_index_width
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -100,6 +101,12 @@ def _pad_to_supported_q_heads(num_heads: int) -> int:
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
     """Return the SM120 DSV4 SWA specialization needed by this model."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is not None and model_config.is_mm_prefix_lm:
+        return _get_mm_prefix_swa_index_width(
+            model_config.hf_config,
+            window_size,
+        )
     if not vllm_config.attention_config.use_non_causal:
         return window_size
     speculative_config = vllm_config.speculative_config
@@ -108,6 +115,26 @@ def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> in
     return get_dspark_swa_index_width(
         window_size,
         speculative_config.num_speculative_tokens,
+    )
+
+
+def _flashinfer_sparse_mla_config_error(
+    capability: DeviceCapability,
+    num_q_heads: int,
+    top_k: int,
+) -> str | None:
+    if capability.major != 12:
+        return None
+
+    from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
+
+    if has_flashinfer_sparse_mla_sm120_config(num_q_heads, top_k):
+        return None
+    return (
+        "on SM120 requires a FlashInfer DSV4 sparse MLA decode "
+        "specialization for "
+        f"(num_q_heads={num_q_heads}, top_k={top_k}). Install a "
+        "FlashInfer build containing flashinfer-ai/flashinfer#4380."
     )
 
 
@@ -423,6 +450,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 decode_is_valid_token=decode_is_valid_token,
                 swa_block_span=swa_block_span,
                 compressed_block_span=compressed_block_span,
+                mm_prefix_query_ranges=swa_metadata.mm_prefix_query_ranges,
             )
             if cache_key != "c4a":
                 swa_metadata.flashinfer_sparse_index_cache[cache_key] = (
@@ -582,8 +610,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
-
         capability = current_platform.get_device_capability()
         if capability is None:
             raise RuntimeError("Unable to determine CUDA compute capability.")
@@ -591,14 +617,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
 
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
-        if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
-            raise RuntimeError(
-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
-                "DSV4 sparse MLA decode specialization for "
-                f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
-                "Install a FlashInfer build containing "
-                "flashinfer-ai/flashinfer#4380."
-            )
+        if error := _flashinfer_sparse_mla_config_error(
+            capability,
+            self.padded_heads,
+            required_topk,
+        ):
+            raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}")
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:

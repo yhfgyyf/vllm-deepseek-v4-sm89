@@ -103,10 +103,10 @@ def fill_mm_prefix_query_ranges(
     query tokens rather than by context length -- bounded by
     ``max_num_batched_tokens`` instead of ``num_seqs * max_seq_len``.
 
-    Ranges are absolute prompt positions and may extend past the tokens
-    scheduled so far under chunked prefill; the portion outside the current
-    chunk is simply not recorded. Degenerate ranges (``start >= end``) are
-    skipped to match the Triton path's ``start < end`` validity check.
+    Ranges are inclusive absolute prompt positions and may extend past the
+    tokens scheduled so far under chunked prefill; the portion outside the
+    current chunk is simply not recorded. Degenerate ranges (``start > end``)
+    are skipped to match the mask path's ``start <= kv_idx <= end`` check.
 
     ``seq_lens_cpu`` only needs to be exact for prefill rows, since mm_prefix
     ranges cover prompt tokens: an over-estimate on a decode row shifts that
@@ -136,7 +136,7 @@ def fill_mm_prefix_query_ranges(
         # Absolute position of this request's first scheduled query token.
         context_len = int(seq_lens_cpu[req_idx]) - query_len
         for start, end in req_ranges:
-            if start >= end:
+            if start > end:
                 continue
             first = max(start - context_len, 0)
             last = min(end - context_len, query_len - 1)

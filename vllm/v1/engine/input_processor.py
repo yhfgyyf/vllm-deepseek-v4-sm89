@@ -480,6 +480,48 @@ class InputProcessor:
                 f"model length of {max_prompt_len}. {suggestion}"
             )
 
+    def _is_declared_extra_input_token(self, token_id: int) -> bool:
+        hf_config = self.model_config.hf_config
+
+        for attr in (
+            "vllm_extra_input_token_ids",
+            "extra_input_token_ids",
+            "multimodal_token_ids",
+        ):
+            token_ids = getattr(hf_config, attr, None)
+            if token_ids is not None and token_id in set(token_ids):
+                return True
+
+        for attr in ("vllm_extra_input_token_ranges", "extra_input_token_ranges"):
+            token_ranges = getattr(hf_config, attr, None) or ()
+            for token_range in token_ranges:
+                if isinstance(token_range, Mapping):
+                    start = int(token_range["start"])
+                    end = int(token_range["end"])
+                else:
+                    start, end = map(int, token_range)
+                if start <= token_id < end:
+                    return True
+
+        return False
+
+    def _is_extra_input_token_covered(
+        self,
+        prompt_input: SingletonInput,
+        token_idx: int,
+    ) -> bool:
+        if prompt_input["type"] != "multimodal":
+            return False
+
+        for mm_positions in prompt_input["mm_placeholders"].values():
+            for mm_position in mm_positions:
+                start = mm_position.offset
+                end = start + mm_position.length
+                if start <= token_idx < end:
+                    return True
+
+        return False
+
     def _validate_model_input(
         self,
         prompt_input: SingletonInput,
@@ -539,10 +581,18 @@ class InputProcessor:
                 raise VLLMValidationError(
                     f"Token id {min_input_id} is out of vocabulary"
                 )
-            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
-                raise VLLMValidationError(
-                    f"Token id {max_input_id} is out of vocabulary"
-                )
+            vocab_max_token_id = max(tokenizer.max_token_id, model_vocab_size - 1)
+            if max_input_id > vocab_max_token_id:
+                for token_idx, token_id in enumerate(prompt_ids):
+                    if token_id <= vocab_max_token_id:
+                        continue
+                    if self._is_declared_extra_input_token(
+                        token_id
+                    ) and self._is_extra_input_token_covered(prompt_input, token_idx):
+                        continue
+                    raise VLLMValidationError(
+                        f"Token id {max_input_id} is out of vocabulary"
+                    )
 
     def _validate_model_inputs(
         self,

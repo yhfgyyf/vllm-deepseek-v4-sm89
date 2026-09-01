@@ -15,6 +15,7 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.config.model_arch import ModelArchitectureConfig
+from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from vllm.transformers_utils.model_arch_config_convertor import (
     Gemma4ModelArchConfigConvertor,
@@ -61,6 +62,14 @@ SPECULATIVE_MODELS = [
     ("meta-llama/Meta-Llama-3-8B-Instruct", "yuhuili/EAGLE-LLaMA3-Instruct-8B", True),
     ("meta-llama/Llama-3.1-8B-Instruct", "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B", True),
 ]
+
+
+def test_deepseek_v4_config_preserves_vision_n_layers():
+    assert DeepseekV4Config().vision_n_layers == 0
+    assert DeepseekV4Config(vision_n_layers=4).vision_n_layers == 4
+    vision_config = DeepseekV4Config(vocab_size=1000, vision_n_layers=4)
+    assert vision_config.vllm_mm_prefix_start_token_id == 1000
+    assert vision_config.vllm_mm_prefix_end_token_id == 1004
 
 
 def _load_groundtruth(filename: str) -> dict:

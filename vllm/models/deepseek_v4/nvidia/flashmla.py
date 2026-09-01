@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
     DeepseekSparseSWAMetadataBuilder,
+    _get_mm_prefix_swa_index_width,
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -119,7 +120,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             else:
                 assert self.topk_indices_buffer is not None
                 top_k = self.topk_indices_buffer.shape[-1]
-            combined_topk = round_up(top_k + self.window_size, 128)
+            model_config = self.vllm_config.model_config
+            hf_config = model_config.hf_config
+            swa_index_width = (
+                _get_mm_prefix_swa_index_width(hf_config, self.window_size)
+                if model_config.is_mm_prefix_lm
+                else self.window_size
+            )
+            combined_topk = round_up(top_k + swa_index_width, 128)
             current_workspace_manager().get_simultaneous(
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
@@ -311,7 +319,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
-        combined_topk = round_up(top_k + self.window_size, 128)
+        swa_index_width = swa_metadata.decode_swa_width or self.window_size
+        combined_topk = round_up(top_k + swa_index_width, 128)
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             chunk_size = chunk_end - chunk_start
             workspace = workspace_manager.get_simultaneous(
@@ -369,6 +378,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_M,
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
+                mm_prefix_query_ranges=(
+                    None
+                    if swa_metadata.mm_prefix_query_ranges is None
+                    else swa_metadata.mm_prefix_query_ranges[
+                        num_decode_tokens + query_start : num_decode_tokens + query_end
+                    ]
+                ),
+                swa_index_width=swa_index_width,
             )
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],

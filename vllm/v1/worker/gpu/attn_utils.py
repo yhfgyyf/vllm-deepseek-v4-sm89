@@ -10,7 +10,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -369,3 +369,31 @@ def compute_mm_prefix_ranges(
                 image_doc_ranges.append(r)
         req_doc_ranges[req_idx] = image_doc_ranges
     return req_doc_ranges
+
+
+def extract_mm_prefix_ranges(
+    mm_position: PlaceholderRange,
+    *,
+    prompt_token_ids: Sequence[int] | None = None,
+    start_token_id: int | None = None,
+    end_token_id: int | None = None,
+) -> list[tuple[int, int]]:
+    if start_token_id is None or end_token_id is None:
+        return mm_position.extract_embeds_range()
+    if prompt_token_ids is None:
+        raise ValueError(
+            "Explicit mm_prefix start/end tokens require prompt_token_ids."
+        )
+
+    start = mm_position.offset
+    end = start + mm_position.length
+    ranges: list[tuple[int, int]] = []
+    span_start: int | None = None
+    for pos, token_id in enumerate(prompt_token_ids[start:end], start=start):
+        token_id = int(token_id)
+        if token_id == start_token_id:
+            span_start = pos
+        elif token_id == end_token_id and span_start is not None:
+            ranges.append((span_start, pos))
+            span_start = None
+    return ranges

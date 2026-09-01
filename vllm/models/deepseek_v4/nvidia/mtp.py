@@ -174,11 +174,12 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             previous_hidden_states = sp_shard(previous_hidden_states)
+            input_ids = sp_shard(input_ids)
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
-            positions=positions, x=hidden_states, input_ids=None
+            positions=positions, x=hidden_states, input_ids=input_ids
         )
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         if self.mtp_block.use_sequence_parallel:
@@ -476,6 +477,11 @@ class DeepSeekV4MTP(nn.Module):
                         name = name.replace(
                             ".ffn.gate.bias",
                             ".ffn.gate.e_score_correction_bias",
+                        )
+                    elif name.endswith(".ffn.gate.bias_vl"):
+                        name = name.replace(
+                            ".ffn.gate.bias_vl",
+                            ".ffn.gate.e_score_correction_bias_vl",
                         )
                     param = params_dict[name]
                     weight_loader = getattr(

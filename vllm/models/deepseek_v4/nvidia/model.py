@@ -745,6 +745,51 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
+def _init_deepseek_v4_gate_routing_parameters(
+    gate: nn.Module,
+    config: typing.Any,
+    *,
+    is_hash_moe: bool,
+    hash_indices_dtype: torch.dtype,
+) -> None:
+    gate.e_score_correction_bias = None
+    gate.e_score_correction_bias_vl = None
+    gate.tid2eid = None
+    has_vision_bias = (
+        getattr(config, "vision_n_layers", 0) > 0
+        or getattr(config, "is_mm_prefix_lm", False)
+        or getattr(config, "vision_config", None) is not None
+        or getattr(config, "image_token_id", None) is not None
+    )
+    if has_vision_bias and (
+        is_hash_moe or getattr(config, "topk_method", None) == "noaux_tc"
+    ):
+        gate.e_score_correction_bias_vl = nn.Parameter(
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+    if is_hash_moe:
+        if has_vision_bias:
+            gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        gate.tid2eid = nn.Parameter(
+            torch.randint(
+                0,
+                config.n_routed_experts,
+                (config.vocab_size, config.num_experts_per_tok),
+                dtype=hash_indices_dtype,
+            ),
+            requires_grad=False,
+        )
+    elif getattr(config, "topk_method", None) == "noaux_tc":
+        gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(config.n_routed_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -759,6 +804,7 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.use_sequence_parallel = use_sequence_parallel
+        self.input_vocab_size = config.vocab_size
         moe_backend = vllm_config.kernel_config.moe_backend
         validate_fi_moe_ep_config(vllm_config)
         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
@@ -798,28 +844,14 @@ class DeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = None
-        self.gate.tid2eid = None
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
-        if is_hash_moe:
-            # hash MoE doesn't use e_score_correction_bias
-            # Use randint instead of empty to avoid garbage values causing
-            # invalid memory access in dummy mode (--load-format="dummy")
-            self.gate.tid2eid = nn.Parameter(
-                torch.randint(
-                    0,
-                    config.n_routed_experts,
-                    (config.vocab_size, config.num_experts_per_tok),
-                    dtype=self.hash_indices_dtype,
-                ),
-                requires_grad=False,
-            )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
-                requires_grad=False,
-            )
+        _init_deepseek_v4_gate_routing_parameters(
+            self.gate,
+            config,
+            is_hash_moe=is_hash_moe,
+            hash_indices_dtype=self.hash_indices_dtype,
+        )
 
         if config.n_shared_experts is None:
             self.shared_experts = None
@@ -951,7 +983,9 @@ class DeepseekV4MoE(nn.Module):
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            e_score_correction_bias_vl=self.gate.e_score_correction_bias_vl,
             hash_indices_table=self.gate.tid2eid,
+            input_vocab_size=config.vocab_size,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
@@ -964,6 +998,10 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        if self.gate.e_score_correction_bias_vl is not None and input_ids is None:
+            raise ValueError(
+                "DeepSeek V4 mixed text/image MoE routing requires input_ids."
+            )
 
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
@@ -977,12 +1015,16 @@ class DeepseekV4MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias.data
             if self.gate.e_score_correction_bias is not None
             else None,
+            e_score_correction_bias_vl=self.gate.e_score_correction_bias_vl.data
+            if self.gate.e_score_correction_bias_vl is not None
+            else None,
             topk=self.n_activated_experts,
             renormalize=self.renormalize,
             indices_type=self.hash_indices_dtype,
             input_tokens=input_ids,
             hash_indices_table=self.gate.tid2eid,
             routed_scaling_factor=self.routed_scaling_factor,
+            input_vocab_size=self.input_vocab_size,
         )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
@@ -1673,6 +1715,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             "head.weight": "lm_head.weight",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+            ".ffn.gate.bias_vl": ".ffn.gate.e_score_correction_bias_vl",
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",

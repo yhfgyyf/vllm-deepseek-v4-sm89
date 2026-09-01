@@ -499,6 +499,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )
+                elif name.endswith(".ffn.gate.bias_vl"):
+                    name = name.replace(
+                        ".ffn.gate.bias_vl",
+                        ".ffn.gate.e_score_correction_bias_vl",
+                    )
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

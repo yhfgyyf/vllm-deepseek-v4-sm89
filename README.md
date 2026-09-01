@@ -1,26 +1,31 @@
-# DeepSeek-V4-Flash 与 GLM-5.3-Flash on SM89 / SM120 — vLLM fork
+# DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 与 GLM-5.3-Flash on SM89 / SM120 — vLLM fork
 
 <!-- markdownlint-disable MD060 -->
 
 > English version: [`README_EN.md`](README_EN.md)
 >
 > 本仓库基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，用于在
-> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash 和
-> GLM-5.3-Flash。
+> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash、
+> DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
-当前代码基于 vLLM `v0.28.1rc0-110`，配套 FlashInfer `0.6.18`。已验证配置包括
+当前代码基于 vLLM `v0.28.1rc0-289`，配套 FlashInfer `0.6.18`。已验证配置包括
 **4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
 
 ## 支持矩阵
 
-| GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
-|---|---|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48GB | 是 | 是 |
-| SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 |
+| GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
+|---|---|---:|---:|---:|
+| SM89 / Ada | 8× RTX 4090 48GB | 是 | 待验证 | 是 |
+| SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 | 是 |
 
 ---
 
 ## Changelog
+
+### 2026-09-01
+
+- 增加 DeepSeek-V4-Flash-Vision-Exp 支持；4× RTX PRO 6000（SM120）已验证，
+  8× RTX 4090 48GB（SM89）待验证。
 
 ### 2026-08-31
 
@@ -50,8 +55,8 @@
 | CUDA toolkit | 13.0 |
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
-| FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev110` SM89+SM120 build |
+| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
+| vLLM | `0.28.1rc0.dev289` SM89+SM120 vision build |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -68,22 +73,23 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc0-sm89-sm120-cu130 \
+gh release download v0.28.1rc0-vision-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*sm89sm120.cu130-*.whl' \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-release
+  --dir /tmp/vllm-sm89-sm120-vision-release
 
-cd /tmp/vllm-sm89-sm120-release
+cd /tmp/vllm-sm89-sm120-vision-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*.whl --torch-backend=cu130
+uv pip install ./vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl \
+  --torch-backend=cu130
 ```
 
-vLLM wheel 会通过锁定的依赖 URL，从同一 Release 自动安装配套的
-FlashInfer wheel。下载到本地的两个 wheel 均由 `SHA256SUMS` 校验。
+vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashInfer wheel。
+下载到本地的两个 wheel 均由 `SHA256SUMS` 校验。
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
@@ -186,7 +192,33 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. GLM-5.3-Flash 启动命令（SM120）
+## 4. DeepSeek-V4-Flash-Vision-Exp 启动命令（SM120）
+
+```bash
+vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --tensor-parallel-size 4 \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.95 \
+  --enable-prefix-caching \
+  --interleave-mm-strings \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4 \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":3}' \
+  --port 8000
+```
+
+## 5. GLM-5.3-Flash 启动命令（SM120）
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -226,7 +258,7 @@ vllm serve /path/to/GLM-5.3-Flash \
 
 ---
 
-## 5. GLM-5.3-Flash SM120 吞吐基线
+## 6. GLM-5.3-Flash SM120 吞吐基线
 
 以下数据来自本项目第一版 SM120 完整基准，使用 4× RTX PRO 6000、TP=4、
 FP8 KV、MTP=5、CUDA Graph、`block-size=2304`、chunked prefill 8192，关闭
@@ -265,10 +297,12 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
 
 ---
 
-## 6. 正确性验证
+## 7. 正确性验证
 
-- DeepSeek-V4-Flash 与 GLM-5.3-Flash 在 SM120 上均通过服务启动、8K/32K
-  输入和 512 输出测试。
+- DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 与 GLM-5.3-Flash
+  在 SM120 上均通过服务启动。
+- DeepSeek-V4-Flash 与 GLM-5.3-Flash 在 SM120 上通过 8K/32K 输入和
+  512 输出测试。
 - DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8
   输出测试。
 - GLM-5.3-Flash 已由社区用户在 8× RTX 4090 48GB（SM89）上成功启动并完成
@@ -277,7 +311,7 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
 
 ---
 
-## 7. License / 来源
+## 8. License / 来源
 
 代码基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，沿用
 Apache-2.0 协议。FlashInfer wheel 基于

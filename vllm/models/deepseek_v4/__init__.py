@@ -9,7 +9,16 @@ classes used by the model registry and quantization config lookup.
 
 from vllm.platforms import current_platform
 
+from .multimodal_processor import (
+    DeepseekV4VisionDummyInputsBuilder,
+    DeepseekV4VisionMultiModalProcessor,
+    DeepseekV4VisionProcessingInfo,
+)
 from .quant_config import DeepseekV4FP8Config
+from .vision_model import (
+    DeepseekV4ForConditionalGeneration,
+    DeepseekV4VisionForCausalLM,
+)
 
 # Pick the per-platform implementation. The NVIDIA branch is the static
 # default that mypy sees; the ROCm/XPU branches override at runtime and are
@@ -35,5 +44,10 @@ __all__ = [
     "DSparkDeepseekV4ForCausalLM",
     "DeepSeekV4MTP",
     "DeepseekV4FP8Config",
+    "DeepseekV4ForConditionalGeneration",
     "DeepseekV4ForCausalLM",
+    "DeepseekV4VisionDummyInputsBuilder",
+    "DeepseekV4VisionForCausalLM",
+    "DeepseekV4VisionMultiModalProcessor",
+    "DeepseekV4VisionProcessingInfo",
 ]

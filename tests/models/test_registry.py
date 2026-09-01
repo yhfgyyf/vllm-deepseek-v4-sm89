@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch.cuda
@@ -14,6 +15,10 @@ from vllm.model_executor.models import (
 from vllm.model_executor.models.adapters import (
     as_embedding_model,
     as_seq_cls_model,
+)
+from vllm.model_executor.models.config import (
+    MODELS_CONFIG_MAP,
+    DeepseekV4ForCausalLMConfig,
 )
 from vllm.model_executor.models.registry import (
     _MULTIMODAL_MODELS,
@@ -206,6 +211,76 @@ def test_lazy_modelinfo_package_attempts_cache_load(monkeypatch):
     assert result is cached_model_info
     assert len(loaded_hashes) == 1
     assert loaded_hashes[0]
+
+
+def test_deepseek_v4_vision_layers_select_registered_vision_arch():
+    vision_arch = "DeepseekV4ForConditionalGeneration"
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(vision_n_layers=1),
+        model_impl="auto",
+        runner_type="generate",
+        convert_type="none",
+    )
+
+    normalized = ModelRegistry._normalize_arch("DeepseekV4ForCausalLM", model_config)
+
+    assert vision_arch in ModelRegistry.models
+    assert normalized == vision_arch
+
+
+def test_deepseek_v4_vision_layers_resolve_registered_vision_arch():
+    vision_arch = "DeepseekV4ForConditionalGeneration"
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(vision_n_layers=1),
+        model_impl="auto",
+        runner_type="generate",
+        convert_type="none",
+    )
+
+    _, architecture = ModelRegistry.resolve_model_cls(
+        "DeepseekV4ForCausalLM",
+        model_config,
+    )
+
+    assert architecture == vision_arch
+
+
+def test_deepseek_v4_text_checkpoint_keeps_text_arch():
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(vision_n_layers=0),
+        model_impl="auto",
+        runner_type="generate",
+        convert_type="none",
+    )
+
+    normalized = ModelRegistry._normalize_arch("DeepseekV4ForCausalLM", model_config)
+
+    assert normalized == "DeepseekV4ForCausalLM"
+
+
+def test_deepseek_v4_vision_arch_keeps_deepseek_fp8_config_hook():
+    hf_config = SimpleNamespace(
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        quantization_config={"quant_method": "fp8"},
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        model_impl="auto",
+        runner_type="generate",
+        convert_type="none",
+    )
+
+    architecture = ModelRegistry._normalize_arch(
+        "DeepseekV4ForCausalLM",
+        model_config,
+    )
+    config_hook = MODELS_CONFIG_MAP[architecture]
+    config_hook.verify_and_update_model_config(model_config)
+
+    assert config_hook is DeepseekV4ForCausalLMConfig
+    assert hf_config.quantization_config["quant_method"] == "deepseek_v4_fp8"
 
 
 def test_hf_registry_coverage():

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -59,6 +61,28 @@ def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride():
     ]
     assert torch.all(global_decode_buffer[:, 128:] == -99)
     assert torch.all(prefill_buffer[:, 128:] == -99)
+
+
+def test_dsv4_vision_warmup_covers_fixed_width_and_mm_prefix_variants():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        CombineTopkSwaIndicesKernel,
+    )
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        model_config=SimpleNamespace(
+            is_mm_prefix_lm=True,
+            hf_config=SimpleNamespace(
+                sliding_window=128,
+                vision_max_n_token=384,
+            ),
+        ),
+    )
+
+    keys = CombineTopkSwaIndicesKernel().get_warmup_keys(config)
+
+    assert {key.SWA_INDEX_WIDTH for key in keys} == {512}
+    assert {key.HAS_MM_PREFIX for key in keys} == {False, True}
 
 
 def test_sparse_flashmla_metadata_smoke():
@@ -469,3 +493,247 @@ def test_flashinfer_mixed_sparse_indices_separates_window_and_padded_width():
     assert sparse_indices.shape == (1, padded_width)
     assert sparse_indices[0].cpu().tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
     assert sparse_lens.cpu().tolist() == [padded_width]
+
+
+def _golden_swa_rows(
+    *,
+    seq_lens: list[int],
+    query_start_loc: list[int],
+    block_table: list[list[int]],
+    token_to_req: list[int],
+    block_size: int,
+    window_size: int,
+    index_width: int | None = None,
+    mm_query_ranges: list[tuple[int, int]] | None = None,
+) -> tuple[list[list[int]], list[int]]:
+    if index_width is None:
+        index_width = window_size
+    rows: list[list[int]] = []
+    lens: list[int] = []
+    for token_idx, req_idx in enumerate(token_to_req):
+        query_start = query_start_loc[req_idx]
+        query_end = query_start_loc[req_idx + 1]
+        query_len = query_end - query_start
+        prefix_len = seq_lens[req_idx] - query_len
+        pos = prefix_len + token_idx - query_start
+        start_pos = max(pos - window_size + 1, 0)
+        end_pos = pos + 1
+        if mm_query_ranges is not None:
+            mm_start, mm_end = mm_query_ranges[token_idx]
+            if mm_start >= 0 and mm_start <= mm_end:
+                start_pos = min(start_pos, mm_start)
+                end_pos = mm_end + 1
+        row = []
+        for pos_offset in range(start_pos, end_pos):
+            block_number = block_table[req_idx][pos_offset // block_size]
+            row.append(block_number * block_size + pos_offset % block_size)
+        lens.append(len(row))
+        rows.append(row + [-1] * (index_width - len(row)))
+    return rows, lens
+
+
+def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        _compute_swa_indices_and_lens_kernel,
+    )
+
+    device = torch.device("cuda")
+    window_size = 4
+    index_width = 8
+    block_size = 4
+    seq_lens = [5, 3]
+    query_start_loc = [0, 5, 8]
+    block_table = [[10, 11, 12], [20, 21, 22]]
+    token_to_req = [0, 0, 0, 0, 0, 1, 1, 1]
+    mm_ranges = [
+        (-1, -1),
+        (1, 3),
+        (1, 3),
+        (1, 3),
+        (-1, -1),
+        (0, 1),
+        (0, 1),
+        (-1, -1),
+    ]
+
+    swa_indices = torch.empty((8, index_width), dtype=torch.int32, device=device)
+    swa_lens = torch.empty((8,), dtype=torch.int32, device=device)
+    _compute_swa_indices_and_lens_kernel[(8,)](
+        swa_indices,
+        swa_indices.stride(0),
+        swa_lens,
+        window_size,
+        index_width,
+        torch.tensor(query_start_loc, dtype=torch.int32, device=device),
+        torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        torch.tensor(token_to_req, dtype=torch.int32, device=device),
+        torch.ones((8,), dtype=torch.bool, device=device),
+        torch.tensor(block_table, dtype=torch.int32, device=device),
+        len(block_table[0]),
+        block_size,
+        torch.tensor(mm_ranges, dtype=torch.int32, device=device),
+        True,
+        token_offset=0,
+        TRITON_BLOCK_SIZE=8,
+    )
+
+    expected_rows, expected_lens = _golden_swa_rows(
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        block_table=block_table,
+        token_to_req=token_to_req,
+        block_size=block_size,
+        window_size=window_size,
+        index_width=index_width,
+        mm_query_ranges=mm_ranges,
+    )
+    assert swa_indices.cpu().tolist() == expected_rows
+    assert swa_lens.cpu().tolist() == expected_lens
+    assert expected_rows[1] == [40, 41, 42, 43, -1, -1, -1, -1]
+    assert expected_rows[2] == expected_rows[3] == expected_rows[1]
+    assert expected_rows[5] == [80, 81, -1, -1, -1, -1, -1, -1]
+    assert expected_rows[6] == expected_rows[5]
+    assert expected_rows[1] != expected_rows[5]
+
+
+def test_flashinfer_mixed_sparse_indices_use_prefill_image_span():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        build_flashinfer_mixed_sparse_indices,
+    )
+
+    device = torch.device("cuda")
+    sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
+        decode_swa_indices=torch.empty((0, 8), dtype=torch.int32, device=device),
+        decode_compressed_indices=None,
+        decode_compressed_topk_lens=None,
+        prefill_topk_indices=torch.empty((5, 0), dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([5], dtype=torch.int32, device=device),
+        token_to_req_indices=torch.zeros((5,), dtype=torch.int32, device=device),
+        swa_block_table=torch.tensor([[10, 11]], dtype=torch.int32, device=device),
+        swa_block_size=4,
+        compressed_block_table=None,
+        compressed_block_size=4,
+        window_size=4,
+        compress_ratio=1,
+        topk=0,
+        mm_prefix_query_ranges=torch.tensor(
+            [(-1, -1), (1, 3), (1, 3), (1, 3), (-1, -1)],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+
+    assert sparse_indices.cpu().tolist() == [
+        [40, -1, -1, -1, -1, -1, -1, -1],
+        [40, 41, 42, 43, -1, -1, -1, -1],
+        [40, 41, 42, 43, -1, -1, -1, -1],
+        [40, 41, 42, 43, -1, -1, -1, -1],
+        [41, 42, 43, 44, -1, -1, -1, -1],
+    ]
+    assert sparse_lens.cpu().tolist() == [8, 8, 8, 8, 8]
+
+
+def test_flashinfer_mixed_sparse_indices_keep_past_window_and_future_image():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        build_flashinfer_mixed_sparse_indices,
+    )
+
+    device = torch.device("cuda")
+    sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
+        decode_swa_indices=torch.empty((0, 8), dtype=torch.int32, device=device),
+        decode_compressed_indices=None,
+        decode_compressed_topk_lens=None,
+        prefill_topk_indices=torch.empty((8, 0), dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        token_to_req_indices=torch.zeros((8,), dtype=torch.int32, device=device),
+        swa_block_table=torch.tensor([[0, 1]], dtype=torch.int32, device=device),
+        swa_block_size=4,
+        compressed_block_table=None,
+        compressed_block_size=4,
+        window_size=4,
+        compress_ratio=1,
+        topk=0,
+        mm_prefix_query_ranges=torch.tensor(
+            [(-1, -1), (-1, -1), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (-1, -1)],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+
+    assert sparse_indices[2].cpu().tolist() == [0, 1, 2, 3, 4, 5, 6, -1]
+    assert sparse_lens[2].item() == 8
+
+
+def test_flashmla_combine_topk_swa_indices_use_prefill_image_span():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import combine_topk_swa_indices
+
+    device = torch.device("cuda")
+    combined_indices, combined_lens = combine_topk_swa_indices(
+        topk_indices=torch.empty((5, 0), dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([5], dtype=torch.int32, device=device),
+        gather_lens=torch.tensor([5], dtype=torch.int32, device=device),
+        window_size=4,
+        compress_ratio=1,
+        topk=0,
+        M=5,
+        N=0,
+        mm_prefix_query_ranges=torch.tensor(
+            [(-1, -1), (1, 3), (1, 3), (1, 3), (-1, -1)],
+            dtype=torch.int32,
+            device=device,
+        ),
+        swa_index_width=8,
+    )
+
+    assert combined_indices[:, :8].cpu().tolist() == [
+        [0, -1, -1, -1, -1, -1, -1, -1],
+        [0, 1, 2, 3, -1, -1, -1, -1],
+        [0, 1, 2, 3, -1, -1, -1, -1],
+        [0, 1, 2, 3, -1, -1, -1, -1],
+        [1, 2, 3, 4, -1, -1, -1, -1],
+    ]
+    assert combined_lens.cpu().tolist() == [1, 4, 4, 4, 4]
+
+
+def test_flashmla_combine_keeps_past_window_and_future_image():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import combine_topk_swa_indices
+
+    device = torch.device("cuda")
+    combined_indices, combined_lens = combine_topk_swa_indices(
+        topk_indices=torch.empty((8, 0), dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        gather_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        window_size=4,
+        compress_ratio=1,
+        topk=0,
+        M=8,
+        N=0,
+        mm_prefix_query_ranges=torch.tensor(
+            [(-1, -1), (-1, -1), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (-1, -1)],
+            dtype=torch.int32,
+            device=device,
+        ),
+        swa_index_width=8,
+    )
+
+    assert combined_indices[2, :8].cpu().tolist() == [0, 1, 2, 3, 4, 5, 6, -1]
+    assert combined_lens[2].item() == 7
+
+
+def test_mm_prefix_fill_ranges_are_inclusive_at_end_boundary():
+    from vllm.v1.attention.backends.utils import fill_mm_prefix_query_ranges
+
+    out = torch.empty((5, 2), dtype=torch.int32).numpy()
+    num_rows = fill_mm_prefix_query_ranges(
+        out,
+        {0: [(1, 3), (4, 4)]},
+        torch.tensor([0, 5], dtype=torch.int32),
+        torch.tensor([5], dtype=torch.int32),
+    )
+
+    assert num_rows == 5
+    assert out.tolist() == [[-1, -1], [1, 3], [1, 3], [1, 3], [4, 4]]

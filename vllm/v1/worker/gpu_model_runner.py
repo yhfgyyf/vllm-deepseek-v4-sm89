@@ -222,6 +222,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import extract_mm_prefix_ranges
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -2425,6 +2426,16 @@ class GPUModelRunner(
             _clamps_in_kernel = getattr(
                 self.model, "mm_prefix_clamp_sliding_window", False
             )
+            hf_config = self.model_config.hf_config
+            _prefix_start_token_id = getattr(
+                hf_config, "vllm_mm_prefix_start_token_id", None
+            )
+            _prefix_end_token_id = getattr(
+                hf_config, "vllm_mm_prefix_end_token_id", None
+            )
+            _has_explicit_prefix_tokens = (
+                _prefix_start_token_id is not None and _prefix_end_token_id is not None
+            )
             for req_id in self.input_batch.req_ids:
                 image_doc_ranges = []
                 req_state = self.requests[req_id]
@@ -2432,10 +2443,16 @@ class GPUModelRunner(
                     if mm_feature.modality == "audio":
                         continue
                     pos_info = mm_feature.mm_position
-                    img_doc_range = pos_info.extract_embeds_range()
+                    img_doc_range = extract_mm_prefix_ranges(
+                        pos_info,
+                        prompt_token_ids=req_state.prompt_token_ids,
+                        start_token_id=_prefix_start_token_id,
+                        end_token_id=_prefix_end_token_id,
+                    )
                     for r in img_doc_range:
                         if (
                             not _clamps_in_kernel
+                            and not _has_explicit_prefix_tokens
                             and _bidi_sw is not None
                             and (r[1] - r[0] + 1) > _bidi_sw
                         ):

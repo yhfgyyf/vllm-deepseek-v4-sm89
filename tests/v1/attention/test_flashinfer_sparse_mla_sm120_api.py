@@ -15,6 +15,7 @@ from vllm.model_executor.layers.attention import (
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
     DeepseekV4FlashInferSM120Attention,
+    _flashinfer_sparse_mla_config_error,
     _required_sm120_sparse_topk,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -61,6 +62,16 @@ def _mock_single_tp(monkeypatch) -> None:
         sparse_attention_module,
         "get_tensor_model_parallel_world_size",
         lambda: 1,
+    )
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm89",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm89_glm_nope",
+        lambda: True,
     )
 
 
@@ -572,7 +583,7 @@ def test_glm_nope_cache_update_rejects_rope_payload(monkeypatch) -> None:
 
 def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     fake_module = SimpleNamespace(
-        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192), (32, 256)})
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192), (32, 256), (32, 1024)})
     )
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(
@@ -584,6 +595,7 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 1024)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
@@ -623,9 +635,41 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
         attention_config=SimpleNamespace(use_non_causal=True),
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
     )
+    vision = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_mm_prefix_lm=True,
+            hf_config=SimpleNamespace(vision_max_n_token=384),
+        ),
+        attention_config=SimpleNamespace(use_non_causal=False),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+    )
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+    assert _required_sm120_sparse_topk(vision, 128) == 512
+    assert _required_sm120_sparse_topk(vision, 512) == 1024
+
+
+def test_sm89_dsv4_does_not_require_sm120_dispatch_entry(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm120_config",
+        lambda num_q_heads, top_k: False,
+    )
+
+    assert (
+        _flashinfer_sparse_mla_config_error(
+            DeviceCapability(8, 9),
+            num_q_heads=8,
+            top_k=128,
+        )
+        is None
+    )
+    assert "SM120 requires" in _flashinfer_sparse_mla_config_error(
+        DeviceCapability(12, 0),
+        num_q_heads=8,
+        top_k=128,
+    )
 
 
 @torch.no_grad()

@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash and GLM-5.3-Flash on SM89 / SM120 — vLLM fork
+# DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on SM89 / SM120 — vLLM fork
 
 <!-- markdownlint-disable MD060 -->
 
@@ -6,22 +6,28 @@
 >
 > This repository is based on
 > [vllm-project/vllm](https://github.com/vllm-project/vllm). It runs
-> DeepSeek-V4-Flash and GLM-5.3-Flash on SM89/Ada and SM120/RTX Blackwell.
+> DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on
+> SM89/Ada and SM120/RTX Blackwell.
 
-The current source is based on vLLM `v0.28.1rc0-110` and is paired with
+The current source is based on vLLM `v0.28.1rc0-289` and is paired with
 FlashInfer `0.6.18`. Validated configurations include
 **4×/8× RTX 4090 48 GB** and **4× RTX PRO 6000 Blackwell 96 GB** systems.
 
 ## Support matrix
 
-| GPU architecture | Validated GPU | DeepSeek-V4-Flash | GLM-5.3-Flash |
-|---|---|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Yes |
-| SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes |
+| GPU architecture | Validated GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
+|---|---|---:|---:|---:|
+| SM89 / Ada | 8× RTX 4090 48 GB | Yes | To be verified | Yes |
+| SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes | Yes |
 
 ---
 
 ## Changelog
+
+### 2026-09-01
+
+- Added DeepSeek-V4-Flash-Vision-Exp support; 4× RTX PRO 6000 (SM120) is
+  verified, and 8× RTX 4090 48 GB (SM89) is to be verified.
 
 ### 2026-08-31
 
@@ -51,8 +57,8 @@ Earlier SM89 builds and environments remain available in
 | CUDA toolkit | 13.0 |
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
-| FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev110` SM89+SM120 build |
+| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
+| vLLM | `0.28.1rc0.dev289` SM89+SM120 vision build |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
@@ -67,21 +73,22 @@ shape is compiled once and then reused from the JIT cache.
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc0-sm89-sm120-cu130 \
+gh release download v0.28.1rc0-vision-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*sm89sm120.cu130-*.whl' \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-release
+  --dir /tmp/vllm-sm89-sm120-vision-release
 
-cd /tmp/vllm-sm89-sm120-release
+cd /tmp/vllm-sm89-sm120-vision-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*.whl --torch-backend=cu130
+uv pip install ./vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl \
+  --torch-backend=cu130
 ```
 
-The vLLM wheel installs its paired FlashInfer wheel from a pinned URL in the
+The vLLM wheel installs the paired FlashInfer wheel from a pinned URL in the
 same release. `SHA256SUMS` verifies both wheels downloaded above.
 
 If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
@@ -150,7 +157,33 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. GLM-5.3-Flash launch command (SM120)
+## 4. DeepSeek-V4-Flash-Vision-Exp launch command (SM120)
+
+```bash
+vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --tensor-parallel-size 4 \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+  --kv-cache-dtype fp8_ds_mla \
+  --block-size 256 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.95 \
+  --enable-prefix-caching \
+  --interleave-mm-strings \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4 \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":3}' \
+  --port 8000
+```
+
+## 5. GLM-5.3-Flash launch command (SM120)
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -190,7 +223,7 @@ The command does not set `--enforce-eager`, so CUDA Graph remains enabled.
 
 ---
 
-## 5. GLM-5.3-Flash SM120 throughput baseline
+## 6. GLM-5.3-Flash SM120 throughput baseline
 
 These results are retained from the project's first complete SM120 benchmark.
 The setup used 4× RTX PRO 6000, TP=4, FP8 KV, MTP=5, CUDA Graph,
@@ -232,10 +265,12 @@ Repeating the same prompt produced:
 
 ---
 
-## 6. Correctness validation
+## 7. Correctness validation
 
-- DeepSeek-V4-Flash and GLM-5.3-Flash both passed server startup and 8K/32K to
-  512-token tests on SM120.
+- DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash passed
+  server startup on SM120.
+- DeepSeek-V4-Flash and GLM-5.3-Flash passed 8K/32K to 512-token tests on
+  SM120.
 - DeepSeek-V4-Flash passed 8K/32K/128K, four-concurrency, tool-calling, and UTF-8
   output tests on SM89.
 - A community user successfully served and ran GLM-5.3-Flash on 8× RTX 4090
@@ -245,7 +280,7 @@ Repeating the same prompt produced:
 
 ---
 
-## 7. License / provenance
+## 8. License / provenance
 
 The code is based on [vllm-project/vllm](https://github.com/vllm-project/vllm)
 and remains under Apache-2.0. The FlashInfer wheel is based on
