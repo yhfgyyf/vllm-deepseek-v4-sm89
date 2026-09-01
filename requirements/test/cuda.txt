@@ -454,7 +454,7 @@ junit-xml==1.9
     # via schemathesis
 kaldi-native-fbank==1.22.3
     # via -r requirements/test/cuda.in
-kaleido==0.2.1
+kaleido==1.3.0
     # via genai-perf
 kiwisolver==1.4.7
     # via matplotlib
