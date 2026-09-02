@@ -63,9 +63,19 @@ RUN apt-get update \
 FROM cuda-jit-runtime
 
 ARG SOURCE_COMMIT=cb7a43539108e9e0c975de02cee35355a413fae3
-ARG IMAGE_VERSION=0.28.1rc0-vision7-sm89-sm120-cu130
+ARG IMAGE_VERSION=0.28.1rc0-vision7-sm89-sm120-cu130-fixed
 
 COPY --from=python-deps /opt/venv /opt/venv
+
+RUN cuda_python_root=/opt/venv/lib/python3.12/site-packages/nvidia/cu13 \
+    && cp "${cuda_python_root}"/include/cublas*.h /usr/local/cuda/include/ \
+    && cp "${cuda_python_root}"/include/curand*.h /usr/local/cuda/include/ \
+    && ln -s "${cuda_python_root}"/lib/libcublas.so.13 \
+        /usr/local/cuda/lib64/libcublas.so \
+    && ln -s "${cuda_python_root}"/lib/libcublasLt.so.13 \
+        /usr/local/cuda/lib64/libcublasLt.so \
+    && ln -s "${cuda_python_root}"/lib/libcurand.so.10 \
+        /usr/local/cuda/lib64/libcurand.so
 
 ENV CUDA_HOME=/usr/local/cuda \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \

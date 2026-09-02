@@ -22,6 +22,13 @@
 
 ## Changelog
 
+### 2026-09-03
+
+- 修复 Docker 镜像中 FlashInfer sampling JIT 缺少 `curand.h`，以及 sparse
+  MLA autotune 编译 `trtllm_utils` 时缺少 `cublasLt.h` 的问题。
+- 保留 vLLM 模型预热所需的 `torchvision`，并发布修复后的 Vision7 镜像；
+  本镜像不包含尚未完成验证的 Qwen3.8-Flash-Next / `qwen4_exp` 适配代码。
+
 ### 2026-09-02
 
 - 修复 [Issue #90](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/90)，
@@ -109,7 +116,7 @@ vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashI
 镜像地址：
 
 ```text
-crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
+crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed
 ```
 
 | 项目 | 值 |
@@ -119,14 +126,16 @@ crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
 | PyTorch / CUDA | `2.13.0+cu130` / CUDA 13.0 JIT toolchain |
 | 镜像大小 | 9.27 GB 未压缩；约 4.33 GB Registry 传输量 |
-| Digest | `sha256:c1e004423863b2a01592e087d94edc7e2e88262408444633ca7904d61c39ebb2` |
+| Digest | `sha256:1a120648d54ebb90aad91bef2a620e5779c627426ad9f0a34367303b4cbe659a` |
 
 直接拉取镜像：
 
 ```bash
 docker pull \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed
 ```
+
+原有的 `0.28.1rc0-vision7-sm89-sm120-cu130` 标签也已更新到同一镜像。
 
 镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
 `vllm serve /path/to/model` 替换为：
@@ -135,11 +144,16 @@ docker pull \
 docker run --rm --gpus all --ipc=host \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130 \
+  -v /path/to/vllm-cache:/root/.cache/vllm \
+  -v /path/to/flashinfer-cache:/root/.cache/flashinfer \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed \
   /models/model-directory
 ```
 
-其余模型参数保持不变。镜像已完成 SM120 GPU 运行验证和 SM89 目标编译验证。
+其余模型参数保持不变。首次遇到新的 GPU 架构或模型 shape 时，FlashInfer 会进行
+JIT 编译和 autotune；挂载上述两个缓存目录可以在后续启动时复用结果。镜像已完成
+SM120 sampling、DeepSeek-V4/GLM sparse MLA autotune 和服务启动验证，并完成
+SM89 sampling、sparse MLA 与 `trtllm_utils` 目标编译验证。
 
 ---
 
