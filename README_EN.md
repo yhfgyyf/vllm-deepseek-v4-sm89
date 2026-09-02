@@ -9,7 +9,7 @@
 > DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on
 > SM89/Ada and SM120/RTX Blackwell.
 
-The current source is based on vLLM `v0.28.1rc0-289` and is paired with
+The current source is based on vLLM `v0.28.1rc0-293` and is paired with
 FlashInfer `0.6.18`. Validated configurations include
 **4×/8× RTX 4090 48 GB** and **4× RTX PRO 6000 Blackwell 96 GB** systems.
 
@@ -23,6 +23,12 @@ FlashInfer `0.6.18`. Validated configurations include
 ---
 
 ## Changelog
+
+### 2026-09-02
+
+- Fixed [Issue #90](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/90)
+  and replaced the affected GitHub Release wheel with the `dev293` / `vision7`
+  build.
 
 ### 2026-09-01
 
@@ -62,7 +68,7 @@ Earlier SM89 builds and environments remain available in
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev289` SM89+SM120 vision build |
+| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 

@@ -8,7 +8,7 @@
 > SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash、
 > DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
-当前代码基于 vLLM `v0.28.1rc0-289`，配套 FlashInfer `0.6.18`。已验证配置包括
+当前代码基于 vLLM `v0.28.1rc0-293`，配套 FlashInfer `0.6.18`。已验证配置包括
 **4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
 
 ## 支持矩阵
@@ -21,6 +21,13 @@
 ---
 
 ## Changelog
+
+### 2026-09-02
+
+- 修复 [Issue #90](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/90)，
+  GitHub Release 中有问题的 vLLM wheel 已替换为 `dev293` / `vision7` 构建。
+- 重新发布包含 DeepSeek-V4-Flash-Vision-Exp 支持的 SM89+SM120 Docker
+  镜像，并完成 SM120 GPU、模型模块和视频解码验证。
 
 ### 2026-09-01
 
@@ -60,7 +67,7 @@
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev289` SM89+SM120 vision build |
+| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -102,23 +109,23 @@ vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashI
 镜像地址：
 
 ```text
-crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
+crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
 ```
 
 | 项目 | 值 |
 |---|---|
 | 平台 | Linux x86_64 / `linux/amd64` |
-| vLLM | `0.28.1rc0.dev110+g5911abc0a1.glm53.dsv4.sm89sm120.cu130` |
-| FlashInfer | `0.6.18+glm53.dsv4.sm89sm120.cu130.pt213` |
+| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
+| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
 | PyTorch / CUDA | `2.13.0+cu130` / CUDA 13.0 JIT toolchain |
-| 镜像大小 | 9.25 GB 未压缩；约 4.55 GB Registry 传输量 |
-| Digest | `sha256:2adecc7cb455b84353a4efe266760f3946dd0026778aa5a7f42e51e4712edda9` |
+| 镜像大小 | 9.27 GB 未压缩；约 4.33 GB Registry 传输量 |
+| Digest | `sha256:c1e004423863b2a01592e087d94edc7e2e88262408444633ca7904d61c39ebb2` |
 
 直接拉取镜像：
 
 ```bash
 docker pull \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
 ```
 
 镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
@@ -128,7 +135,7 @@ docker pull \
 docker run --rm --gpus all --ipc=host \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-sm89-sm120-cu130 \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130 \
   /models/model-directory
 ```
 

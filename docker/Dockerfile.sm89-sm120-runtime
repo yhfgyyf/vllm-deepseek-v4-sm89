@@ -24,7 +24,7 @@ FROM runtime-base AS python-deps
 
 ARG UV_VERSION=0.10.7
 ARG PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
-ARG VLLM_WHEEL_URL="https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-sm89-sm120-cu130/vllm-0.28.1rc0.dev110%2Bg5911abc0a1.glm53.dsv4.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e5af611dfff4b28296079ef10c9519118d4e658d17b6be8516c67739b21bf911"
+ARG VLLM_WHEEL_URL="https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-vision-sm89-sm120-cu130/vllm-0.28.1rc0.dev293%2Bgcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=7a445495453b4d758c934cf4f9800edfbfb5eb081abe087f9726e8df2c70df76"
 
 RUN python3.12 -m venv /tmp/uv-bootstrap \
     && /tmp/uv-bootstrap/bin/pip install \
@@ -44,7 +44,7 @@ RUN python3.12 -m venv /tmp/uv-bootstrap \
         "${VLLM_WHEEL_URL}" \
     && /tmp/uv-bootstrap/bin/uv pip uninstall \
         --python /opt/venv/bin/python \
-        torchaudio torchcodec torchvision \
+        torchaudio torchcodec \
     && find /opt/venv/lib/python3.12/site-packages/vllm \
         -type f -name '*.so' -exec strip --strip-debug {} + \
     && /opt/venv/bin/python -c \
@@ -62,8 +62,8 @@ RUN apt-get update \
 
 FROM cuda-jit-runtime
 
-ARG SOURCE_COMMIT=5911abc0a15483f1deffb2235f4cd07113870065
-ARG IMAGE_VERSION=0.28.1rc0-sm89-sm120-cu130
+ARG SOURCE_COMMIT=cb7a43539108e9e0c975de02cee35355a413fae3
+ARG IMAGE_VERSION=0.28.1rc0-vision7-sm89-sm120-cu130
 
 COPY --from=python-deps /opt/venv /opt/venv
 
@@ -80,7 +80,7 @@ ENV CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST="8.9 12.0" \
     VLLM_USAGE_SOURCE=production-docker-image
 
-LABEL org.opencontainers.image.description="Run DeepSeek-V4-Flash and GLM-5.3-Flash on SM89 and SM120 with vLLM" \
+LABEL org.opencontainers.image.description="Run DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on SM89 and SM120 with vLLM" \
       org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       org.opencontainers.image.source="https://github.com/yhfgyyf/vllm-deepseek-v4-sm89" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
