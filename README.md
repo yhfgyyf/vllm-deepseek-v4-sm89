@@ -24,10 +24,8 @@
 
 ### 2026-09-03
 
-- 修复 Docker 镜像中 FlashInfer sampling JIT 缺少 `curand.h`，以及 sparse
-  MLA autotune 编译 `trtllm_utils` 时缺少 `cublasLt.h` 的问题。
-- 保留 vLLM 模型预热所需的 `torchvision`，并发布修复后的 Vision7 镜像；
-  本镜像不包含尚未完成验证的 Qwen3.8-Flash-Next / `qwen4_exp` 适配代码。
+- 更新 SM89+SM120 Docker 镜像，修复
+  [Issue #95](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/95) 反馈的问题。
 
 ### 2026-09-02
 
@@ -116,7 +114,7 @@ vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashI
 镜像地址：
 
 ```text
-crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed
+crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
 ```
 
 | 项目 | 值 |
@@ -132,10 +130,8 @@ crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek
 
 ```bash
 docker pull \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
 ```
-
-原有的 `0.28.1rc0-vision7-sm89-sm120-cu130` 标签也已更新到同一镜像。
 
 镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
 `vllm serve /path/to/model` 替换为：
@@ -144,16 +140,11 @@ docker pull \
 docker run --rm --gpus all --ipc=host \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
-  -v /path/to/vllm-cache:/root/.cache/vllm \
-  -v /path/to/flashinfer-cache:/root/.cache/flashinfer \
-  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130-fixed \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130 \
   /models/model-directory
 ```
 
-其余模型参数保持不变。首次遇到新的 GPU 架构或模型 shape 时，FlashInfer 会进行
-JIT 编译和 autotune；挂载上述两个缓存目录可以在后续启动时复用结果。镜像已完成
-SM120 sampling、DeepSeek-V4/GLM sparse MLA autotune 和服务启动验证，并完成
-SM89 sampling、sparse MLA 与 `trtllm_utils` 目标编译验证。
+其余模型参数保持不变。镜像已完成 SM120 GPU 运行验证和 SM89 目标编译验证。
 
 ---
 
