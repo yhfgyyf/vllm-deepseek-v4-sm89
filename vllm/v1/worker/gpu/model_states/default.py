@@ -60,6 +60,7 @@ class DefaultModelState(ModelState):
         self.mm_pruner = maybe_create_mm_pruner(
             self.model_config, model, self.rope_state, encoder_cache
         )
+        self._mm_prefix_prompt_token_ids: dict[str, list[int]] = {}
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         if self.rope_state is not None:
@@ -77,10 +78,23 @@ class DefaultModelState(ModelState):
             )
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.add_request(req_index, new_req_data)
+        if self._uses_explicit_mm_prefix_tokens():
+            assert new_req_data.prefill_token_ids is not None
+            self._mm_prefix_prompt_token_ids[new_req_data.req_id] = (
+                new_req_data.prefill_token_ids
+            )
 
     def remove_request(self, req_id: str) -> None:
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
+        self._mm_prefix_prompt_token_ids.pop(req_id, None)
+
+    def _uses_explicit_mm_prefix_tokens(self) -> bool:
+        hf_config = self.model_config.hf_config
+        return (
+            getattr(hf_config, "vllm_mm_prefix_start_token_id", None) is not None
+            and getattr(hf_config, "vllm_mm_prefix_end_token_id", None) is not None
+        )
 
     def apply_staged_writes(self) -> None:
         if self.rope_state is not None:
@@ -204,6 +218,17 @@ class DefaultModelState(ModelState):
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                prompt_token_ids_by_req=self._mm_prefix_prompt_token_ids,
+                start_token_id=getattr(
+                    self.model_config.hf_config,
+                    "vllm_mm_prefix_start_token_id",
+                    None,
+                ),
+                end_token_id=getattr(
+                    self.model_config.hf_config,
+                    "vllm_mm_prefix_end_token_id",
+                    None,
+                ),
             )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

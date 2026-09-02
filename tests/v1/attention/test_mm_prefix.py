@@ -19,12 +19,16 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
-from vllm.v1.worker.gpu.attn_utils import extract_mm_prefix_ranges
+from vllm.v1.worker.gpu.attn_utils import (
+    compute_mm_prefix_ranges,
+    extract_mm_prefix_ranges,
+)
 
 
 def _fa4_available() -> bool:
@@ -99,8 +103,6 @@ def _query_ranges(mm_ranges, query_lens, seq_lens):
 
 
 def test_explicit_prefix_tokens_exclude_leading_pad_from_range():
-    from vllm.multimodal.inputs import PlaceholderRange
-
     vocab_size = 129280
     prompt_token_ids = [
         11,
@@ -124,6 +126,42 @@ def test_explicit_prefix_tokens_exclude_leading_pad_from_range():
     assert query_ranges is not None
     assert query_ranges.tolist()[1] == [-1, -1]
     assert query_ranges.tolist()[2] == [2, 6]
+
+
+def test_compute_mm_prefix_ranges_uses_explicit_prefix_tokens():
+    vocab_size = 129280
+    req_id = "req-0"
+    prompt_token_ids = [
+        11,
+        vocab_size + 1,
+        vocab_size,
+        vocab_size + 2,
+        vocab_size + 3,
+        vocab_size + 1,
+        vocab_size + 4,
+        12,
+    ]
+    mm_features = {
+        req_id: [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-0",
+                mm_position=PlaceholderRange(offset=1, length=6),
+            )
+        ]
+    }
+
+    ranges = compute_mm_prefix_ranges(
+        req_ids=[req_id],
+        mm_features=mm_features,
+        sliding_window=1,
+        prompt_token_ids_by_req={req_id: prompt_token_ids},
+        start_token_id=vocab_size,
+        end_token_id=vocab_size + 4,
+    )
+
+    assert ranges == {0: [(2, 6)]}
 
 
 def test_matches_range_scan_semantics_with_context_offset():

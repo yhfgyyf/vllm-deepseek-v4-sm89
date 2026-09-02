@@ -6,8 +6,25 @@ import pytest
 import torch
 
 
-def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride():
-    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+def test_deepseek_v4_swa_backend_supports_mm_prefix():
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+
+    assert DeepseekSparseSWABackend.supports_mm_prefix()
+
+
+@pytest.mark.parametrize("sm120", [False, True])
+def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride(
+    monkeypatch: pytest.MonkeyPatch,
+    sm120: bool,
+):
+    from vllm.models.deepseek_v4 import sparse_mla
+    from vllm.platforms.interface import DeviceCapability
+
+    monkeypatch.setattr(
+        sparse_mla.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(12, 0) if sm120 else DeviceCapability(10, 0),
+    )
 
     device = torch.device("cuda")
     capacity_width = 512
@@ -29,12 +46,18 @@ def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride():
         decode_lens_buffer=torch.empty(2, dtype=torch.int32, device=device),
         prefill_buffer=prefill_buffer,
     )
-    captured_decode, _, captured_prefill = build_c128a_topk_metadata(
+    captured_decode, _, captured_prefill = sparse_mla.build_c128a_topk_metadata(
         max_compressed_tokens=256,
         **kwargs,
     )
-    assert captured_decode.shape == captured_prefill.shape == (2, 256)
+    # SM120 keeps the decode view contiguous across the full buffer width;
+    # other backends get the active-width slice. The prefill view is always
+    # narrowed.
+    expected_decode_width = capacity_width if sm120 else 256
+    assert captured_decode.shape == (2, expected_decode_width)
+    assert captured_prefill.shape == (2, 256)
     assert captured_decode.stride(0) == captured_prefill.stride(0) == capacity_width
+    assert captured_decode.is_contiguous() == sm120
 
     captured_rows = torch.empty((4, 4), dtype=torch.int32, device=device)
     captured_rows[:2].copy_(captured_decode[:, :4])
@@ -47,7 +70,7 @@ def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride():
 
     global_decode_buffer.fill_(-99)
     prefill_buffer.fill_(-99)
-    build_c128a_topk_metadata(
+    sparse_mla.build_c128a_topk_metadata(
         max_compressed_tokens=128,
         **kwargs,
     )
@@ -236,10 +259,12 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
     builder_calls = 0
+    captured_mm_prefix_ranges = []
 
     def fake_build(*args, **kwargs):
         nonlocal builder_calls
         builder_calls += 1
+        captured_mm_prefix_ranges.append(kwargs.get("mm_prefix_query_ranges"))
         return (
             torch.tensor([[builder_calls]], dtype=torch.int32),
             torch.tensor([builder_calls], dtype=torch.int32),
@@ -275,6 +300,9 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
             num_prefills=1,
             num_decode_tokens=1,
             num_prefill_tokens=2,
+            mm_prefix_query_ranges=torch.tensor(
+                [[-1, -1], [1, 2], [1, 2]], dtype=torch.int32
+            ),
         )
 
     def make_flashmla_metadata():
@@ -374,6 +402,7 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
     )
 
     assert builder_calls == 4
+    assert all(ranges is not None for ranges in captured_mm_prefix_ranges)
     assert sparse_indices_third is not sparse_indices_fourth
     assert sparse_lens_third is not sparse_lens_fourth
 
@@ -534,7 +563,7 @@ def _golden_swa_rows(
 
 def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
     from vllm.v1.attention.backends.mla.sparse_swa import (
-        _compute_swa_indices_and_lens_kernel,
+        _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
     )
 
     device = torch.device("cuda")
@@ -558,9 +587,8 @@ def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
 
     swa_indices = torch.empty((8, index_width), dtype=torch.int32, device=device)
     swa_lens = torch.empty((8,), dtype=torch.int32, device=device)
-    _compute_swa_indices_and_lens_kernel[(8,)](
+    _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
         swa_indices,
-        swa_indices.stride(0),
         swa_lens,
         window_size,
         index_width,
@@ -569,12 +597,11 @@ def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
         torch.tensor(token_to_req, dtype=torch.int32, device=device),
         torch.ones((8,), dtype=torch.bool, device=device),
         torch.tensor(block_table, dtype=torch.int32, device=device),
-        len(block_table[0]),
         block_size,
         torch.tensor(mm_ranges, dtype=torch.int32, device=device),
         True,
+        num_tokens=8,
         token_offset=0,
-        TRITON_BLOCK_SIZE=8,
     )
 
     expected_rows, expected_lens = _golden_swa_rows(

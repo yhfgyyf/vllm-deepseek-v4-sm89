@@ -66,7 +66,12 @@ def _torch_topk_softplus_sqrt(
         biased_topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=True)[1]
         topk_ids = torch.where(image_mask.unsqueeze(-1), biased_topk_ids, hash_topk_ids)
     else:
-        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=True)[1]
+        # Match the fused kernel's deterministic tie-break: lower expert ids
+        # win when scores are equal. torch.topk does not guarantee which tied
+        # index it selects at the k-th boundary.
+        topk_ids = torch.argsort(
+            scores_for_choice, dim=-1, descending=True, stable=True
+        )[:, :topk]
 
     topk_weights = original_scores.gather(1, topk_ids.long())
     if renormalize:
@@ -74,6 +79,19 @@ def _torch_topk_softplus_sqrt(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def test_torch_topk_softplus_sqrt_breaks_ties_by_expert_id():
+    gating_output = torch.tensor([[2.0, 1.0, 1.0, 0.0]])
+
+    _, topk_ids = _torch_topk_softplus_sqrt(
+        gating_output,
+        topk=2,
+        renormalize=False,
+        routed_scaling_factor=1.0,
+    )
+
+    assert topk_ids.tolist() == [[0, 1]]
 
 
 def test_sqrtsoftplus_bias_uses_deepseek_v4_routing_method():
@@ -478,6 +496,8 @@ def test_fused_topk_softplus_sqrt_padding(
     indices_dtype = torch.int32
 
     gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    # Exercise top-k cutoff ties without relying on random low-precision collisions.
+    gating_output[0] = 0
 
     padding_rows = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
     padding_rows[1::2] = True

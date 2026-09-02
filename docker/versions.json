@@ -71,13 +71,13 @@
       "default": "true"
     },
     "FLASHINFER_VERSION": {
-      "default": "0.6.18rc10"
+      "default": "0.6.18"
     },
     "FLASHINFER_RELEASE_TAG": {
-      "default": "v0.6.18rc10"
+      "default": "v0.6.18"
     },
     "FLASHINFER_GLM_PYTHON_WHEEL_URL": {
-      "default": "https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=2bb642881118be275914546162782539138db3ddbda07ee8c759418001e59851"
+      "default": "https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc0-vision-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.vision1.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=72b774b474b7f961c2993b9cdd2337d2bec7c70560d508fee654f3423757863d"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"

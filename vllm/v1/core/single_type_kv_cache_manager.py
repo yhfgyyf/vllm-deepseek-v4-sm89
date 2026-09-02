@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -75,6 +76,9 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # Hybrid fine-grained lookup may lower this after all participating
+        # managers have been validated by the coordinator.
+        self.cache_hit_alignment_tokens = scheduler_block_size
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -87,8 +91,10 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and isinstance(
-            kv_cache_spec, AttentionSpec
+        self._record_new_block_ids = (
+            needs_kv_cache_zeroing
+            and isinstance(kv_cache_spec, AttentionSpec)
+            and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
         self.new_block_ids: list[int] = []
 
@@ -405,6 +411,15 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads = []
         return pending
 
+    def finalize_partial_tail_offload(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        num_in_flight_tokens: int,
+    ) -> tuple[int, KVCacheBlock, int] | None:
+        """Finalize a producer partial tail when its request finishes."""
+        return None
+
     def _apply_cow(
         self,
         request_id: str,
@@ -461,7 +476,7 @@ class SingleTypeKVCacheManager(ABC):
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.cache_hit_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
@@ -923,10 +938,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        # Sliding-window cache hits must stay at the group's physical block
+        # granularity. resolve_block_hashes() converts finer-grained hashes to
+        # that view when the hybrid-cache alignment is smaller than block_size.
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1113,26 +1127,50 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
-class KpoolTailManager(FullAttentionManager):
-    """Fixed 1-block-per-request circular buffer for ``KpoolTailSpec``.
+class CircularBufferManager(FullAttentionManager):
+    """Fixed 1-block-per-request circular buffer manager.
 
-    The GLM-5.3-Flash kpool indexer tail cache holds the incomplete
-    pool's raw K + gate score: exactly one block of ``kpool`` slots per request,
-    overwritten in place by ``pos % kpool`` as decode/spec-decode advances.
-    Prefill seeds it; the connector transfers it across PD; decode reads it to
-    compress the boundary pool correctly.
-
-    This manager allocates that single block on first admission and reuses it
-    for the request's whole lifetime. It **never skips, never prunes, never
-    prefix-caches**. The no-prune guarantee is load-bearing:
-    ``SlidingWindowManager.remove_skipped_blocks`` would evict the in-progress
-    pool's earlier tokens mid-pool (before completion, before PD transfer),
-    which is fatal. Because the block is circularly reused, allocation is
-    independent of sequence length and of MTP size (MTP > kpool still fits in
-    one block: completed pools flush mid-step).
+    The block is allocated on first admission and reused for the request's
+    lifetime. It never skips, prunes, grows with sequence length, or hashes
+    blocks into the prefix cache.
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+
+    def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks:
+            return []
+        new_blocks = self.block_pool.get_new_blocks(1)
+        req_blocks.extend(new_blocks)
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(block.block_id for block in new_blocks)
+        return new_blocks
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        return 0 if self.req_to_blocks.get(request_id) else 1
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        return self._claim_ring_block(request_id)
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        self._claim_ring_block(request_id)
 
     @classmethod
     def find_longest_cache_hit(
@@ -1147,9 +1185,7 @@ class KpoolTailManager(FullAttentionManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        # Tail state is per-request transient (circularly overwritten), so it is
-        # neither shareable nor a stable function of a shareable prefix.
-        return tuple([] for _ in range(len(kv_cache_group_ids))), 0
+        return tuple([] for _ in kv_cache_group_ids), 0
 
     def cache_blocks(
         self,
@@ -1157,53 +1193,7 @@ class KpoolTailManager(FullAttentionManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
-        # Never hash tail blocks into the prefix cache.
         return
-
-    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        return 0
-
-    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        # The single block holds the in-progress pool for the whole request; no
-        # token is ever out of window.
-        return 0
-
-    def remove_skipped_blocks(
-        self,
-        request_id: str,
-        processed_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
-    ) -> None:
-        # Never prune mid-request; the block is freed on request completion.
-        return
-
-    def get_num_blocks_to_allocate(
-        self,
-        request_id: str,
-        num_tokens: int,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        total_computed_tokens: int,
-        num_local_computed_tokens: int,
-        num_tokens_main_model: int,
-        apply_admission_cap: bool = False,
-    ) -> int:
-        # Exactly one block per request, reused circularly; never grow.
-        return max(1 - len(self.req_to_blocks.get(request_id, ())), 0)
-
-    def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
-    ) -> list[KVCacheBlock]:
-        # Cap at one block regardless of num_tokens; the kernel reuses its slots
-        # via pos % kpool. No partial-hit CoW path (find_longest_cache_hit never
-        # hits, so _partial_hit_reqs is always empty).
-        req_blocks = self.req_to_blocks[request_id]
-        if len(req_blocks) >= 1:
-            return []
-        new_blocks = self.block_pool.get_new_blocks(1)
-        req_blocks.extend(new_blocks)
-        if self._record_new_block_ids:
-            self.new_block_ids.extend(b.block_id for b in new_blocks)
-        return new_blocks
 
     def add_local_computed_blocks(
         self,
@@ -1212,31 +1202,30 @@ class KpoolTailManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        # The tail never has local prefix-cache hits (find_longest_cache_hit
-        # returns none); external (PD-transferred) tokens are handled by
-        # allocate_external_computed_blocks below.
         return
 
-    def allocate_external_computed_blocks(
+    def remove_skipped_blocks(
         self,
         request_id: str,
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
     ) -> None:
-        # The tail is a fixed 1-block circular buffer; PD-transferred
-        # (external) tokens do not grow it -- the kernel reuses the single
-        # block's slots via pos % kpool. The base FullAttention path would
-        # allocate cdiv(num_external, block_size) blocks (one per kpool
-        # tokens), which (a) wastes blocks and (b) mismatches the producer's
-        # 1-block transfer and trips the NIXL reconcile block-count assert.
-        # Cap at one block, matching allocate_new_blocks / the producer.
-        req_blocks = self.req_to_blocks[request_id]
-        if len(req_blocks) >= 1:
-            return
-        new_blocks = self.block_pool.get_new_blocks(1)
-        req_blocks.extend(new_blocks)
-        if self._record_new_block_ids:
-            self.new_block_ids.extend(b.block_id for b in new_blocks)
+        return
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        return 0
+
+
+class KpoolTailManager(CircularBufferManager):
+    """GLM-5.3-Flash kpool tail ring manager.
+
+    The tail cache holds the incomplete pool's raw K plus gate score in exactly
+    one block per request. Reusing ``CircularBufferManager`` keeps PD/NIXL
+    transfer block counts capped to the producer's single transferred block.
+    """
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
@@ -1421,10 +1410,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # current allocation.
             self._num_checkpoint_blocks: dict[str, int] = {}
             # Requests that registered their own last-prompt-boundary partial
-            # tail (producers). On the next step's CoW the boundary state moves
-            # into a private cow_block; we record that block for connector
-            # offload (see _pending_boundary_state_offloads).
-            self._producer_partial_tail_reqs: dict[str, int] = {}
+            # tail (producers). A later CoW hands its private copy to the
+            # connector; a request that finishes first hands off this table
+            # source directly.
+            self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1787,10 +1776,12 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
-                        boundary_tokens = self._producer_partial_tail_reqs.pop(
+                        producer_tail = self._producer_partial_tail_reqs.pop(
                             request_id, None
                         )
-                        if boundary_tokens is not None:
+                        if producer_tail is not None:
+                            marker_block, boundary_tokens = producer_tail
+                            assert marker_block is source_block
                             # This CoW preserved a producer's own boundary
                             # state in cow_block; hand it to the connector for
                             # partial-tail offload once the copy has run.
@@ -1825,6 +1816,22 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         req_blocks.append(block)
         req_blocks[block_idx] = self._null_block
+
+    def finalize_partial_tail_offload(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        num_in_flight_tokens: int,
+    ) -> tuple[int, KVCacheBlock, int] | None:
+        if self.mamba_cache_mode != "align":
+            return None
+        producer_tail = self._producer_partial_tail_reqs.pop(request_id, None)
+        if producer_tail is None:
+            return None
+        source_block, boundary_tokens = producer_tail
+        if num_in_flight_tokens != 0 or num_computed_tokens != boundary_tokens:
+            return None
+        return self.kv_cache_group_id, source_block, boundary_tokens
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
@@ -1932,7 +1939,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # in ``source_block`` but the next step's forward overwrites it. The
             # upcoming CoW copies it into a durable cow_block; record the req so
             # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            self._producer_partial_tail_reqs[request.request_id] = (
+                source_block,
+                num_tokens,
+            )
         return partial_hash
 
 
@@ -2082,6 +2092,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowSpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowSpec,
+    )
+    KVCacheSpecRegistry.register(
+        CircularBufferSpec,
+        CircularBufferManager,
+        uniform_type_base_spec=CircularBufferSpec,
     )
     KVCacheSpecRegistry.register(
         SlidingWindowMLASpec,

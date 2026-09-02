@@ -239,7 +239,13 @@ def init_kv_cache(
         in ("longcat_flash", "longcat_flash_ngram")
         else 1
     )
-    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
+    bind_kv_cache(
+        kv_caches,
+        forward_context,
+        runner_kv_caches,
+        num_attn_module,
+        kv_cache_groups=kv_cache_config.kv_cache_groups,
+    )
     return kv_caches
 
 
@@ -351,20 +357,38 @@ def compute_mm_prefix_ranges(
     req_ids: list[str],
     mm_features: dict[str, list[MultiModalFeatureSpec]],
     sliding_window: int | None = None,
+    prompt_token_ids_by_req: Mapping[str, Sequence[int]] | None = None,
+    start_token_id: int | None = None,
+    end_token_id: int | None = None,
 ) -> dict[int, list[tuple[int, int]]]:
     """Compute PrefixLM bidirectional ranges for multimodal tokens.
 
     Ranges exceeding sliding_window are skipped to prevent early tokens
     from attending across the entire image span.
     """
+    has_explicit_prefix_tokens = start_token_id is not None and end_token_id is not None
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
     for req_idx, req_id in enumerate(req_ids):
         image_doc_ranges = []
         for mm_feature in mm_features.get(req_id, ()):
             if mm_feature.modality not in ("image", "video"):
                 continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
+            ranges = extract_mm_prefix_ranges(
+                mm_feature.mm_position,
+                prompt_token_ids=(
+                    None
+                    if prompt_token_ids_by_req is None
+                    else prompt_token_ids_by_req.get(req_id)
+                ),
+                start_token_id=start_token_id,
+                end_token_id=end_token_id,
+            )
+            for r in ranges:
+                if (
+                    not has_explicit_prefix_tokens
+                    and sliding_window is not None
+                    and (r[1] - r[0] + 1) > sliding_window
+                ):
                     continue
                 image_doc_ranges.append(r)
         req_doc_ranges[req_idx] = image_doc_ranges
