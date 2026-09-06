@@ -922,10 +922,15 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
-    # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
+    # Triton cannot currently bind E8M0 scale tensors directly.
     # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
     # so decode them to fp32 before launching the kernel.
-    if current_platform.is_rocm() or current_platform.is_xpu():
+    if current_platform.is_cuda():
+        if As.dtype == torch.float8_e8m0fnu:
+            As = As.to(torch.float32).contiguous()
+        if Bs.dtype == torch.float8_e8m0fnu:
+            Bs = Bs.to(torch.float32).contiguous()
+    elif current_platform.is_rocm() or current_platform.is_xpu():
         if As.dtype == torch.float8_e8m0fnu:
             As = _upcast_e8m0_to_fp32(As).contiguous()
         if Bs.dtype == torch.float8_e8m0fnu:

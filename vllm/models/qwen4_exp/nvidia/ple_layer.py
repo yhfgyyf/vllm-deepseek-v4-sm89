@@ -321,6 +321,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 quant_config, f"{prefix}.ngram_embedding"
             ),
         )
+        self.embedding_output_dtype = self.ngram_embedding.weight.dtype
 
     @staticmethod
     def _shift_precompute(
@@ -451,7 +452,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids,
             self.layer_name,
         )
-        return self.ngram_embedding(ngram_ids).flatten(-2)
+        output = ngram_ids.new_empty(
+            (ngram_ids.shape[0], self.embedding_dim),
+            dtype=self.embedding_output_dtype,
+        )
+        torch.ops.vllm.qwen4_exp_ple_ngram_embedding(
+            ngram_ids,
+            output,
+            self.layer_name,
+        )
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -879,6 +889,27 @@ def qwen4_exp_compute_ple_ngram_ids_fake(
     return
 
 
+def qwen4_exp_ple_ngram_embedding(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the large PLE embedding lookup outside Inductor's FX graph."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
+def qwen4_exp_ple_ngram_embedding_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual_output: torch.Tensor,
@@ -901,6 +932,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_compute_ple_ngram_ids,
     mutates_args=["output"],
     fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_ngram_embedding",
+    op_func=qwen4_exp_ple_ngram_embedding,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_ngram_embedding_fake,
 )
 
 

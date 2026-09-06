@@ -820,6 +820,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             else:
                 extra_sparse_indices = attn_metadata.c128a_global_decode_topk_indices
                 extra_sparse_lengths = attn_metadata.c128a_decode_topk_lens
+                if extra_sparse_indices is not None:
+                    # Adaptive C128 views retain the capacity row stride, but
+                    # both FlashInfer sparse paths require packed index rows.
+                    extra_sparse_indices = extra_sparse_indices.contiguous()
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens

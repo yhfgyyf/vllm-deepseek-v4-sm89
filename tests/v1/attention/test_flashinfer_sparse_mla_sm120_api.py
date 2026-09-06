@@ -13,6 +13,7 @@ from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.attention import (
     sparse_mla_attention as sparse_attention_module,
 )
+from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as dsv4_sparse_module
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
     DeepseekV4FlashInferSM120Attention,
@@ -131,6 +132,132 @@ def test_sm120_backend_uses_dedicated_backend_name() -> None:
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120.get_class()
         is FlashInferMLASparseSM120Backend
     )
+
+
+@pytest.mark.parametrize("num_tokens", [40, 65, 128, 144, 256, 288])
+@pytest.mark.parametrize("capacity", [128, 1024])
+def test_dsv4_c128_decode_packs_adaptive_index_rows(
+    monkeypatch, num_tokens: int, capacity: int
+) -> None:
+    """The FlashInfer consumer must not interpret capacity stride as top-k."""
+    backing = torch.arange(num_tokens * capacity, dtype=torch.int32).view(
+        num_tokens, capacity
+    )
+    indices = backing[:, :128].view(num_tokens, 1, 128)
+    lengths = torch.ones(num_tokens, dtype=torch.int32)
+    q = torch.empty((num_tokens, 8, 512), dtype=torch.bfloat16)
+    cache = torch.empty(0, dtype=torch.uint8)
+    attn = SimpleNamespace(
+        compress_ratio=128,
+        swa_cache_layer=SimpleNamespace(kv_cache=cache),
+        _prepare_query=lambda query, output: query,
+        _as_sparse_cache=lambda value: value,
+        _get_workspace=lambda device: cache,
+        scale=512**-0.5,
+        attn_sink=None,
+    )
+    swa = SimpleNamespace(
+        num_decodes=num_tokens,
+        num_decode_tokens=num_tokens,
+        is_valid_token=torch.ones(num_tokens, dtype=torch.bool),
+        decode_swa_indices=torch.zeros((num_tokens, 1, 128), dtype=torch.int32),
+        decode_swa_lens=lengths,
+    )
+    metadata = SimpleNamespace(
+        c128a_global_decode_topk_indices=indices,
+        c128a_decode_topk_lens=lengths,
+    )
+
+    def check_call(**kwargs):
+        packed = kwargs["extra_sparse_indices"]
+        assert packed.is_contiguous()
+        torch.testing.assert_close(packed, indices)
+        assert kwargs["extra_sparse_topk_lens"] is lengths
+        if indices.is_contiguous():
+            assert packed.data_ptr() == indices.data_ptr()
+
+    monkeypatch.setattr(
+        dsv4_sparse_module, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", check_call
+    )
+    for increment in (0, 17):
+        backing.add_(increment)
+        DeepseekV4FlashInferSM120Attention._forward_decode(
+            attn, q, cache, swa, metadata, False, torch.empty_like(q)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA.")
+@pytest.mark.parametrize("num_tokens", [40, 65, 128, 256])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+def test_dsv4_c128_cuda_graph_reads_updated_strided_indices(
+    num_tokens: int, num_heads: int
+) -> None:
+    """Packing C128 rows must stay live across speculative decode graph replay."""
+    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0), (12, 1)):
+        pytest.skip("Requires native SM89/SM12x FlashInfer sparse MLA.")
+    pytest.importorskip("flashinfer")
+    attention = DeepseekV4FlashInferSM120Attention
+    device = torch.device("cuda")
+    main_cache = torch.zeros((1, 256, 584), dtype=torch.uint8, device=device)
+    extra_cache = torch.zeros((1, 2, 584), dtype=torch.uint8, device=device)
+    # Two exact DSV4 footer-format KV rows: -1 and +1, with unit E8M0 scales.
+    signs = torch.tensor([-1, 1], dtype=torch.bfloat16, device=device)[:, None]
+    data = extra_cache.flatten()[: 2 * 576].view(2, 576)
+    data[:, :448] = signs.to(torch.float8_e4m3fn).view(torch.uint8)
+    data[:, 448:] = signs.expand(2, 64).contiguous().view(torch.uint8)
+    extra_cache.flatten()[2 * 576 :].fill_(127)
+
+    backing = torch.zeros((num_tokens, 1024), dtype=torch.int32, device=device)
+    indices = backing[:, :128].view(num_tokens, 1, 128)
+    indices[:, :, 0] = 1
+    lengths = torch.ones(num_tokens, dtype=torch.int32, device=device)
+    q = torch.zeros(
+        (num_heads, num_tokens, 512), dtype=torch.bfloat16, device=device
+    ).transpose(0, 1)
+    output = torch.empty((num_tokens, num_heads, 512), dtype=q.dtype, device=device)
+    workspace = torch.empty(32 << 20, dtype=torch.uint8, device=device)
+    attn = SimpleNamespace(
+        compress_ratio=128,
+        kv_cache_torch_dtype=torch.uint8,
+        swa_cache_layer=SimpleNamespace(kv_cache=main_cache),
+        _as_sparse_cache=attention._as_sparse_cache,
+        _get_workspace=lambda device: workspace,
+        scale=512**-0.5,
+        attn_sink=None,
+    )
+    attn._prepare_query = lambda query, out: attention._prepare_query(attn, query, out)
+    swa = SimpleNamespace(
+        num_decodes=num_tokens,
+        num_decode_tokens=num_tokens,
+        is_valid_token=torch.ones(num_tokens, dtype=torch.bool, device=device),
+        decode_swa_indices=torch.full(
+            (num_tokens, 1, 128), -1, dtype=torch.int32, device=device
+        ),
+        decode_swa_lens=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+    )
+    metadata = SimpleNamespace(
+        c128a_global_decode_topk_indices=indices,
+        c128a_decode_topk_lens=lengths,
+    )
+
+    def run():
+        attention._forward_decode(attn, q, extra_cache, swa, metadata, False, output)
+
+    run()
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for slot in (0, 1):
+        indices[:, :, 0] = slot
+        graph.replay()
+        torch.testing.assert_close(
+            output, torch.full_like(output, 2 * slot - 1), rtol=0, atol=0
+        )
+    lengths.zero_()
+    graph.replay()
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
 
 def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
@@ -325,8 +452,10 @@ def test_glm_nope_uses_native_scale_format() -> None:
     assert _kv_scale_format_for_model("deepseek_v3", 128, 64, 512) == "pow2_fp32"
 
 
+@pytest.mark.parametrize("num_tokens", [2, 96, 112, 192, 224])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
 def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
-    monkeypatch,
+    monkeypatch, num_tokens: int, num_heads: int
 ) -> None:
     _mock_single_tp(monkeypatch)
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
@@ -339,7 +468,10 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
         lambda device: torch.empty(1024, dtype=torch.uint8, device=device),
     )
 
-    converted_topk = torch.arange(2 * 192, dtype=torch.int32).reshape(2, 192)
+    topk = 2176
+    converted_topk = torch.arange(num_tokens * topk, dtype=torch.int32).reshape(
+        num_tokens, topk
+    )
     convert_call: dict[str, Any] = {}
 
     def fake_convert_req_index_to_global_index(
@@ -349,7 +481,7 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
         convert_call["block_table"] = block_table
         convert_call["topk_indices"] = topk_indices
         convert_call["kwargs"] = kwargs
-        return converted_topk, torch.tensor([192, 191], dtype=torch.int32)
+        return converted_topk, torch.full((num_tokens,), topk, dtype=torch.int32)
 
     monkeypatch.setattr(
         sparse_module,
@@ -362,7 +494,7 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
     def fake_decode(**kwargs):
         decode_call.update(kwargs)
         return torch.zeros(
-            (2, 1, 32, 512),
+            (num_tokens, 1, num_heads, 512),
             dtype=kwargs["query"].dtype,
             device=kwargs["query"].device,
         )
@@ -374,12 +506,14 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
         SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=fake_decode),
     )
 
-    topk_indices = torch.arange(3 * 192, dtype=torch.int32).reshape(3, 192)
+    topk_indices = torch.arange((num_tokens + 1) * topk, dtype=torch.int32).reshape(
+        num_tokens + 1, topk
+    )
     with set_current_vllm_config(
         _fake_vllm_config("glm5_next", qk_nope_head_dim=256, qk_rope_head_dim=0)
     ):
         impl = FlashInferMLASparseSM120Impl(
-            num_heads=32,
+            num_heads=num_heads,
             head_size=512,
             scale=0.25,
             num_kv_heads=1,
@@ -399,10 +533,16 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
             kv_b_proj=SimpleNamespace(),
         )
 
-    q = torch.zeros((2, 32, 512), dtype=torch.bfloat16)
+    # MLA absorption produces head-major latent Q; NoPE still passes an empty
+    # RoPE component. The consumer must pack the concatenated query rows.
+    latent_q = torch.zeros((num_heads, num_tokens, 512), dtype=torch.bfloat16)
+    q = (
+        latent_q.transpose(0, 1),
+        torch.empty((num_tokens, num_heads, 0), dtype=torch.bfloat16),
+    )
     kv_cache = torch.empty((7, 64, 528), dtype=torch.uint8)
     metadata = SimpleNamespace(
-        req_id_per_token=torch.tensor([0, 1, 0], dtype=torch.int32),
+        req_id_per_token=torch.zeros(num_tokens + 1, dtype=torch.int32),
         block_table=torch.arange(4, dtype=torch.int32).reshape(2, 2),
         block_size=64,
         topk_tokens=128,
@@ -412,14 +552,15 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
     out, lse = impl.forward_mqa(q, kv_cache, metadata, SimpleNamespace())
 
     assert lse is None
-    assert out.shape == (2, 32, 512)
-    assert convert_call["topk_indices"].shape == (2, 192)
-    assert convert_call["kwargs"]["NUM_TOPK_TOKENS"] == 192
-    assert decode_call["query"].shape == (2, 1, 32, 512)
+    assert out.shape == (num_tokens, num_heads, 512)
+    assert convert_call["topk_indices"].shape == (num_tokens, topk)
+    assert convert_call["kwargs"]["NUM_TOPK_TOKENS"] == topk
+    assert decode_call["query"].shape == (num_tokens, 1, num_heads, 512)
+    assert decode_call["query"].is_contiguous()
     assert decode_call["kv_cache"].shape == (7, 1, 64, 528)
-    assert decode_call["block_tables"].shape == (2, 1, 192)
-    assert decode_call["max_seq_len"] == 192
-    assert decode_call["sparse_mla_top_k"] == 192
+    assert decode_call["block_tables"].shape == (num_tokens, 1, topk)
+    assert decode_call["max_seq_len"] == topk
+    assert decode_call["sparse_mla_top_k"] == topk
     assert decode_call["kv_scale_format"] == "arbitrary_fp32_nope"
     assert decode_call["bmm1_scale"] == 0.25
     assert decode_call["bmm2_scale"] == 1.0

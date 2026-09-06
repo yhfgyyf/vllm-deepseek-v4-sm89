@@ -19,6 +19,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     _run_b12x_fp8_block_scaled_mm,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
+from vllm.model_executor.layers.quantization.utils import fp8_utils
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     w8a8_triton_block_scaled_mm,
@@ -36,8 +37,8 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.import_utils import has_deep_gemm
 
-if current_platform.get_device_capability() < (9, 0):
-    pytest.skip("FP8 Triton requires CUDA 9.0 or higher", allow_module_level=True)
+if current_platform.get_device_capability() < (8, 9):
+    pytest.skip("FP8 Triton requires CUDA 8.9 or higher", allow_module_level=True)
 
 vllm_config = VllmConfig()
 
@@ -159,7 +160,111 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="CUDA E8M0 conversion requires SM89 or higher.",
+)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_w8a8_block_fp8_cuda_decodes_e8m0_before_launch(monkeypatch, device):
+    captured_scales: list[torch.Tensor] = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                captured_scales.extend((args[3], args[4]))
+
+            return launch
+
+    monkeypatch.setattr(fp8_utils, "_w8a8_triton_block_scaled_mm", FakeKernel())
+    monkeypatch.setattr(fp8_utils, "get_w8a8_block_fp8_configs", lambda *args: None)
+
+    scale_codes = torch.tensor(
+        [0, 1, 127, 254, 255], dtype=torch.uint8, device=device
+    ).view(torch.float8_e8m0fnu)
+    A = torch.ones((5, 128), dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
+    B = A.clone()
+    As = scale_codes[:, None]
+    Bs = scale_codes[:, None]
+
+    fp8_utils.w8a8_triton_block_scaled_mm(A, B, As, Bs, [1, 128], torch.bfloat16)
+
+    expected_finite = torch.tensor(
+        [2.0**-127, 2.0**-126, 1.0, 2.0**127],
+        dtype=torch.float32,
+        device=device,
+    )
+    assert len(captured_scales) == 2
+    for decoded in captured_scales:
+        assert decoded.dtype == torch.float32
+        assert decoded.is_contiguous()
+        torch.testing.assert_close(decoded[:4, 0], expected_finite, rtol=0, atol=0)
+        assert torch.isnan(decoded[4, 0])
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="CUDA graph regression requires SM89 or higher.",
+)
+@pytest.mark.parametrize(
+    ("As_dtype", "Bs_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float32, torch.float8_e8m0fnu),
+        (torch.float8_e8m0fnu, torch.float32),
+        (torch.float8_e8m0fnu, torch.float8_e8m0fnu),
+    ],
+    ids=["fp32-fp32", "fp32-e8m0", "e8m0-fp32", "e8m0-e8m0"],
+)
+@pytest.mark.parametrize("M", [8, 128, 256])
+@torch.inference_mode()
+def test_w8a8_block_fp8_matmul_scale_cuda_graph(M, As_dtype, Bs_dtype):
+    N, K = 128, 256
+    block_size = [128, 128]
+    out_dtype = torch.bfloat16
+    torch.manual_seed(0)
+
+    A_fp8 = torch.randn(M, K, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    B_fp8 = torch.randn(N, K, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    As_fp32 = torch.exp2(torch.randint(-8, -4, (M, 2)).to(torch.float32))
+    Bs_fp32 = torch.exp2(torch.randint(-8, -4, (1, 2)).to(torch.float32))
+    As = As_fp32.to(As_dtype)
+    Bs = Bs_fp32.to(Bs_dtype)
+
+    reference = native_w8a8_block_matmul(
+        A_fp8, B_fp8, As_fp32, Bs_fp32, block_size, out_dtype
+    )
+    eager_output = w8a8_triton_block_scaled_mm(
+        A_fp8, B_fp8, As, Bs, block_size, out_dtype
+    )
+    rel_diff = torch.mean(torch.abs(eager_output.float() - reference.float()))
+    rel_diff /= torch.mean(torch.abs(reference.float()))
+    assert rel_diff < 0.001
+
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = w8a8_triton_block_scaled_mm(
+            A_fp8, B_fp8, As, Bs, block_size, out_dtype
+        )
+
+    next_As_fp32 = As_fp32 * 2
+    next_Bs_fp32 = Bs_fp32 * 4
+    As.copy_(next_As_fp32.to(As_dtype))
+    Bs.copy_(next_Bs_fp32.to(Bs_dtype))
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    next_reference = native_w8a8_block_matmul(
+        A_fp8, B_fp8, next_As_fp32, next_Bs_fp32, block_size, out_dtype
+    )
+    rel_diff = torch.mean(torch.abs(graph_output.float() - next_reference.float()))
+    rel_diff /= torch.mean(torch.abs(next_reference.float()))
+    assert rel_diff < 0.001
+    assert not torch.equal(graph_output, eager_output)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(90),
+    reason="CUTLASS block FP8 requires SM90 or higher.",
 )
 @torch.inference_mode()
 def test_w8a8_block_fp8_cutlass_matmul():

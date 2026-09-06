@@ -13,6 +13,7 @@ from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.qwen4_exp.nvidia.ple_layer as ple_layer_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
@@ -24,6 +25,7 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLELayer,
     _get_ple_embedding_quant_method,
+    qwen4_exp_ple_ngram_embedding,
 )
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
@@ -270,6 +272,62 @@ def test_ple_fp8_embedding_uses_int8_for_tp_reduce(monkeypatch) -> None:
     assert output.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(output[0].float(), layer.weight[0].float())
     assert torch.count_nonzero(output[1].float()) == 0
+
+
+def test_ple_ngram_embedding_uses_static_forward_context(monkeypatch) -> None:
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = nn.Module()
+    layer.ple_embedding.ngram_embedding = nn.Embedding(4, 2)
+    context = SimpleNamespace(no_compile_layers={"model.layers.1.ple": layer})
+    monkeypatch.setattr(ple_layer_module, "get_forward_context", lambda: context)
+    ngram_ids = torch.tensor([[0, 2], [1, 3]])
+    output = torch.empty(2, 4)
+
+    qwen4_exp_ple_ngram_embedding(
+        ngram_ids,
+        output,
+        "model.layers.1.ple",
+    )
+
+    expected = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    torch.testing.assert_close(output, expected)
+
+
+def test_ple_ngram_embedding_forward_preserves_fp8_dtype(monkeypatch) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.embedding_dim = 4
+    module.ngram_heads = 2
+    module.embedding_output_dtype = torch.float8_e4m3fn
+    module.layer_name = "model.layers.1.ple"
+
+    def compute_ids(input_ids, query_start_loc, ngram_context, output, layer_name):
+        output.zero_()
+
+    def embedding_lookup(ngram_ids, output, layer_name):
+        assert output.dtype == torch.float8_e4m3fn
+        output.fill_(1)
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen4_exp_compute_ple_ngram_ids",
+        compute_ids,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen4_exp_ple_ngram_embedding",
+        embedding_lookup,
+    )
+
+    output = module(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 2]),
+        torch.tensor([[0, 0]]),
+    )
+
+    assert output.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(output.float(), torch.ones(2, 4))
 
 
 def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
