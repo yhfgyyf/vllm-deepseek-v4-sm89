@@ -557,9 +557,13 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 query=query[num_decode_tokens:num_tokens],
                 swa_kv_cache=swa_k_cache,
                 workspace_buffer=workspace,
-                sparse_indices=sparse_indices[num_decode_tokens:num_tokens].contiguous(),
+                sparse_indices=sparse_indices[
+                    num_decode_tokens:num_tokens
+                ].contiguous(),
                 compressed_kv_cache=compressed_kv_cache,
-                sparse_topk_lens=sparse_topk_lens[num_decode_tokens:num_tokens].contiguous(),
+                sparse_topk_lens=sparse_topk_lens[
+                    num_decode_tokens:num_tokens
+                ].contiguous(),
                 seq_lens=seq_lens[num_decodes:num_reqs],
                 out=output[num_decode_tokens:num_tokens],
                 bmm1_scale=bmm1_scale,
@@ -817,7 +821,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             sinks=self.attn_sink,
             kv_layout="NHD",
             swa_topk_lens=swa_lens,
-            extra_sparse_indices=(None if extra_sparse_indices is None else extra_sparse_indices.contiguous()),
+            extra_sparse_indices=(
+                None
+                if extra_sparse_indices is None
+                else extra_sparse_indices.contiguous()
+            ),
             extra_sparse_topk_lens=extra_sparse_lengths,
         )
 
