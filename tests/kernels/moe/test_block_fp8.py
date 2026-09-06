@@ -366,8 +366,8 @@ def _dequant_block_fp8(
 @pytest.mark.parametrize("tp_rank", [0, 1, 2, 3])
 @torch.inference_mode()
 def test_w8a8_block_fp8_fused_moe_refined_block_scales(tp_rank, workspace_init):
-    """TP-misaligned blockwise FP8 MoE (e.g. Qwen4Exp, intermediate
-    640 at TP=4 -> 160 per rank, not divisible by the checkpoint's 128 block).
+    """TP-misaligned blockwise FP8 MoE (intermediate 640 at TP=4 -> 160 per
+    rank, not divisible by the checkpoint's 128 block).
 
     The per-rank scale grid is refined from 128 to 32 (lossless: each 32-block
     lies inside one global 128-block) so the Triton kernel can consume exact

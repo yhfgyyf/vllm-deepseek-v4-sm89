@@ -143,8 +143,8 @@ def _make_mtp_speculative_config(
     checkpoint_value: bool,
 ) -> SpeculativeConfig:
     draft_hf_config = _make_hf_config(
-        architectures=["Qwen4ExpMTP"],
-        model_type="qwen4_exp_mtp",
+        architectures=["Glm5NextMTPModel"],
+        model_type="glm5_next_mtp",
         n_predict=1,
         index_share_for_mtp_iteration=checkpoint_value,
     )

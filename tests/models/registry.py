@@ -509,7 +509,6 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         extras={"native-prefix": "imdatta0/small_qwen3_5_20b"},
         max_model_len=4096,
     ),
-    "Qwen4ExpForCausalLM": _HfExamplesInfo("", is_available_online=False),
     "MellumForCausalLM": _HfExamplesInfo("JetBrains/Mellum2-12B-A2.5B-Base"),
     "Qwen3NextForCausalLM": _HfExamplesInfo(
         "Qwen/Qwen3-Next-80B-A3B-Instruct",
@@ -1355,10 +1354,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "Qwen/Qwen3.5-35B-A3B",
         max_model_len=4096,
     ),
-    "Qwen4ExpForConditionalGeneration": _HfExamplesInfo(
-        "",
-        is_available_online=False,
-    ),
     "Qwen3OmniMoeForConditionalGeneration": _HfExamplesInfo(
         "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         max_model_len=4096,
@@ -1811,7 +1806,6 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         "Qwen/Qwen3.5-35B-A3B",
         speculative_model="Qwen/Qwen3.5-35B-A3B",
     ),
-    "Qwen4ExpMTP": _HfExamplesInfo("", is_available_online=False),
     "Step3p5MTP": _HfExamplesInfo(
         "stepfun-ai/Step-3.5-Flash",
         speculative_model="stepfun-ai/Step-3.5-Flash",

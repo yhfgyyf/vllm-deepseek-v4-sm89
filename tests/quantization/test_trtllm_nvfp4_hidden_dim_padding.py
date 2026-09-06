@@ -111,8 +111,8 @@ def test_align_trtllm_fp4_moe_hidden_dim_pads_to_256_multiple():
 
 
 def test_align_trtllm_fp4_moe_intermediate_pads_gate_and_up_separately():
-    # Qwen3.8-Flash-Next has intermediate_size=640. At TP4 each rank owns
-    # 160 values, which TRTLLM pads to the next 64-value boundary (192).
+    # With intermediate_size=640 and TP4, each rank owns 160 values, which
+    # TRTLLM pads to the next 64-value boundary (192).
     intermediate = 160
     padded_intermediate = 192
     hidden_dim = 32

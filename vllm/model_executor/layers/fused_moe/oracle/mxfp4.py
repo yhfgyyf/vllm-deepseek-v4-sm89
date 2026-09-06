@@ -486,17 +486,16 @@ def _get_requested_backends(
     return _filter_by_activation(backends, requested_activation_key)
 
 
-def _requires_qwen38_tep8_emulation(
+def _requires_gfx950_tep8_shape_emulation(
     config: FusedMoEConfig,
     activation_key: QuantKey | None,
 ) -> bool:
-    """Avoid the inaccurate native gfx950 kernel for Qwen3.8 TEP8.
+    """Avoid an inaccurate native gfx950 kernel for one TEP8 shape.
 
-    Qwen3.8 Flash Next's routed experts use the distinctive
-    ``E=512, H=2560, N=640`` W4A4 shape. With eight-way expert parallelism,
+    For ``E=512, H=2560, N=640`` W4A4 with eight-way expert parallelism,
     AITER operates on 64 local experts and pads ``N`` to 768. That native path
     is not numerically reliable on gfx950, while OCP MX emulation preserves
-    model accuracy. Keep this guard exact so other MXFP4 shapes and smaller EP
+    accuracy. Keep this guard exact so other MXFP4 shapes and smaller EP
     configurations retain the native backend.
     """
     parallel = config.moe_parallel_config
@@ -577,10 +576,10 @@ def select_mxfp4_moe_backend(
         assert last_error is not None
         raise last_error
 
-    if _requires_qwen38_tep8_emulation(config, requested_activation_key):
+    if _requires_gfx950_tep8_shape_emulation(config, requested_activation_key):
         backend = Mxfp4MoeBackend.EMULATION
         logger.warning_once(
-            "Using OCP MX emulation for the Qwen3.8 Flash Next TEP8 routed "
+            "Using OCP MX emulation for E=512, H=2560, N=640 TEP8 routed "
             "experts on gfx950 because the native AITER W4A4 kernel is not "
             "numerically reliable for this shape. Performance will be lower."
         )

@@ -22,6 +22,11 @@
 
 ## Changelog
 
+### 2026-09-03
+
+- 更新 SM89+SM120 Docker 镜像，修复
+  [Issue #95](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/95) 反馈的问题。
+
 ### 2026-09-02
 
 - 修复 [Issue #90](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/90)，
@@ -119,7 +124,7 @@ crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
 | PyTorch / CUDA | `2.13.0+cu130` / CUDA 13.0 JIT toolchain |
 | 镜像大小 | 9.27 GB 未压缩；约 4.33 GB Registry 传输量 |
-| Digest | `sha256:c1e004423863b2a01592e087d94edc7e2e88262408444633ca7904d61c39ebb2` |
+| Digest | `sha256:1a120648d54ebb90aad91bef2a620e5779c627426ad9f0a34367303b4cbe659a` |
 
 直接拉取镜像：
 

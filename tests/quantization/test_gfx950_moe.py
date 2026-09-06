@@ -16,7 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
-    _requires_qwen38_tep8_emulation,
+    _requires_gfx950_tep8_shape_emulation,
     select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -73,7 +73,7 @@ def _make_w4a4_moe_config(moe_backend: str = "auto") -> FusedMoEConfig:
     )
 
 
-def _make_qwen38_tep8_moe_config() -> FusedMoEConfig:
+def _make_tep8_moe_config() -> FusedMoEConfig:
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     return FusedMoEConfig(
@@ -104,22 +104,22 @@ def _make_qwen38_tep8_moe_config() -> FusedMoEConfig:
     )
 
 
-def test_qwen38_tep8_requires_emulation_only_on_gfx950(monkeypatch):
+def test_tep8_requires_emulation_only_on_gfx950(monkeypatch):
     import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as mxfp4_oracle
 
-    config = _make_qwen38_tep8_moe_config()
+    config = _make_tep8_moe_config()
     monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: True)
 
-    assert _requires_qwen38_tep8_emulation(config, kMxfp4Dynamic)
+    assert _requires_gfx950_tep8_shape_emulation(config, kMxfp4Dynamic)
 
     config.moe_parallel_config.ep_size = 4
     config.num_local_experts = 128
-    assert not _requires_qwen38_tep8_emulation(config, kMxfp4Dynamic)
+    assert not _requires_gfx950_tep8_shape_emulation(config, kMxfp4Dynamic)
 
-    config = _make_qwen38_tep8_moe_config()
+    config = _make_tep8_moe_config()
     monkeypatch.setattr(mxfp4_oracle.current_platform, "is_rocm", lambda: False)
-    assert not _requires_qwen38_tep8_emulation(config, kMxfp4Dynamic)
+    assert not _requires_gfx950_tep8_shape_emulation(config, kMxfp4Dynamic)
 
 
 @pytest.mark.parametrize(
@@ -129,7 +129,7 @@ def test_qwen38_tep8_requires_emulation_only_on_gfx950(monkeypatch):
         ("aiter", Mxfp4MoeBackend.AITER_MXFP4_MXFP4),
     ],
 )
-def test_qwen38_tep8_auto_fallback_respects_explicit_backend(
+def test_tep8_auto_fallback_respects_explicit_backend(
     requested_backend,
     expected_backend,
     monkeypatch,
@@ -141,7 +141,7 @@ def test_qwen38_tep8_auto_fallback_respects_explicit_backend(
         def is_supported_config(*args, **kwargs):
             return True, None
 
-    config = _make_qwen38_tep8_moe_config()
+    config = _make_tep8_moe_config()
     config.moe_backend = requested_backend
     monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: True)

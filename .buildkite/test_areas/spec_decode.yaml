@@ -12,7 +12,6 @@ steps:
     - "!vllm/distributed/kv_transfer/"
     - vllm/inputs/
     - vllm/model_executor/
-    - vllm/models/qwen4_exp/
     - vllm/platforms/
     - vllm/sampling_params.py
     - vllm/transformers_utils/
