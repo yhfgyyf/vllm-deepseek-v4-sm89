@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import (
     sparse_mla_attention as sparse_attention_module,
 )
@@ -76,6 +77,61 @@ def _mock_single_tp(monkeypatch) -> None:
         "has_flashinfer_sparse_mla_sm89_glm_nope",
         lambda: True,
     )
+
+
+@pytest.mark.parametrize(
+    ("adaptive", "graph_mode", "capability", "expected_threshold"),
+    [
+        (True, CUDAGraphMode.FULL, DeviceCapability(8, 9), 2048),
+        (True, CUDAGraphMode.FULL, DeviceCapability(12, 0), 2048),
+        (False, CUDAGraphMode.FULL, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL_AND_PIECEWISE, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL_DECODE_ONLY, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL, DeviceCapability(10, 0), 7),
+    ],
+)
+def test_dsv4_adaptive_full_mixed_builders_use_all_token_decode_capacity(
+    monkeypatch,
+    adaptive: bool,
+    graph_mode: CUDAGraphMode,
+    capability: DeviceCapability,
+    expected_threshold: int,
+) -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=adaptive),
+        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+    )
+    monkeypatch.setattr(
+        dsv4_sparse_module.current_platform,
+        "get_device_capability",
+        lambda: capability,
+    )
+
+    def fake_mla_init(self, *args, **kwargs):
+        self.vllm_config = config
+        self.reorder_batch_threshold = 7
+
+    def fake_swa_init(self, *args, **kwargs):
+        self.vllm_config = config
+        self.decode_threshold = 7
+
+    monkeypatch.setattr(
+        dsv4_sparse_module.DeepseekV4SparseMLAMetadataBuilder,
+        "__init__",
+        fake_mla_init,
+    )
+    monkeypatch.setattr(
+        dsv4_sparse_module.DeepseekSparseSWAMetadataBuilder,
+        "__init__",
+        fake_swa_init,
+    )
+
+    mla_builder = dsv4_sparse_module.DeepseekV4FlashInferSparseMLAMetadataBuilder()
+    swa_builder = dsv4_sparse_module.DeepseekSparseSWAFlashInferMetadataBuilder()
+
+    assert mla_builder.reorder_batch_threshold == expected_threshold
+    assert swa_builder.decode_threshold == expected_threshold
 
 
 def test_glm_nope_capability_checks_with_kv_cache_mla_signature(monkeypatch) -> None:

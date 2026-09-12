@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import (
@@ -18,6 +20,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV41SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
@@ -131,6 +134,24 @@ def _native_workspace_size_upper_bound(
     )
 
 
+def _adaptive_full_mixed_decode_capacity(vllm_config: VllmConfig) -> int | None:
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or not speculative_config.enable_adaptive_verification
+        or vllm_config.compilation_config.cudagraph_mode.mixed_mode()
+        != CUDAGraphMode.FULL
+    ):
+        return None
+
+    capability = current_platform.get_device_capability()
+    if capability is None or not (
+        capability.major == 12 or capability == DeviceCapability(8, 9)
+    ):
+        return None
+    return vllm_config.scheduler_config.max_num_batched_tokens
+
+
 class DeepseekV41NativeSparseBackend(DeepseekV41SparseMLABackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -196,6 +217,12 @@ class DeepseekV41NativeMetadataBuilder(DeepseekV41SparseMLAMetadataBuilder):
 
 class DeepseekV41NativeSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        capacity = _adaptive_full_mixed_decode_capacity(self.vllm_config)
+        if capacity is not None:
+            self.decode_threshold = capacity
 
 
 class DeepseekV41NativeSWABackend(DeepseekSparseSWABackend):

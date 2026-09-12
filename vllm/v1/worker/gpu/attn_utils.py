@@ -7,10 +7,11 @@ from typing import Any, cast
 
 import torch
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -210,6 +211,72 @@ def get_query_lens_mismatch_unsupported_backend(
             if not group.backend.supports_device_cpu_query_lens_mismatch():
                 return group.backend.__name__
     return None
+
+
+def _can_preserve_adaptive_full_cudagraph(
+    attn_groups: list[list[AttentionGroup]],
+    requested_mode: CUDAGraphMode,
+    max_num_batched_tokens: int,
+    device_capability: DeviceCapability | None,
+    checked_layer_names: set[str] | None = None,
+) -> bool:
+    """Keep explicit mixed FULL only for audited native, all-token builders."""
+    if requested_mode != CUDAGraphMode.FULL or device_capability is None:
+        return False
+    if device_capability != DeviceCapability(8, 9) and device_capability.major != 12:
+        return False
+
+    requirements = {
+        (
+            "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
+            "DeepseekV4FlashInferMLASparseBackend",
+        ): "reorder_batch_threshold",
+        (
+            "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
+            "DeepseekSparseSWAFlashInferBackend",
+        ): "decode_threshold",
+        ("vllm.models.deepseek_v4.compressor", "CompressorBackend"): None,
+        (
+            "vllm.v1.attention.backends.mla.indexer",
+            "DeepseekV4IndexerBackend",
+        ): "adaptive_full_mixed_decode",
+        (
+            "vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse",
+            "DeepseekV41NativeSparseBackend",
+        ): None,
+        (
+            "vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse",
+            "DeepseekV41NativeSWABackend",
+        ): "decode_threshold",
+        ("vllm.models.deepseek_v4_1.compressor", "CompressorBackend"): None,
+        (
+            "vllm.v1.attention.backends.mla.indexer",
+            "DeepseekV41IndexerBackend",
+        ): "adaptive_full_mixed_decode",
+    }
+    has_swa = False
+    for groups in attn_groups:
+        for group in groups:
+            if checked_layer_names is not None and checked_layer_names.isdisjoint(
+                group.layer_names
+            ):
+                continue
+            identity = group.backend.full_cls_name()
+            if identity not in requirements:
+                return False
+            requirement = requirements[identity]
+            if requirement is None:
+                continue
+            builder = group.get_metadata_builder(0)
+            expected = (
+                True
+                if requirement == "adaptive_full_mixed_decode"
+                else max_num_batched_tokens
+            )
+            if getattr(builder, requirement, None) != expected:
+                return False
+            has_swa |= requirement == "decode_threshold"
+    return has_swa
 
 
 def init_kv_cache(

@@ -7,10 +7,15 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from importlib import import_module
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.config import CUDAGraphMode
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -23,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu.attn_utils import (
+    _can_preserve_adaptive_full_cudagraph,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
 )
@@ -115,6 +121,106 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
             checked_layer_names={"target"},
         )
         == "_DraftBackend"
+    )
+
+
+def _native_adaptive_groups(version):
+    package = f"vllm.models.deepseek_{version}"
+    native = import_module(f"{package}.nvidia.flashinfer_sparse")
+    indexer = import_module("vllm.v1.attention.backends.mla.indexer")
+    compressor = import_module(f"{package}.compressor")
+    if version == "v4":
+        backends = [
+            native.DeepseekV4FlashInferMLASparseBackend,
+            native.DeepseekSparseSWAFlashInferBackend,
+            indexer.DeepseekV4IndexerBackend,
+        ]
+    else:
+        backends = [
+            native.DeepseekV41NativeSparseBackend,
+            native.DeepseekV41NativeSWABackend,
+            indexer.DeepseekV41IndexerBackend,
+        ]
+    backends.append(compressor.CompressorBackend)
+    groups = []
+    for backend in backends:
+        builder = SimpleNamespace(
+            decode_threshold=128,
+            reorder_batch_threshold=128,
+            adaptive_full_mixed_decode=True,
+        )
+        groups.append(
+            SimpleNamespace(
+                backend=backend,
+                layer_names=["target"],
+                get_metadata_builder=lambda _, builder=builder: builder,
+            )
+        )
+    return [groups]
+
+
+@pytest.mark.parametrize("version", ["v4", "v4_1"])
+@pytest.mark.parametrize("capability", [(8, 9), (12, 0), (12, 1)])
+def test_explicit_adaptive_full_requires_audited_native_builders(version, capability):
+    groups = _native_adaptive_groups(version)
+    assert _can_preserve_adaptive_full_cudagraph(
+        groups, CUDAGraphMode.FULL, 128, DeviceCapability(*capability)
+    )
+    # A pure SWA model needs no indexer or compressed-cache group.
+    assert _can_preserve_adaptive_full_cudagraph(
+        [[groups[0][1]]], CUDAGraphMode.FULL, 128, DeviceCapability(*capability)
+    )
+
+
+@pytest.mark.parametrize("version", ["v4", "v4_1"])
+@pytest.mark.parametrize("missing", ["indexer", "swa", "unknown", "empty"])
+def test_adaptive_full_rejects_unready_or_unknown_target_groups(version, missing):
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+
+    groups = _native_adaptive_groups(version)
+    if missing == "indexer":
+        groups[0][2].get_metadata_builder(0).adaptive_full_mixed_decode = False
+    elif missing == "swa":
+        groups[0][1].get_metadata_builder(0).decode_threshold = 3
+    elif missing == "unknown":
+        groups[0][2].backend = DeepseekV32IndexerBackend
+    else:
+        groups = []
+    assert not _can_preserve_adaptive_full_cudagraph(
+        groups, CUDAGraphMode.FULL, 128, DeviceCapability(12, 0)
+    )
+
+
+def test_adaptive_full_preserves_other_modes_hardware_and_target_scope():
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+
+    groups = _native_adaptive_groups("v4")
+    for capability in [None, DeviceCapability(9, 0), DeviceCapability(10, 0)]:
+        assert not _can_preserve_adaptive_full_cudagraph(
+            groups, CUDAGraphMode.FULL, 128, capability
+        )
+    for mode in [CUDAGraphMode.NONE, CUDAGraphMode.FULL_AND_PIECEWISE]:
+        assert not _can_preserve_adaptive_full_cudagraph(
+            groups, mode, 128, DeviceCapability(12, 0)
+        )
+    assert not _can_preserve_adaptive_full_cudagraph(
+        [[groups[0][-1]]], CUDAGraphMode.FULL, 128, DeviceCapability(12, 0)
+    )
+    groups[0][0].get_metadata_builder(0).reorder_batch_threshold = 3
+    assert not _can_preserve_adaptive_full_cudagraph(
+        groups, CUDAGraphMode.FULL, 128, DeviceCapability(12, 0)
+    )
+    groups[0][0].get_metadata_builder(0).reorder_batch_threshold = 128
+    draft_group = SimpleNamespace(
+        backend=DeepseekV32IndexerBackend, layer_names=["draft"]
+    )
+    groups[0].append(draft_group)
+    assert _can_preserve_adaptive_full_cudagraph(
+        groups, CUDAGraphMode.FULL, 128, DeviceCapability(12, 0), {"target"}
+    )
+    draft_group.layer_names.append("target")
+    assert not _can_preserve_adaptive_full_cudagraph(
+        groups, CUDAGraphMode.FULL, 128, DeviceCapability(12, 0), {"target"}
     )
 
 

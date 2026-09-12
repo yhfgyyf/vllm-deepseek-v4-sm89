@@ -26,6 +26,12 @@ FlashInfer `0.6.18`. Validated configurations include
 
 ### 2026-09-12
 
+- Added SM89 / SM120 adaptive verification support for DeepSeek-V4 / V4.1 in
+  the current `main` source, including device-ragged metadata, padding, and
+  FULL graph replay. SM120 operator and V4.1 full-model validation passed;
+  physical SM89 adaptive validation remains pending. This is a source-only
+  update with no new wheels; existing `vision9` and earlier vLLM wheels do not
+  contain this adaptation.
 - Added native DeepSeek-V4.1-Flash model, Engram, DSpark, and experimental CED
   prefill support, published as the SM89+SM120 `vision9` wheels.
 - Validated the full model server on 4× RTX PRO 6000 (SM120). SM89 validation
@@ -100,6 +106,12 @@ shape is compiled once and then reused from the JIT cache.
 
 ## 2. Quick install (prebuilt wheels)
 
+> **Adaptive verification cannot use the published vLLM whl packages below.**
+> Setting `enable_adaptive_verification=true` does not add this adaptation to
+> `vision9` or earlier packages. Install **this fork's current `main` source**
+> using section 2.1. The paired FlashInfer wheel remains usable; no new vLLM
+> wheel needs to be generated or downloaded for this update.
+
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
@@ -129,10 +141,12 @@ mirror.
 The existing `vision7` Docker image does **not** include DeepSeek-V4.1-Flash.
 Use the release wheels above or the source build below for V4.1.
 
-### 2.1 Full source build
+### 2.1 Install current main source (required for adaptive)
 
-This path recompiles the vLLM C++ / CUDA extensions for both SM89 and SM120.
-`requirements/cuda.txt` installs the paired FlashInfer wheel from this release.
+This path installs this fork's current `main` source in editable mode and
+compiles the C++ / CUDA extensions for SM89 and SM120, without producing a
+new distributable wheel. `requirements/cuda.txt` installs the paired
+FlashInfer wheel from the existing release.
 Prerequisites are the CUDA 13.0 toolkit, a C++ compiler, and Rust/Cargo with
 Rust 2024 edition support.
 
@@ -151,11 +165,15 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export TORCH_CUDA_ARCH_LIST='8.9;12.0'
 export MAX_JOBS=4
 
-VLLM_VERSION_OVERRIDE='0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130' \
-  uv build --wheel --no-build-isolation
-uv pip install --no-build-isolation \
-  dist/vllm-0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130-*.whl
+uv pip install --no-build-isolation -e . --torch-backend=cu130
+
+.venv/bin/python -I -c 'import vllm; print(vllm.__file__)'
 ```
+
+The final path must point to `vllm/__init__.py` in this source checkout, not
+the old wheel's `site-packages/vllm`. Launch with the `vllm` command from this
+`.venv`. For an existing checkout, synchronize this fork's `main` before
+running the installation commands above.
 
 ---
 
@@ -217,6 +235,37 @@ or other multimodal content while it is enabled.
 The full model server was validated on SM120. SM89 validation was limited to
 offline compilation; no kernel numerical execution or full-model validation
 was performed on SM89 hardware.
+
+### 3.1 Enable adaptive verification: changes from fixed DSpark 5
+
+Install this fork's current `main` source using section 2.1 first. Keep the
+model path, TP/EP, FP8 KV, Engram, Model Runner V2, and CUDA 13.1 Blackwell
+assembler settings above. Replace `--speculative-config` and add explicit FULL:
+
+| Parameter | Fixed DSpark 5 (command above) | Adaptive (current main source) |
+|---|---|---|
+| `enable_adaptive_verification` | `false` | `true` |
+| `--compilation-config` | Not explicitly set | `'{"cudagraph_mode":"FULL"}'` |
+| `num_speculative_tokens` / draft / rejection | `5` / `probabilistic` / `block` | Unchanged |
+| `--hf-overrides '{"ced_prefill":true}'` | Enables CED | May be retained; CED is not required for adaptive |
+
+The new command ending is:
+
+```bash
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
+```
+
+Do not add `--enforce-eager` or switch graph mode to `PIECEWISE`. CED and
+adaptive are independent: retain `ced_prefill=true` to combine them, or
+remove that override for normal prefill. Real CED prefill/mixed steps still
+follow their EAGER route, while pure decode can use FULL; requesting FULL
+does not imply that all CED prefill runs inside a graph.
+
+SM120 validation covers V4 / V4.1 operators, mixed prefill, padding, zero
+draft budgets, FULL replay, and V4.1 full-model serving. This is not evidence
+of physical SM89 validation or full-model accuracy equivalence.
 
 ## 4. DeepSeek-V4-Flash launch commands
 

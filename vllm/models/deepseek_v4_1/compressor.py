@@ -60,6 +60,7 @@ class CompressorMetadata:
 @triton.jit
 def _ring_slot_mapping_kernel(
     slot_mapping_ptr,
+    source_slot_mapping_ptr,
     block_table_ptr,
     block_table_stride,
     token_to_req_ptr,
@@ -71,6 +72,7 @@ def _ring_slot_mapping_kernel(
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = offsets < num_actual_tokens
+    valid = valid & (tl.load(source_slot_mapping_ptr + offsets, valid, other=-1) >= 0)
     req = tl.load(token_to_req_ptr + offsets, mask=valid, other=0).to(tl.int64)
     block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=0)
     pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
@@ -113,6 +115,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         _ring_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)](
             slot_mapping,
+            common_attn_metadata.slot_mapping,
             block_table,
             block_table.stride(0),
             token_to_req_indices,

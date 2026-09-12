@@ -59,6 +59,7 @@ from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
     get_dummy_encoder_profile_inputs,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
@@ -85,6 +86,7 @@ from vllm.v1.worker.gpu.async_utils import (
     StepTimingCollector,
 )
 from vllm.v1.worker.gpu.attn_utils import (
+    _can_preserve_adaptive_full_cudagraph,
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
     get_slot_mapping_policies,
@@ -606,8 +608,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
-        # The speculator clears the flag at load time when the checkpoint has
-        # no confidence head, so it holds the effective value.
+        # The speculator validates the confidence head while loading weights.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
             enable_adaptive_verification=getattr(
                 self.speculator, "enable_adaptive_verification", False
@@ -649,7 +650,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             use_replayssm=self.vllm_config.cache_config.use_replayssm,
         )
         if self.adaptive_verification is not None:
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            preserve_full = _can_preserve_adaptive_full_cudagraph(
+                self.attn_groups,
+                self.compilation_config.cudagraph_mode,
+                self.scheduler_config.max_num_batched_tokens,
+                current_platform.get_device_capability()
+                if current_platform.is_cuda()
+                else None,
+                checked_layer_names=target_attn_layer_names,
+            )
+            if preserve_full:
+                logger.info(
+                    "Keeping requested FULL mode for native adaptive verification."
+                )
+            else:
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_AND_PIECEWISE
+                )
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,

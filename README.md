@@ -24,6 +24,11 @@
 
 ### 2026-09-12
 
+- 在当前 `main` 源码中增加 DeepSeek-V4 / V4.1 的 SM89 / SM120 adaptive
+  verification 适配，覆盖 device-ragged metadata、padding 和 FULL graph 回放。
+  SM120 已完成算子及 V4.1 整模型验证；SM89 adaptive 实卡验证仍待完成。
+  此更新仅提供源码，不生成新的 wheel；现有 `vision9` 及更早的 vLLM wheel
+  不包含该适配。
 - 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
   支持，发布 SM89+SM120 `vision9` wheel。
 - 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证；SM89 本轮仅完成
@@ -103,6 +108,11 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
+> **Adaptive verification 不能使用下面的已发布 vLLM whl 包。** 即使设置
+> `enable_adaptive_verification=true`，`vision9` 及更早的包也不包含本次适配。
+> 必须使用**本仓库当前 `main` 源码**，按 2.2 节安装；配套 FlashInfer wheel
+> 仍可使用，无需重新生成或下载新的 vLLM wheel。
+
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
@@ -128,10 +138,11 @@ vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashI
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
-### 2.2 从源码完整构建
+### 2.2 从当前 main 源码安装（adaptive 必需）
 
-以下流程会重新编译 vLLM 的 C++ / CUDA 扩展，并同时生成 SM89 与 SM120
-目标代码。`requirements/cuda.txt` 会安装本次 Release 配套的 FlashInfer wheel。
+以下流程以 editable 方式直接安装本仓库当前 `main` 源码，并编译 SM89 与
+SM120 的 C++ / CUDA 扩展，不生成用于分发的新 wheel。
+`requirements/cuda.txt` 会安装现有 Release 配套的 FlashInfer wheel。
 构建前需准备 CUDA 13.0 toolkit、C++ 编译器和支持 Rust 2024 edition 的
 Rust/Cargo。
 
@@ -150,11 +161,14 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export TORCH_CUDA_ARCH_LIST='8.9;12.0'
 export MAX_JOBS=4
 
-VLLM_VERSION_OVERRIDE='0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130' \
-  uv build --wheel --no-build-isolation
-uv pip install --no-build-isolation \
-  dist/vllm-0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130-*.whl
+uv pip install --no-build-isolation -e . --torch-backend=cu130
+
+.venv/bin/python -I -c 'import vllm; print(vllm.__file__)'
 ```
+
+最后的路径应指向当前源码目录下的 `vllm/__init__.py`，不能仍指向旧 wheel 的
+`site-packages/vllm`。后续启动使用此 `.venv` 中的 `vllm` 命令；更新已有 checkout
+时先同步本仓库 `main`，再执行上述安装。
 
 ### 2.3 Docker 镜像（阿里云上海 ACR）
 
@@ -252,6 +266,36 @@ CED 时不要发送图片或其他多模态内容。
 
 SM120 已完成完整模型服务验证；SM89 本轮仅完成离线编译验证，未在 SM89
 硬件上执行内核数值测试或完整模型服务验证。
+
+### 3.1 启用 adaptive verification：与固定 DSpark 5 的参数差异
+
+先按 2.2 节安装本仓库当前 `main` 源码。保留上述模型路径、TP/EP、FP8 KV、
+Engram、Model Runner V2 和 CUDA 13.1 Blackwell assembler 设置，只替换
+`--speculative-config` 并增加显式 FULL 配置：
+
+| 参数 | 固定 DSpark 5（上述命令） | Adaptive（当前 main 源码） |
+|---|---|---|
+| `enable_adaptive_verification` | `false` | `true` |
+| `--compilation-config` | 未显式指定 | `'{"cudagraph_mode":"FULL"}'` |
+| `num_speculative_tokens` / draft / rejection | `5` / `probabilistic` / `block` | 不变 |
+| `--hf-overrides '{"ced_prefill":true}'` | 开启 CED | 可保留；CED 不是 adaptive 的必要条件 |
+
+新的命令结尾为：
+
+```bash
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
+```
+
+不要增加 `--enforce-eager` 或将 graph 模式改为 `PIECEWISE`。CED 与 adaptive
+是独立选项：保留 `ced_prefill=true` 可组合使用；移除该 override 即可采用普通
+prefill。CED 的真实 prefill/mixed 步骤仍遵循其 EAGER 路由，纯 decode 可使用
+FULL；显式 FULL 不表示所有 CED prefill 都在 graph 中执行。
+
+本次在 SM120 上验证了 V4 / V4.1 算子、mixed prefill、padding、零草稿预算和
+FULL 回放，并完成 V4.1 整模型 serving；不将这些结果扩展为 SM89 实卡验证或
+完整模型精度无损保证。
 
 ## 4. DeepSeek-V4-Flash 启动命令
 

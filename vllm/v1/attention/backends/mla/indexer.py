@@ -6,7 +6,7 @@ from typing import Any, ClassVar
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
@@ -303,6 +303,12 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return super().supports_device_cpu_query_lens_mismatch() or (
+            _supports_v4_sm89_flattening() or _supports_v4_sm120_varlen()
+        )
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V4_INDEXER"
@@ -317,6 +323,10 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
 
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV4IndexerMetadataBuilder"]:
+        return DeepseekV4IndexerMetadataBuilder
+
 
 class DeepseekV41IndexerBackend(DeepseekV32IndexerBackend):
     """Model-specific backend for segregated V4.1 MXFP4 index pages."""
@@ -324,6 +334,13 @@ class DeepseekV41IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return current_platform.is_cuda() and (
+            current_platform.is_device_capability((8, 9))
+            or current_platform.is_device_capability_family(120)
+        )
 
     @staticmethod
     def get_name() -> str:
@@ -731,6 +748,32 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _uses_adaptive_verification(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return bool(
+        speculative_config is not None
+        and speculative_config.enable_adaptive_verification
+    )
+
+
+def _uses_full_mixed_cudagraph(vllm_config: VllmConfig) -> bool:
+    return (
+        vllm_config.compilation_config.cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL
+    )
+
+
+def _supports_v4_sm89_flattening() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability((8, 9))
+
+
+def _supports_v4_sm120_varlen() -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and has_deep_gemm()
+    )
+
+
 def _dsv41_decode_max_indexer_kv_len(
     seq_lens_cpu_upper_bound: torch.Tensor,
     num_decodes: int,
@@ -755,12 +798,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         return dsa_indexer_uses_fp4(vllm_config)
 
     @classmethod
+    def _use_flattened_decode(cls, vllm_config: VllmConfig) -> bool:
+        return _use_flattening(vllm_config)
+
+    @classmethod
+    def _supports_varlen_decode(cls, vllm_config: VllmConfig) -> bool:
+        return _supports_varlen_paged_mqa_logits()
+
+    @classmethod
+    def _supports_adaptive_full_mixed_decode(cls) -> bool:
+        return False
+
+    @classmethod
     def get_cudagraph_support(
         cls,
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        if _supports_varlen_paged_mqa_logits() or _use_flattening(vllm_config):
+        if cls._supports_varlen_decode(vllm_config) or cls._use_flattened_decode(
+            vllm_config
+        ):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
@@ -794,9 +851,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
+        self.adaptive_full_mixed_decode = (
+            self._supports_adaptive_full_mixed_decode()
+            and _uses_adaptive_verification(self.vllm_config)
+            and _uses_full_mixed_cudagraph(self.vllm_config)
+        )
+        if self.adaptive_full_mixed_decode:
+            self.decode_threshold = scheduler_config.max_num_batched_tokens
         self.reorder_batch_threshold = None
-        self.use_flattening = _use_flattening(self.vllm_config)
-        self.supports_varlen = _supports_varlen_paged_mqa_logits()
+        self.use_flattening = self._use_flattened_decode(self.vllm_config)
+        self.supports_varlen = self._supports_varlen_decode(self.vllm_config)
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
             "(next_n=%d, use_fp4_cache=%s)",
@@ -1077,6 +1141,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         return indices
 
+    def _get_decode_threshold(self, num_tokens: int) -> int:
+        return self.decode_threshold
+
     def build(
         self,
         common_prefix_len: int,
@@ -1094,9 +1161,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
-                decode_threshold=self.decode_threshold,
+                decode_threshold=self._get_decode_threshold(num_tokens),
                 require_uniform=not (self.use_flattening or self.supports_varlen),
-                treat_short_extends_as_decodes=not self.use_pcp,
+                treat_short_extends_as_decodes=(
+                    self.adaptive_full_mixed_decode or not self.use_pcp
+                ),
             )
         )
 
@@ -1220,8 +1289,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             min_decode_len = int(decode_lens_cpu.min().item())
-            write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
+            write_is_uniform = min_decode_len == max_decode_len
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
             # native kernel. max_decode_len <= 1 always has one.
@@ -1288,9 +1357,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
 
-            seq_lens_is_buffer_view = (use_native and next_n > 1) or (
-                not use_native and max_decode_len > 1
-            )
+            seq_lens_is_buffer_view = not use_native or next_n > 1
 
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global
@@ -1362,6 +1429,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         return attn_metadata
 
 
+class DeepseekV4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Metadata builder for the SM89/SM120 DeepSeek-V4 indexer."""
+
+    def _get_decode_threshold(self, num_tokens: int) -> int:
+        if self.adaptive_full_mixed_decode:
+            max_capture_size = (
+                self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            if num_tokens > max_capture_size:
+                # Eager prefills must retain the bounded logits chunking path.
+                return self.num_speculative_tokens + 1
+        return self.decode_threshold
+
+    @classmethod
+    def _use_flattened_decode(cls, vllm_config: VllmConfig) -> bool:
+        return _use_flattening(vllm_config) or (
+            _uses_adaptive_verification(vllm_config) and _supports_v4_sm89_flattening()
+        )
+
+    @classmethod
+    def _supports_varlen_decode(cls, vllm_config: VllmConfig) -> bool:
+        return _supports_varlen_paged_mqa_logits() or (
+            _uses_adaptive_verification(vllm_config) and _supports_v4_sm120_varlen()
+        )
+
+    @classmethod
+    def _supports_adaptive_full_mixed_decode(cls) -> bool:
+        return _supports_v4_sm89_flattening() or _supports_v4_sm120_varlen()
+
+
 class DeepseekV41IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     """Metadata builder for the native SM89/SM120 V4.1 indexer."""
 
@@ -1370,6 +1467,21 @@ class DeepseekV41IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     @classmethod
     def _resolve_use_fp4(cls, vllm_config: VllmConfig) -> bool:
         return dsv41_indexer_uses_fp4(vllm_config)
+
+    @classmethod
+    def _use_flattened_decode(cls, vllm_config: VllmConfig) -> bool:
+        return _use_flattening(vllm_config) or _uses_adaptive_verification(vllm_config)
+
+    @classmethod
+    def _supports_varlen_decode(cls, vllm_config: VllmConfig) -> bool:
+        return False
+
+    @classmethod
+    def _supports_adaptive_full_mixed_decode(cls) -> bool:
+        return current_platform.is_cuda() and (
+            current_platform.is_device_capability((8, 9))
+            or current_platform.is_device_capability_family(120)
+        )
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

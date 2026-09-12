@@ -320,6 +320,108 @@ def test_compression_handles_chunk_start_ring_read_before_tail_write(ratio):
 
 
 @cuda
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
+    """Padded FULL-graph capacity is not the live token count."""
+    from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import (
+        fused_save_compress_norm,
+    )
+    from vllm.models.deepseek_v4_1.compressor import CompressorMetadataBuilder
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    torch.manual_seed(13)
+    device = "cuda"
+    builder = object.__new__(CompressorMetadataBuilder)
+    builder.capacity = 8
+    builder.token_to_req_indices = torch.zeros(8, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    starts = torch.zeros(5, dtype=torch.int32, device=device)
+    positions = torch.zeros(8, dtype=torch.int64, device=device)
+    source_slots = torch.full((8,), -1, dtype=torch.int64, device=device)
+    blocks = torch.arange(4, dtype=torch.int32, device=device).view(4, 1)
+    initial_state = torch.randn(4, 8, 1024, device=device)
+    state = initial_state.clone()
+    raw = torch.randn(8, 1024, device=device)
+    weight = torch.randn(512, dtype=torch.bfloat16, device=device)
+    latent = torch.full((8, 512), 37, dtype=torch.bfloat16, device=device)
+    graph = None
+
+    # Uneven verification plus prefill, then a zero-draft verification budget.
+    for lengths, cpu_lengths in [
+        ([3, 1, 3, 0], [2, 2, 3, 0]),
+        ([1, 1, 3, 0], [1, 1, 3, 0]),
+    ]:
+        live = sum(lengths)
+        cpu_starts = torch.tensor([0, *cpu_lengths], dtype=torch.int32).cumsum(0)
+        starts.copy_(torch.tensor([0, *lengths], device=device).cumsum(0))
+        pos = [p + i for n, p in zip(lengths, [1, 4, 0, 0]) for i in range(n)]
+        positions.copy_(torch.tensor(pos + [1] * (8 - live), device=device))
+        source_slots.fill_(-1)
+        source_slots[:live] = 0
+        cm = CommonAttentionMetadata(
+            query_start_loc=starts,
+            query_start_loc_cpu=cpu_starts,
+            seq_lens=torch.tensor(
+                [p + n for p, n in zip([1, 4, 0, 0], lengths)],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_reqs=4,
+            num_actual_tokens=8,
+            max_query_len=3,
+            max_seq_len=5,
+            block_table_tensor=blocks,
+            slot_mapping=source_slots,
+            positions=positions,
+        )
+        metadata = builder.build(0, cm)
+        assert metadata.slot_mapping[live:].tolist() == [-1] * (8 - live)
+        state.copy_(initial_state)
+        latent.fill_(37)
+        expected_state, expected = state.clone(), latent.clone()
+        token = 0
+        for req, length in enumerate(lengths):
+            for _ in range(length):
+                p = pos[token]
+                if (p + 1) % 2 == 0:
+                    pair = torch.stack((expected_state[req, (p - 1) % 8], raw[token]))
+                    pooled = (pair[:, :512] * pair[:, 512:].softmax(0)).sum(0)
+                    expected[token] = _rms(pooled, weight)
+                expected_state[req, p % 8] = raw[token]
+                token += 1
+
+        def forward(metadata=metadata):
+            fused_save_compress_norm(
+                raw,
+                positions,
+                state,
+                metadata.slot_mapping,
+                starts,
+                metadata.token_to_req_indices,
+                weight,
+                1e-6,
+                2,
+                latent,
+            )
+
+        if graph_replay:
+            if graph is None:
+                forward()
+                torch.accelerator.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    forward()
+            state.copy_(initial_state)
+            latent.fill_(37)
+            graph.replay()
+        else:
+            forward()
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+        torch.testing.assert_close(latent, expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(latent[live:], expected[live:], rtol=0, atol=0)
+
+
+@cuda
 @pytest.mark.parametrize("tokens", [1, 17, 32, 33, 129])
 @pytest.mark.parametrize("carried", [False, True])
 @pytest.mark.parametrize("with_norm", [False, True])
