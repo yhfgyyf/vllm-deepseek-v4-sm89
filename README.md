@@ -115,39 +115,23 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，但其中的
 vLLM 资产已更新为 `vision10`；配套 FlashInfer `vision2` 和依赖下载地址不变。
-请使用新建的 Python 3.12 虚拟环境，并按下面的 `vision10` 文件名下载，
-不要复用本地缓存的旧 `vision9` vLLM wheel。下载需要 GitHub CLI（`gh`）。
+在 Python 3.12 虚拟环境中，直接通过下面的确切 wheel URL 安装：
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-wheel_dir="$(mktemp -d /tmp/vllm-vision10-wheels.XXXXXX)"
-gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
-  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl' \
-  --pattern SHA256SUMS \
-  --dir "$wheel_dir"
-
-cd "$wheel_dir"
-sha256sum -c SHA256SUMS
-
-UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
-  --torch-backend=cu130
-uv pip install 'transformers==5.16.1' 'triton==3.7.1'
-uv pip check
-"$VIRTUAL_ENV/bin/python" -I -c 'import vllm; print(vllm.__version__, vllm.__file__)'
+uv pip install --torch-backend=cu130 \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision10.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=459a9638502de1cce8a1d1043bbe89e290afaa034a82008da92285bd1c9b72e5' \
+  'transformers==5.16.1' 'triton==3.7.1'
 ```
 
-`SHA256SUMS` 校验下载的两个 wheel。vLLM 依赖继续通过锁定 URL 和 SHA256 安装
-同一 Release 中的 FlashInfer `vision2`；本次未重新打包 FlashInfer。
-最后打印的 vLLM 版本应包含 `vision10`，路径应来自新环境的 `site-packages`。
+`uv` 会校验 URL 中的 SHA256，并自动安装配套 FlashInfer `vision2`，
+无需单独下载或安装 FlashInfer。已激活兼容环境时，只需执行 `uv pip install`。
 该 wheel 基于源码提交 `1cf1104417873d65e4ad353ea904f602d16204f2` 构建，
 复用已审计且未改动的 Vision9 原生二进制；Release tag 对应的源码归档未移动。
 
-如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
+PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Release URL 下载。
 
 ### 2.2 从当前 main 源码安装（wheel 的替代方案）
 

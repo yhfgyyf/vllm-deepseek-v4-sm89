@@ -114,43 +114,27 @@ shape is compiled once and then reused from the JIT cache.
 
 The latest release retains the `v0.28.1rc1-vision9-sm89-sm120-cu130` tag,
 but its vLLM asset is now `vision10`. Paired FlashInfer `vision2` and its
-dependency URL are unchanged. Use a fresh Python 3.12 virtual environment
-and download the `vision10` filename below instead of a cached Vision9 vLLM
-wheel. Downloading requires the GitHub CLI (`gh`).
+dependency URL are unchanged. Install directly from the exact wheel URL
+below in a Python 3.12 virtual environment:
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-wheel_dir="$(mktemp -d /tmp/vllm-vision10-wheels.XXXXXX)"
-gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
-  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl' \
-  --pattern SHA256SUMS \
-  --dir "$wheel_dir"
-
-cd "$wheel_dir"
-sha256sum -c SHA256SUMS
-
-UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
-  --torch-backend=cu130
-uv pip install 'transformers==5.16.1' 'triton==3.7.1'
-uv pip check
-"$VIRTUAL_ENV/bin/python" -I -c 'import vllm; print(vllm.__version__, vllm.__file__)'
+uv pip install --torch-backend=cu130 \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision10.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=459a9638502de1cce8a1d1043bbe89e290afaa034a82008da92285bd1c9b72e5' \
+  'transformers==5.16.1' 'triton==3.7.1'
 ```
 
-`SHA256SUMS` verifies both downloaded wheels. vLLM still installs FlashInfer
-`vision2` from the same release using a pinned URL and SHA256; FlashInfer
-was not repackaged. The printed vLLM version must contain `vision10`, and its
-path must be in the new environment's `site-packages`.
+`uv` verifies the SHA256 in the URL and automatically installs paired
+FlashInfer `vision2`; no separate FlashInfer download or install is needed.
+With a compatible environment already activated, run only `uv pip install`.
 The wheel was built from source commit
 `1cf1104417873d65e4ad353ea904f602d16204f2`, reusing audited, unchanged Vision9
 native binaries. The release tag's source archives were not moved.
 
-If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
-mirror.
+Optionally use `--index-url` for a PyPI mirror; the wheel still downloads
+from the release URL above.
 
 The existing `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
 this adaptive adaptation. It cannot directly use the adaptive-enabled DSpark
