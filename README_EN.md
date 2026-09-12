@@ -29,8 +29,8 @@ FlashInfer `0.6.18`. Validated configurations include
 - Added SM89 / SM120 adaptive verification support for DeepSeek-V4 / V4.1 in
   the current `main` source, including device-ragged metadata, padding, and
   FULL graph replay. SM120 operator and V4.1 full-model validation passed;
-  physical SM89 adaptive validation remains pending. A new `vision10`
-  wheel was built with this adaptation, and README DSpark examples enable adaptive
+  physical SM89 adaptive validation remains pending. The latest release's vLLM
+  wheel was replaced by `vision10` with this adaptation. DSpark examples enable adaptive
   verification with explicit FULL graphs by default. `vision9` and earlier
   vLLM wheels do not contain it. Paired FlashInfer `vision2` is unchanged.
 - Added native DeepSeek-V4.1-Flash model, Engram, DSpark, and experimental CED
@@ -112,26 +112,42 @@ shape is compiled once and then reused from the JIT cache.
 > not contain this adaptation and cannot use the adaptive-enabled DSpark
 > commands below. The paired FlashInfer `vision2` wheel does not need replacing.
 
-If you have the `vision10` wheel and its `SHA256SUMS`, install them locally as
-shown below. Otherwise, install current `main` source using section 2.1.
-An older release wheel is not a substitute for the new build.
+The latest release retains the `v0.28.1rc1-vision9-sm89-sm120-cu130` tag,
+but its vLLM asset is now `vision10`. Paired FlashInfer `vision2` and its
+dependency URL are unchanged. Use a fresh Python 3.12 virtual environment
+and download the `vision10` filename below instead of a cached Vision9 vLLM
+wheel. Downloading requires the GitHub CLI (`gh`).
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-cd /path/to/vision10-wheel-directory
+wheel_dir="$(mktemp -d /tmp/vllm-vision10-wheels.XXXXXX)"
+gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl' \
+  --pattern SHA256SUMS \
+  --dir "$wheel_dir"
+
+cd "$wheel_dir"
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
 uv pip install 'transformers==5.16.1' 'triton==3.7.1'
+uv pip check
+"$VIRTUAL_ENV/bin/python" -I -c 'import vllm; print(vllm.__version__, vllm.__file__)'
 ```
 
-`SHA256SUMS` verifies the local vLLM wheel. Its dependency still installs
-FlashInfer `vision2` from the `vision9` release using a pinned URL and SHA256;
-FlashInfer was not repackaged for this update.
+`SHA256SUMS` verifies both downloaded wheels. vLLM still installs FlashInfer
+`vision2` from the same release using a pinned URL and SHA256; FlashInfer
+was not repackaged. The printed vLLM version must contain `vision10`, and its
+path must be in the new environment's `site-packages`.
+The wheel was built from source commit
+`1cf1104417873d65e4ad353ea904f602d16204f2`, reusing audited, unchanged Vision9
+native binaries. The release tag's source archives were not moved.
 
 If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
 mirror.
@@ -180,12 +196,14 @@ running the installation commands above.
 ## 3. DeepSeek-V4.1-Flash launch command (SM120)
 
 The following text-serving configuration was validated on 4× RTX PRO 6000
-96 GB. It uses TP=4, expert parallelism, FP8 KV, Engram CPU offload, DSpark 5,
+96 GB. It uses TP=4, expert parallelism, FP8 KV, Engram CPU offload, DSpark 5 (adaptive),
 and experimental CED prefill. CPU offload also requires sufficient host memory.
 V4.1 uses Model Runner V2; switching to the legacy V1 runner is unsupported:
 
 ```bash
+source /path/to/.venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=12.0
 export VLLM_USE_V2_MODEL_RUNNER=1
 export TRITON_PTXAS_BLACKWELL_PATH="$(
@@ -223,7 +241,11 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
-`ptxas-blackwell --version` must report the CUDA 13.1 toolchain.
+Use `vllm serve` from the new environment above and replace the model path
+with your checkpoint. `ptxas-blackwell --version` must report CUDA 13.1
+(13.1.80 was validated); the CUDA toolkit / PyTorch pairing remains cu130.
+Initial JIT compilation and graph capture may take time. Measure throughput
+only after the service is ready and warmed up.
 
 CED is currently an experimental approximate text-prefill path. For the tested
 long-text prefill workloads, the prefill proxy (input tokens / TTFT) roughly
@@ -273,6 +295,24 @@ method stay unchanged when enabling adaptive.
 SM120 validation covers V4 / V4.1 operators, mixed prefill, padding, zero
 draft budgets, FULL replay, and V4.1 full-model serving. This is not evidence
 of physical SM89 validation or full-model accuracy equivalence.
+
+### 3.2 DeepSeek-V4.1-Flash throughput reference
+
+Measured on 2026-09-12 using `vllm bench serve` on 4× RTX PRO 6000 Blackwell
+Server Edition 96 GB (SM120), TP4/EP, FP8 KV, Engram CPU offload,
+CED + DSpark5 adaptive, and FULL configured:
+
+| Input / output tokens | Max concurrency | Requests | Aggregate output throughput | Mean TTFT | Mean TPOT |
+|---|---:|---:|---:|---:|---:|
+| 8,192 / 512 | 10 | 200 | **296.61 tokens/s** | 1.464 s | 30.64 ms |
+
+The service was warmed up; random inputs, temperature=0, ignore-eos, all
+200 requests succeeded, and prefix-cache hits were zero. Throughput is total
+output tokens / full-run duration, including prefill and decode, not
+per-request or decode-only speed. This single run used the Vision9 /
+FlashInfer Vision2 environment with this adaptive patch applied, not a new
+benchmark of the Vision10 wheel. There is no same-workload baseline, so it
+does not establish an adaptive speedup percentage or quality equivalence.
 
 ## 4. DeepSeek-V4-Flash launch commands
 

@@ -27,7 +27,7 @@
 - 在当前 `main` 源码中增加 DeepSeek-V4 / V4.1 的 SM89 / SM120 adaptive
   verification 适配，覆盖 device-ragged metadata、padding 和 FULL graph 回放。
   SM120 已完成算子及 V4.1 整模型验证；SM89 adaptive 实卡验证仍待完成。
-  构建包含该适配的 `vision10` wheel，README 中的 DSpark 示例默认开启
+  最新 Release 中的 vLLM wheel 已替换为包含该适配的 `vision10`，DSpark 示例默认开启
   adaptive verification，并显式使用 FULL graph；`vision9` 及更早的 vLLM
   wheel 不包含该适配。配套 FlashInfer `vision2` 保持不变。
 - 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
@@ -113,24 +113,39 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 > `main` 源码。** `vision9` 及更早的 vLLM whl 包不包含该适配，不能直接使用
 > 下文默认开启 adaptive 的 DSpark 命令。配套 FlashInfer `vision2` 无需更换。
 
-如果已获得 `vision10` wheel 和配套 `SHA256SUMS`，可按下方从本地安装；
-否则按 2.2 节直接安装当前 `main` 源码。不要将旧 Release wheel 当作新构建。
+最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，但其中的
+vLLM 资产已更新为 `vision10`；配套 FlashInfer `vision2` 和依赖下载地址不变。
+请使用新建的 Python 3.12 虚拟环境，并按下面的 `vision10` 文件名下载，
+不要复用本地缓存的旧 `vision9` vLLM wheel。下载需要 GitHub CLI（`gh`）。
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-cd /path/to/vision10-wheel-directory
+wheel_dir="$(mktemp -d /tmp/vllm-vision10-wheels.XXXXXX)"
+gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
+  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl' \
+  --pattern SHA256SUMS \
+  --dir "$wheel_dir"
+
+cd "$wheel_dir"
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
 uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
 uv pip install 'transformers==5.16.1' 'triton==3.7.1'
+uv pip check
+"$VIRTUAL_ENV/bin/python" -I -c 'import vllm; print(vllm.__version__, vllm.__file__)'
 ```
 
-`SHA256SUMS` 校验本地的 vLLM wheel。它会继续通过锁定 URL 和 SHA256 安装
-`vision9` Release 中的 FlashInfer `vision2` wheel；本次未重新打包 FlashInfer。
+`SHA256SUMS` 校验下载的两个 wheel。vLLM 依赖继续通过锁定 URL 和 SHA256 安装
+同一 Release 中的 FlashInfer `vision2`；本次未重新打包 FlashInfer。
+最后打印的 vLLM 版本应包含 `vision10`，路径应来自新环境的 `site-packages`。
+该 wheel 基于源码提交 `1cf1104417873d65e4ad353ea904f602d16204f2` 构建，
+复用已审计且未改动的 Vision9 原生二进制；Release tag 对应的源码归档未移动。
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
@@ -217,7 +232,9 @@ FP8 KV、Engram CPU offload、DSpark 5（adaptive）和实验性 CED prefill；C
 还需预留充足的主机内存。V4.1 使用 Model Runner V2，不支持切换到旧 V1 runner：
 
 ```bash
+source /path/to/.venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=12.0
 export VLLM_USE_V2_MODEL_RUNNER=1
 export TRITON_PTXAS_BLACKWELL_PATH="$(
@@ -255,7 +272,10 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
-`ptxas-blackwell --version` 必须显示 CUDA 13.1 工具链。
+使用上述新环境中的 `vllm serve`，并将模型路径替换为自己的 checkpoint。
+`ptxas-blackwell --version` 必须显示 CUDA 13.1 工具链（已验证 13.1.80）；
+这不改变 CUDA toolkit / PyTorch 的 cu130 配套。首次 JIT 和 graph capture
+可能耗时，应在服务就绪及预热完成后测吞吐。
 
 CED 当前是实验性的近似文本 prefill 路径。在已测长文本 prefill 中，按输入 token
 数 / TTFT 估算的 prefill 代理指标相对关闭 CED 时约翻倍，但收益会随 prompt、
@@ -299,6 +319,22 @@ FULL 配置。各模型原有的草稿数量和采样方式不因开启 adaptive
 本次在 SM120 上验证了 V4 / V4.1 算子、mixed prefill、padding、零草稿预算和
 FULL 回放，并完成 V4.1 整模型 serving；不将这些结果扩展为 SM89 实卡验证或
 完整模型精度无损保证。
+
+### 3.2 DeepSeek-V4.1-Flash 吞吐参考
+
+2026-09-12，4× RTX PRO 6000 Blackwell Server Edition 96GB（SM120），
+TP4/EP、FP8 KV、Engram CPU offload、CED + DSpark5 adaptive、FULL 配置下，
+使用 `vllm bench serve` 测得：
+
+| 输入 / 输出 tokens | 最大并发 | 请求数 | 聚合输出吞吐 | 平均 TTFT | 平均 TPOT |
+|---|---:|---:|---:|---:|---:|
+| 8,192 / 512 | 10 | 200 | **296.61 tokens/s** | 1.464 s | 30.64 ms |
+
+服务已预热，随机输入、temperature=0、ignore-eos，200/200 请求成功，
+前缀缓存命中为 0。吞吐为完整测试周期的总输出 tokens / 总耗时，包含
+prefill 和 decode，不是单请求或纯 decode 速度。此为一次测量，来自已应用
+本次 adaptive 补丁的 Vision9 / FlashInfer Vision2 环境，非新 Vision10 wheel
+的重新压测；无同负载基线，不据此声称 adaptive 加速比例或质量无损。
 
 ## 4. DeepSeek-V4-Flash 启动命令
 
