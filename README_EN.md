@@ -17,7 +17,7 @@ FlashInfer `0.6.18`. Validated configurations include
 
 | GPU architecture | Validated GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
 |---|---|---:|---:|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48 GB | Offline compilation only | Yes | Yes | Yes |
+| SM89 / Ada | 8× RTX 4090 48 GB | Pending validation | Yes | Yes | Yes |
 | SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes | Yes | Yes |
 
 ---
