@@ -29,9 +29,10 @@ FlashInfer `0.6.18`. Validated configurations include
 - Added SM89 / SM120 adaptive verification support for DeepSeek-V4 / V4.1 in
   the current `main` source, including device-ragged metadata, padding, and
   FULL graph replay. SM120 operator and V4.1 full-model validation passed;
-  physical SM89 adaptive validation remains pending. This is a source-only
-  update with no new wheels; existing `vision9` and earlier vLLM wheels do not
-  contain this adaptation.
+  physical SM89 adaptive validation remains pending. A new `vision10`
+  wheel was built with this adaptation, and README DSpark examples enable adaptive
+  verification with explicit FULL graphs by default. `vision9` and earlier
+  vLLM wheels do not contain it. Paired FlashInfer `vision2` is unchanged.
 - Added native DeepSeek-V4.1-Flash model, Engram, DSpark, and experimental CED
   prefill support, published as the SM89+SM120 `vision9` wheels.
 - Validated the full model server on 4× RTX PRO 6000 (SM120). SM89 validation
@@ -95,7 +96,7 @@ Earlier SM89 builds and environments remain available in
 | Triton | 3.7.1 (`ptxas-blackwell` from CUDA 13.1) |
 | Transformers | 5.16.1 |
 | FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision10.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
@@ -106,42 +107,41 @@ shape is compiled once and then reused from the JIT cache.
 
 ## 2. Quick install (prebuilt wheels)
 
-> **Adaptive verification cannot use the published vLLM whl packages below.**
-> Setting `enable_adaptive_verification=true` does not add this adaptation to
-> `vision9` or earlier packages. Install **this fork's current `main` source**
-> using section 2.1. The paired FlashInfer wheel remains usable; no new vLLM
-> wheel needs to be generated or downloaded for this update.
+> **Adaptive verification requires the new `vision10` vLLM wheel or this
+> fork's current `main` source.** `vision9` and earlier vLLM whl packages do
+> not contain this adaptation and cannot use the adaptive-enabled DSpark
+> commands below. The paired FlashInfer `vision2` wheel does not need replacing.
+
+If you have the `vision10` wheel and its `SHA256SUMS`, install them locally as
+shown below. Otherwise, install current `main` source using section 2.1.
+An older release wheel is not a substitute for the new build.
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
-  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl' \
-  --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision9-release
-
-cd /tmp/vllm-sm89-sm120-vision9-release
+cd /path/to/vision10-wheel-directory
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl \
+uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
 uv pip install 'transformers==5.16.1' 'triton==3.7.1'
 ```
 
-The vLLM wheel installs the paired FlashInfer wheel from a pinned URL in the
-same release. `SHA256SUMS` verifies both wheels downloaded above.
+`SHA256SUMS` verifies the local vLLM wheel. Its dependency still installs
+FlashInfer `vision2` from the `vision9` release using a pinned URL and SHA256;
+FlashInfer was not repackaged for this update.
 
 If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
 mirror.
 
-The existing `vision7` Docker image does **not** include DeepSeek-V4.1-Flash.
-Use the release wheels above or the source build below for V4.1.
+The existing `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
+this adaptive adaptation. It cannot directly use the adaptive-enabled DSpark
+commands below. Use `vision10` or current source; historical Docker
+configurations must keep adaptive disabled.
 
-### 2.1 Install current main source (required for adaptive)
+### 2.1 Install current main source (alternative to the wheel)
 
 This path installs this fork's current `main` source in editable mode and
 compiles the C++ / CUDA extensions for SM89 and SM120, without producing a
@@ -219,7 +219,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
 `ptxas-blackwell --version` must report the CUDA 13.1 toolchain.
@@ -236,20 +237,22 @@ The full model server was validated on SM120. SM89 validation was limited to
 offline compilation; no kernel numerical execution or full-model validation
 was performed on SM89 hardware.
 
-### 3.1 Enable adaptive verification: changes from fixed DSpark 5
+### 3.1 DSpark enables adaptive verification by default
 
-Install this fork's current `main` source using section 2.1 first. Keep the
-model path, TP/EP, FP8 KV, Engram, Model Runner V2, and CUDA 13.1 Blackwell
-assembler settings above. Replace `--speculative-config` and add explicit FULL:
+All DSpark launch examples below explicitly enable adaptive with FULL graphs.
+This is the README example default, not a change to the generic
+`SpeculativeConfig` default. Install `vision10` or current `main` source and
+use a DSpark checkpoint with a confidence head. Retain the model path, TP/EP,
+FP8 KV, Engram, Model Runner V2, and appropriate CUDA toolchain settings.
 
-| Parameter | Fixed DSpark 5 (command above) | Adaptive (current main source) |
+| Parameter | Previous fixed DSpark 5 | Current adaptive default |
 |---|---|---|
 | `enable_adaptive_verification` | `false` | `true` |
 | `--compilation-config` | Not explicitly set | `'{"cudagraph_mode":"FULL"}'` |
 | `num_speculative_tokens` / draft / rejection | `5` / `probabilistic` / `block` | Unchanged |
 | `--hf-overrides '{"ced_prefill":true}'` | Enables CED | May be retained; CED is not required for adaptive |
 
-The new command ending is:
+The V4.1 command ending is:
 
 ```bash
   --speculative-config \
@@ -263,11 +266,19 @@ remove that override for normal prefill. Real CED prefill/mixed steps still
 follow their EAGER route, while pure decode can use FULL; requesting FULL
 does not imply that all CED prefill runs inside a graph.
 
+To restore fixed-draft verification, set `enable_adaptive_verification=false`;
+FULL may remain enabled. Each model's existing draft count and sampling
+method stay unchanged when enabling adaptive.
+
 SM120 validation covers V4 / V4.1 operators, mixed prefill, padding, zero
 draft budgets, FULL replay, and V4.1 full-model serving. This is not evidence
 of physical SM89 validation or full-model accuracy equivalence.
 
 ## 4. DeepSeek-V4-Flash launch commands
+
+These commands now enable adaptive by default. V4 validation in this round
+covers SM120 operators and FULL replay, not a new V4 full-model serving run;
+physical SM89 adaptive validation remains pending.
 
 ### 4.1 SM89: 4× RTX 4090 48 GB
 
@@ -292,13 +303,14 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
-This preserves the established SM89 deployment profile. It has been validated
-with 8K, 32K, and 128K inputs, 512 output tokens, and four concurrent 8K
-requests.
+The previous fixed-DSpark profile was validated with 8K, 32K, and 128K inputs,
+512 output tokens, and four concurrent 8K requests. Those historical results
+do not validate the new adaptive setting on physical SM89 hardware.
 
 ### 4.2 SM120: 4× RTX PRO 6000 96 GB
 
@@ -322,13 +334,19 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
 ---
 
 ## 5. DeepSeek-V4-Flash-Vision-Exp launch commands
+
+These DSpark examples also enable adaptive by default. Vision-Exp multimodal
+adaptive full-model regression was not run in this round; validate actual
+inputs before deployment. Historical multimodal results are not new adaptive
+validation evidence.
 
 ### 5.1 SM89: 8× RTX 4090 48 GB
 
@@ -352,7 +370,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":3}' \
+  '{"method":"dspark","num_speculative_tokens":3,"enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
@@ -361,8 +380,9 @@ draft model and KV cache do not have enough memory headroom. 8× RTX 4090
 48 GB can enable DSpark with the command above; set
 `--max-num-batched-tokens` to `4096`.
 
-The 8-GPU command above is the recommended deployment configuration. This
-round of SM89 runtime regression used 4× RTX 4090 48 GB without DSpark.
+Historical SM89 runtime regression used 4× RTX 4090 48 GB without DSpark.
+The 8-GPU adaptive command above is outside the completed physical SM89
+validation scope.
 
 ### 5.2 SM120: 4× RTX PRO 6000 96 GB
 
@@ -386,7 +406,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":3}' \
+  '{"method":"dspark","num_speculative_tokens":3,"enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 

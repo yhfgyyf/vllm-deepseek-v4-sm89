@@ -27,8 +27,9 @@
 - 在当前 `main` 源码中增加 DeepSeek-V4 / V4.1 的 SM89 / SM120 adaptive
   verification 适配，覆盖 device-ragged metadata、padding 和 FULL graph 回放。
   SM120 已完成算子及 V4.1 整模型验证；SM89 adaptive 实卡验证仍待完成。
-  此更新仅提供源码，不生成新的 wheel；现有 `vision9` 及更早的 vLLM wheel
-  不包含该适配。
+  构建包含该适配的 `vision10` wheel，README 中的 DSpark 示例默认开启
+  adaptive verification，并显式使用 FULL graph；`vision9` 及更早的 vLLM
+  wheel 不包含该适配。配套 FlashInfer `vision2` 保持不变。
 - 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
   支持，发布 SM89+SM120 `vision9` wheel。
 - 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证；SM89 本轮仅完成
@@ -95,7 +96,7 @@
 | Triton | 3.7.1（`ptxas-blackwell` CUDA 13.1） |
 | Transformers | 5.16.1 |
 | FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision10.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -108,37 +109,32 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
-> **Adaptive verification 不能使用下面的已发布 vLLM whl 包。** 即使设置
-> `enable_adaptive_verification=true`，`vision9` 及更早的包也不包含本次适配。
-> 必须使用**本仓库当前 `main` 源码**，按 2.2 节安装；配套 FlashInfer wheel
-> 仍可使用，无需重新生成或下载新的 vLLM wheel。
+> **Adaptive verification 需要本次 `vision10` vLLM wheel 或本仓库当前
+> `main` 源码。** `vision9` 及更早的 vLLM whl 包不包含该适配，不能直接使用
+> 下文默认开启 adaptive 的 DSpark 命令。配套 FlashInfer `vision2` 无需更换。
+
+如果已获得 `vision10` wheel 和配套 `SHA256SUMS`，可按下方从本地安装；
+否则按 2.2 节直接安装当前 `main` 源码。不要将旧 Release wheel 当作新构建。
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
-  --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl' \
-  --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision9-release
-
-cd /tmp/vllm-sm89-sm120-vision9-release
+cd /path/to/vision10-wheel-directory
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl \
+uv pip install ./vllm-*glm53.dsv41.vision10.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
 uv pip install 'transformers==5.16.1' 'triton==3.7.1'
 ```
 
-vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashInfer wheel。
-下载到本地的两个 wheel 均由 `SHA256SUMS` 校验。
+`SHA256SUMS` 校验本地的 vLLM wheel。它会继续通过锁定 URL 和 SHA256 安装
+`vision9` Release 中的 FlashInfer `vision2` wheel；本次未重新打包 FlashInfer。
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
-### 2.2 从当前 main 源码安装（adaptive 必需）
+### 2.2 从当前 main 源码安装（wheel 的替代方案）
 
 以下流程以 editable 方式直接安装本仓库当前 `main` 源码，并编译 SM89 与
 SM120 的 C++ / CUDA 扩展，不生成用于分发的新 wheel。
@@ -172,8 +168,9 @@ uv pip install --no-build-isolation -e . --torch-backend=cu130
 
 ### 2.3 Docker 镜像（阿里云上海 ACR）
 
-> **注意：** 以下现有 Docker 镜像不包含 DeepSeek-V4.1-Flash 支持；V4.1
-> 请使用本次 Release wheel 或上述源码构建流程。
+> **注意：** 以下现有 Docker 镜像不包含 DeepSeek-V4.1-Flash 或本次 adaptive
+> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用 `vision10`
+> wheel 或上述源码安装流程；旧镜像的历史配置须关闭 adaptive。
 
 镜像地址：
 
@@ -208,14 +205,15 @@ docker run --rm --gpus all --ipc=host \
   /models/model-directory
 ```
 
-其余模型参数保持不变。镜像已完成 SM120 GPU 运行验证和 SM89 目标编译验证。
+其余模型参数按旧镜像的历史配置设置。镜像已完成 SM120 GPU 运行验证和 SM89
+目标编译验证，不代表它支持本次 adaptive 适配。
 
 ---
 
 ## 3. DeepSeek-V4.1-Flash 启动命令（SM120）
 
 以下为 4× RTX PRO 6000 96GB 上验证过的文本服务配置。它使用 TP=4、EP、
-FP8 KV、Engram CPU offload、DSpark 5 和实验性 CED prefill；CPU offload
+FP8 KV、Engram CPU offload、DSpark 5（adaptive）和实验性 CED prefill；CPU offload
 还需预留充足的主机内存。V4.1 使用 Model Runner V2，不支持切换到旧 V1 runner：
 
 ```bash
@@ -253,7 +251,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
 `ptxas-blackwell --version` 必须显示 CUDA 13.1 工具链。
@@ -267,20 +266,21 @@ CED 时不要发送图片或其他多模态内容。
 SM120 已完成完整模型服务验证；SM89 本轮仅完成离线编译验证，未在 SM89
 硬件上执行内核数值测试或完整模型服务验证。
 
-### 3.1 启用 adaptive verification：与固定 DSpark 5 的参数差异
+### 3.1 DSpark 默认开启 adaptive verification
 
-先按 2.2 节安装本仓库当前 `main` 源码。保留上述模型路径、TP/EP、FP8 KV、
-Engram、Model Runner V2 和 CUDA 13.1 Blackwell assembler 设置，只替换
-`--speculative-config` 并增加显式 FULL 配置：
+本文所有 DSpark 启动示例均显式开启 adaptive，并配置 FULL；这是 README
+示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。先安装 `vision10`
+wheel 或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
+保留模型路径、TP/EP、FP8 KV、Engram、Model Runner V2 和相应 CUDA 工具链设置。
 
-| 参数 | 固定 DSpark 5（上述命令） | Adaptive（当前 main 源码） |
+| 参数 | 旧固定 DSpark 5 | 当前默认 adaptive |
 |---|---|---|
 | `enable_adaptive_verification` | `false` | `true` |
 | `--compilation-config` | 未显式指定 | `'{"cudagraph_mode":"FULL"}'` |
 | `num_speculative_tokens` / draft / rejection | `5` / `probabilistic` / `block` | 不变 |
 | `--hf-overrides '{"ced_prefill":true}'` | 开启 CED | 可保留；CED 不是 adaptive 的必要条件 |
 
-新的命令结尾为：
+V4.1 的命令结尾为：
 
 ```bash
   --speculative-config \
@@ -293,11 +293,17 @@ Engram、Model Runner V2 和 CUDA 13.1 Blackwell assembler 设置，只替换
 prefill。CED 的真实 prefill/mixed 步骤仍遵循其 EAGER 路由，纯 decode 可使用
 FULL；显式 FULL 不表示所有 CED prefill 都在 graph 中执行。
 
+若要恢复固定草稿验证，将 `enable_adaptive_verification` 改为 `false`；可保留
+FULL 配置。各模型原有的草稿数量和采样方式不因开启 adaptive 而改变。
+
 本次在 SM120 上验证了 V4 / V4.1 算子、mixed prefill、padding、零草稿预算和
 FULL 回放，并完成 V4.1 整模型 serving；不将这些结果扩展为 SM89 实卡验证或
 完整模型精度无损保证。
 
 ## 4. DeepSeek-V4-Flash 启动命令
+
+以下命令已默认开启 adaptive。V4 本轮验证限于 SM120 算子和 FULL 回放，
+未重新执行 V4 整模型 serving；SM89 adaptive 实卡验证仍待完成。
 
 ### 4.1 SM89：4× RTX 4090 48GB
 
@@ -322,12 +328,13 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
-该配置保持原有 SM89 部署口径，已验证 8K、32K、128K 输入，512 输出，以及
-4 并发 8K 输入。
+原固定 DSpark 配置曾验证 8K、32K、128K 输入、512 输出及 4 并发 8K 输入；
+这些历史结果不代表新增 adaptive 参数后的 SM89 实卡验证。
 
 ### 4.2 SM120：4× RTX PRO 6000 96GB
 
@@ -351,13 +358,17 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
 ---
 
 ## 5. DeepSeek-V4-Flash-Vision-Exp 启动命令
+
+以下 DSpark 示例也默认开启 adaptive；本轮未进行 Vision-Exp 多模态 adaptive
+整模型回归，部署前需验证实际输入，历史多模态结果不作为本次验证证据。
 
 4× RTX 4090 48GB 可以运行 DeepSeek-V4-Flash-Vision-Exp，但不建议启用
 DSpark：目标模型和 draft model 会占用大部分显存，剩余空间不足以提供实用的
@@ -386,7 +397,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":3}' \
+  '{"method":"dspark","num_speculative_tokens":3,"enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
@@ -412,12 +424,13 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":3}' \
+  '{"method":"dspark","num_speculative_tokens":3,"enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
 
-上述 8 卡命令是推荐部署配置；本轮 SM89 实机回归使用 4× RTX 4090 48GB，
-且未启用 DSpark。
+历史 SM89 实机回归使用 4× RTX 4090 48GB，且未启用 DSpark；上述 8 卡
+adaptive 命令不属于已完成的 SM89 实机验证范围。
 
 ## 6. GLM-5.3-Flash 启动命令
 
