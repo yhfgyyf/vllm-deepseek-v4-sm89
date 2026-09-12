@@ -171,6 +171,16 @@ from vllm.v1.worker.workspace import use_workspace_lane
 logger = init_logger(__name__)
 
 
+def _requires_ced_eager(hf_config: Any, batch_req_state: Any, dummy_run: bool) -> bool:
+    return (
+        not dummy_run
+        and getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and bool(getattr(hf_config, "ced_prefill", False))
+        and batch_req_state is not None
+        and batch_req_state.has_prefill
+    )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -808,7 +818,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
             spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+            if not self.speculative_config.use_dspark() and hasattr(
+                self.model, "get_mtp_target_hidden_states"
+            ):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):
@@ -1585,6 +1597,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        if _requires_ced_eager(self.model_config.hf_config, batch_req_state, dummy_run):
+            skip_compiled = True
 
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -1954,7 +1968,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
             spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+            if not self.speculative_config.use_dspark() and hasattr(
+                self.model, "get_mtp_target_hidden_states"
+            ):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):

@@ -570,7 +570,7 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
-    # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
+    # DeepSeek V4-family fields. Other MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
     storage_block_size: int | None = None
@@ -820,7 +820,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
     cache_dtype_str: str | None = None
-    # DeepseekV4-only: see MLAAttentionSpec.model_version.
+    allow_prefix_caching: bool = True
+    # DeepSeek V4-family: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
 
@@ -828,11 +829,15 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     head_size_v: int = 0
 
     def __post_init__(self):
-        assert self.model_version in (None, "deepseek_v4"), (
+        assert self.model_version in (None, "deepseek_v4", "deepseek_v4_1"), (
             f"Unsupported model version: {self.model_version}"
         )
         super().__post_init__()
         _apply_alignment_padding(self)
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return self.allow_prefix_caching
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -845,16 +850,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        allow_prefix_caching_set = {spec.allow_prefix_caching for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
+            and len(allow_prefix_caching_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, and retained token count."
+            "window size, retained token count, and prefix-cache policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -866,6 +873,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             extra_retained_tokens=extra_retained_set.pop(),
+            allow_prefix_caching=allow_prefix_caching_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
@@ -877,6 +885,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.prefix_cacheable == self.prefix_cacheable
             for spec in kv_cache_specs.values()
         )
 

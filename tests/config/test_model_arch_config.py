@@ -16,6 +16,7 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.config.model_arch import ModelArchitectureConfig
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from vllm.transformers_utils.model_arch_config_convertor import (
     Gemma4ModelArchConfigConvertor,
@@ -70,6 +71,37 @@ def test_deepseek_v4_config_preserves_vision_n_layers():
     vision_config = DeepseekV4Config(vocab_size=1000, vision_n_layers=4)
     assert vision_config.vllm_mm_prefix_start_token_id == 1000
     assert vision_config.vllm_mm_prefix_end_token_id == 1004
+
+
+def test_deepseek_v41_config_flattens_text_and_vision_fields():
+    config = DeepseekV41Config(
+        text_config={"hidden_size": 5120, "num_hidden_layers": 40},
+        vision_config={
+            "num_hidden_layers": 32,
+            "hidden_size": 1024,
+            "patch_size": 14,
+            "downsample_ratio": 2,
+            "max_image_tokens": 1024,
+        },
+    )
+
+    assert config.hidden_size == 5120
+    assert config.num_hidden_layers == 40
+    assert config.vision_n_layers == 32
+    assert config.vision_dim == 1024
+    assert config.vision_downsample_ratio == 2
+    assert config.is_mm_prefix_lm is True
+    assert config.mm_prefix_clamp_sliding_window is True
+    assert config.mm_prefix_span_leading_pad_modulus == 2
+
+
+def test_deepseek_v41_text_config_does_not_enable_mm_prefix():
+    config = DeepseekV41Config(text_config={"hidden_size": 5120})
+
+    assert config.vision_n_layers == 0
+    assert config.is_mm_prefix_lm is False
+    assert config.mm_prefix_clamp_sliding_window is False
+    assert config.mm_prefix_span_leading_pad_modulus == 0
 
 
 def _load_groundtruth(filename: str) -> dict:

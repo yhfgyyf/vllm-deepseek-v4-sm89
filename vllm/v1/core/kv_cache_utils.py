@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -1909,6 +1910,12 @@ def group_and_unify_kv_cache_specs(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     ):
         return None
+    # Every spec must be consumed by the specialized grouping loop below.
+    if any(
+        not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        for spec in kv_cache_spec.values()
+    ):
+        return None
 
     # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
@@ -1916,14 +1923,15 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
-    # Group SWA layers by (block_size, sliding_window), separating C4I+C4A and
-    # C128A-style DeepseekV4 groups.
+    grouped_swa_mla_specs: dict[
+        tuple[int, int, bool], dict[str, KVCacheSpec]
+    ] = defaultdict(dict)
+    # Group SWA layers by allocation geometry and cacheability, separating
+    # C4I+C4A, C128A, and request-private DeepSeek V4-family groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            key = (spec.block_size, spec.sliding_window, spec.prefix_cacheable)
+            grouped_swa_mla_specs[key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
 
@@ -2123,15 +2131,31 @@ def _get_packed_kv_cache_groups(
             cdiv(len(names), n) * page for page, names in page_size_layers.items()
         )
 
-    # Bytes a block must hold however the mamba buckets end up split: a mamba
-    # bucket can go down to one state per group, every other bucket's split is
-    # already fixed by the repeat pattern.
+    # Bytes a block must hold however state buckets end up split. Circular
+    # buffers and unsplit sliding-window states can go down to one state per
+    # group, like mamba states.
+    def is_state_bucket(spec: UniformTypeKVCacheSpecs) -> bool:
+        model_config = vllm_config.model_config
+        is_deepseek_v41 = (
+            model_config is not None
+            and model_config.hf_config.model_type == "deepseek_v41"
+        )
+        if isinstance(spec.first_spec, MambaSpec):
+            return True
+        if not is_deepseek_v41:
+            return False
+        if isinstance(spec.first_spec, CircularBufferSpec):
+            return True
+        return repeats_per_group is None and isinstance(
+            spec.first_spec, SlidingWindowSpec
+        )
+
     anchor_bytes = max(
         (
             widest_group_bytes(
                 page_size_layers,
                 len(spec.kv_cache_specs)
-                if isinstance(spec.first_spec, MambaSpec)
+                if is_state_bucket(spec)
                 else num_groups_for(spec, balanced),
             )
             for spec, page_size_layers, balanced in bucketed
@@ -2145,7 +2169,7 @@ def _get_packed_kv_cache_groups(
         # `_align_hybrid_block_size` pads a mamba state up to one attention
         # page, so cap a mamba group at the states a block already fits rather
         # than let it widen the block.
-        if anchor_bytes and isinstance(spec.first_spec, MambaSpec):
+        if anchor_bytes and is_state_bucket(spec):
             states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
             num_groups = max(
                 num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
@@ -2181,8 +2205,9 @@ def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     if spec_config is None or not spec_config.use_eagle():
         return False
     model_config = vllm_config.model_config
-    return (
-        model_config is not None and model_config.hf_config.model_type == "deepseek_v4"
+    return model_config is not None and model_config.hf_config.model_type in (
+        "deepseek_v4",
+        "deepseek_v41",
     )
 
 
@@ -2218,7 +2243,7 @@ def _annotate_eagle_groups(
         kv_cache_spec: The kv cache spec of each attention layer, in layer
             registration order. Only read by rule 2.
         kv_cache_groups: Groups to annotate in place.
-        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4 packed group.
+        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4/V4.1 packed group.
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle_block_drop():

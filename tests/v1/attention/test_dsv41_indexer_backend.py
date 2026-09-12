@@ -1,0 +1,410 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    _dsv41_expand_decode_seq_lens,
+    _dsv41_rows_per_chunk,
+    _dsv41_workspace_specs,
+)
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer as indexer_backend
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV4IndexerBackend,
+    DeepseekV32IndexerMetadataBuilder,
+    DeepseekV41IndexerBackend,
+    DeepseekV41IndexerMetadataBuilder,
+    _dsv41_decode_max_indexer_kv_len,
+    dsv41_indexer_uses_fp4,
+)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.workspace import WorkspaceManager
+
+
+class _AttentionConfig:
+    def __init__(self, dtype: str):
+        self.dtype = dtype
+
+    def resolve_indexer_kv_dtype(self, default: str) -> str:
+        return default if self.dtype == "auto" else self.dtype
+
+
+def _config(dtype: str = "auto"):
+    return SimpleNamespace(attention_config=_AttentionConfig(dtype))
+
+
+def _builder_config(max_model_len: int = 128):
+    return SimpleNamespace(
+        attention_config=_AttentionConfig("auto"),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_seqs=4,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+        num_speculative_tokens=0,
+    )
+
+
+def _build_single_decode(
+    builder_cls,
+    monkeypatch,
+    *,
+    compress_ratio: int = 1,
+    seq_len: int = 17,
+    max_model_len: int = 128,
+    for_cudagraph_capture: bool = False,
+):
+    monkeypatch.setattr(indexer_backend, "num_compute_units", lambda _: 4)
+    monkeypatch.setattr(indexer_backend, "_use_flattening", lambda _: False)
+    monkeypatch.setattr(
+        indexer_backend, "_supports_varlen_paged_mqa_logits", lambda: False
+    )
+    monkeypatch.setattr(indexer_backend, "dsv41_indexer_uses_fp4", lambda _: True)
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_compressed_slot_mapping",
+        lambda num_tokens, *_args, out, **_kwargs: out[:num_tokens],
+    )
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=compress_ratio,
+        state_content_bytes=68,
+        alignment=128,
+        model_version="deepseek_v4_1",
+    )
+    builder = builder_cls(
+        kv_cache_spec=spec,
+        layer_names=["model.layers.20.attn.indexer.k_cache"],
+        vllm_config=_builder_config(max_model_len),
+        device=torch.device("cpu"),
+        block_table_width=1,
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=seq_len,
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len], dtype=torch.int32),
+    )
+    metadata = (
+        builder.build_for_cudagraph_capture(common)
+        if for_cudagraph_capture
+        else builder.build(0, common)
+    )
+    return builder, metadata
+
+
+def test_v41_backend_isolated_interface() -> None:
+    assert DeepseekV4IndexerBackend.get_supported_kernel_block_sizes() == [256]
+    assert DeepseekV41IndexerBackend.get_name() == "DEEPSEEK_V41_INDEXER"
+    assert not DeepseekV41IndexerBackend.supports_pcp()
+    assert DeepseekV41IndexerBackend.get_supported_kernel_block_sizes() == [128]
+    assert (
+        DeepseekV41IndexerBackend.get_builder_cls() is DeepseekV41IndexerMetadataBuilder
+    )
+
+
+def test_v41_builder_skips_deep_gemm_scheduler_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        indexer_backend, "_uses_deep_gemm_scheduler_metadata", lambda: True
+    )
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_paged_mqa_logits_metadata",
+        lambda *_args, **_kwargs: pytest.fail("V4.1 requested DeepGEMM metadata"),
+    )
+
+    builder, metadata = _build_single_decode(
+        DeepseekV41IndexerMetadataBuilder, monkeypatch
+    )
+
+    assert metadata.decode is not None
+    assert (
+        metadata.decode.schedule_metadata.data_ptr()
+        == builder.scheduler_metadata_buffer.data_ptr()
+    )
+
+
+@pytest.mark.parametrize(
+    ("compress_ratio", "expected_active", "expected_capture"),
+    [(1, 257, 1024), (2, 128, 512)],
+)
+def test_v41_builder_uses_active_width_but_capture_uses_configured_max(
+    monkeypatch,
+    compress_ratio: int,
+    expected_active: int,
+    expected_capture: int,
+) -> None:
+    _, active = _build_single_decode(
+        DeepseekV41IndexerMetadataBuilder,
+        monkeypatch,
+        compress_ratio=compress_ratio,
+        seq_len=257,
+        max_model_len=1024,
+    )
+    _, capture = _build_single_decode(
+        DeepseekV41IndexerMetadataBuilder,
+        monkeypatch,
+        compress_ratio=compress_ratio,
+        seq_len=257,
+        max_model_len=1024,
+        for_cudagraph_capture=True,
+    )
+
+    assert active.decode is not None
+    assert capture.decode is not None
+    assert active.decode.max_indexer_kv_len == expected_active
+    assert capture.decode.max_indexer_kv_len == expected_capture
+
+
+@pytest.mark.parametrize(("compress_ratio", "expected"), [(1, 257), (2, 128)])
+def test_v41_active_width_ignores_prefill_and_graph_padding_rows(
+    compress_ratio: int, expected: int
+) -> None:
+    seq_lens_cpu_upper_bound = torch.tensor([130, 257, 0, 0, 8192], dtype=torch.int32)
+
+    actual = _dsv41_decode_max_indexer_kv_len(
+        seq_lens_cpu_upper_bound,
+        num_decodes=4,
+        compress_ratio=compress_ratio,
+    )
+
+    assert actual == expected
+
+
+def test_legacy_builder_keeps_deep_gemm_scheduler_metadata(monkeypatch) -> None:
+    calls = []
+    expected = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    monkeypatch.setattr(
+        indexer_backend, "_uses_deep_gemm_scheduler_metadata", lambda: True
+    )
+
+    def fake_metadata(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(indexer_backend, "get_paged_mqa_logits_metadata", fake_metadata)
+
+    _, metadata = _build_single_decode(DeepseekV32IndexerMetadataBuilder, monkeypatch)
+
+    assert len(calls) == 1
+    assert metadata.decode is not None
+    assert metadata.decode.max_indexer_kv_len is None
+    torch.testing.assert_close(metadata.decode.schedule_metadata, expected)
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (12, 0)])
+def test_v41_fp4_contract_accepts_sm89_and_sm120(monkeypatch, capability) -> None:
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer.current_platform,
+        "is_device_capability",
+        lambda target: capability == target,
+    )
+    monkeypatch.setattr(
+        indexer.current_platform,
+        "is_device_capability_family",
+        lambda family: capability[0] == family // 10,
+    )
+
+    assert dsv41_indexer_uses_fp4(_config())
+
+
+def test_v41_fp4_contract_rejects_precision_override(monkeypatch) -> None:
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer.current_platform, "is_device_capability", lambda _: True
+    )
+
+    with pytest.raises(ValueError, match="requires indexer_kv_dtype='mxfp4'"):
+        dsv41_indexer_uses_fp4(_config("fp8"))
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "expected"),
+    [
+        ([10, 20], [10, 10, 10, 20, 20, 20]),
+        ([10, 11, 12, 20, 21, 22], [10, 11, 12, 20, 21, 22]),
+        ([[10, 11, 12], [20, 21, 22]], [10, 11, 12, 20, 21, 22]),
+    ],
+)
+def test_v41_decode_seq_lens_expand_per_request_or_query(seq_lens, expected) -> None:
+    actual = _dsv41_expand_decode_seq_lens(torch.tensor(seq_lens), 2, 3)
+    assert actual.tolist() == expected
+
+
+def test_v41_short_context_chunk_is_capped_by_block_score_scratch() -> None:
+    max_logits_elements = 512 * 1024 * 1024 // 4
+    assert (
+        _dsv41_rows_per_chunk(1, max_logits_elements, needs_block_scores=True) == 8192
+    )
+    assert (
+        _dsv41_rows_per_chunk(1, max_logits_elements, needs_block_scores=False) == 8192
+    )
+    assert (
+        _dsv41_rows_per_chunk(2048 * 8, max_logits_elements, needs_block_scores=False)
+        == 8192
+    )
+
+
+def test_v41_workspace_specs_cover_runtime_scratch(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    specs = _dsv41_workspace_specs(1024 * 1024)
+    max_logits_elements = 512 * 1024 * 1024 // 4
+    assert specs == (
+        ((max_logits_elements,), torch.float32),
+        ((max_logits_elements // 8,), torch.float32),
+        ((max_logits_elements // (2048 * 8),), torch.int32),
+        ((1024 * 1024,), torch.uint8),
+    )
+
+
+def test_v41_workspace_views_are_distinct_and_stable(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+    specs = _dsv41_workspace_specs(64 * 1024)
+    manager = WorkspaceManager(torch.device("cpu"))
+
+    first = manager.get_simultaneous(*specs)
+    byte_ranges = sorted(
+        (tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes) for tensor in first
+    )
+    assert all(
+        left_end <= right_start
+        for (_, left_end), (right_start, _) in zip(byte_ranges, byte_ranges[1:])
+    )
+
+    manager.lock()
+    second = manager.get_simultaneous(*specs)
+    assert [tensor.data_ptr() for tensor in second] == [
+        tensor.data_ptr() for tensor in first
+    ]
+
+
+def test_v41_candidate_source_requires_exact_output_shape() -> None:
+    args = (
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        512,
+        1024,
+    )
+    with pytest.raises(ValueError, match="requires a candidate output buffer"):
+        sparse_indexer._dsv41_native_indexer(*args, None, 8, True)
+    with pytest.raises(ValueError, match="2048 blocks per row"):
+        sparse_indexer._dsv41_native_indexer(
+            *args, torch.empty(1, 2047, dtype=torch.int32), 8, False
+        )
+
+
+def test_v41_profile_reserves_runtime_workspace_without_legacy_dummy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    expected = _dsv41_workspace_specs(1024 * 1024)
+    calls = []
+
+    class _Workspace:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return []
+
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+    monkeypatch.setattr(
+        sparse_indexer.current_platform, "fp8_dtype", lambda: torch.float16
+    )
+    monkeypatch.setattr(
+        sparse_indexer, "current_workspace_manager", lambda: _Workspace()
+    )
+    hidden = torch.zeros(1, 1)
+    q_values = torch.zeros(1, 32, 64, dtype=torch.uint8)
+    q_scales = torch.zeros(1, 32, 4, dtype=torch.uint8)
+    weights = torch.zeros(1, 32)
+    topk = torch.empty(1, 512, dtype=torch.int32)
+    monkeypatch.setattr(
+        sparse_indexer.torch,
+        "empty",
+        lambda *args, **kwargs: pytest.fail("legacy dummy allocation reached"),
+    )
+
+    result = sparse_indexer.sparse_attn_indexer(
+        hidden,
+        "model.layers.0.self_attn.indexer.k_cache",
+        torch.zeros(1, 64, 68, dtype=torch.uint8),
+        q_values,
+        q_scales,
+        None,
+        weights,
+        128,
+        "ue8m0",
+        512,
+        128,
+        1024 * 1024,
+        1024 * 1024,
+        topk,
+        True,
+        False,
+        "",
+        use_fp4_cache=True,
+        use_v41_native=True,
+    )
+
+    assert result is topk
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("batch_size", [16, 32])
+@pytest.mark.parametrize("next_n", [5, 7, 8])
+@pytest.mark.parametrize("max_model_len", [128 * 1024, 1024 * 1024])
+def test_v41_decode_chunks_preserve_whole_query_groups(
+    batch_size: int, next_n: int, max_model_len: int
+) -> None:
+    max_logits_elements = 512 * 1024 * 1024 // 4
+    rows = _dsv41_rows_per_chunk(
+        max_model_len,
+        max_logits_elements,
+        needs_block_scores=True,
+        group_size=next_n,
+    )
+    assert rows >= next_n
+    assert rows % next_n == 0
+    assert rows * max_model_len <= max_logits_elements
+    assert rows <= max_logits_elements // (2048 * 8)
+    score_width = max(2048, (max_model_len + 7) // 8)
+    assert rows * score_width <= max_logits_elements // 8
+    requests_per_chunk = rows // next_n
+    chunk_rows = [
+        (min(start + requests_per_chunk, batch_size) - start) * next_n
+        for start in range(0, batch_size, requests_per_chunk)
+    ]
+    assert sum(chunk_rows) == batch_size * next_n
+    assert all(0 < size <= rows and size % next_n == 0 for size in chunk_rows)

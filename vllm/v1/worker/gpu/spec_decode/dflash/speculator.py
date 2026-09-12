@@ -303,6 +303,40 @@ class DFlashSpeculator(DraftModelSpeculator):
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
+    def _precompute_context_kv(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_rejected: torch.Tensor,
+        *,
+        dummy_run: bool,
+    ) -> None:
+        """Insert target context outside the fixed-shape draft query graph."""
+        num_tokens = input_batch.num_tokens
+        if aux_hidden_states:
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
+        else:
+            hidden_states = last_hidden_states
+        self.hidden_states[:num_tokens].copy_(hidden_states[:num_tokens])
+        if dummy_run:
+            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+        elif self._layer_group_idx is not None:
+            context_slots = [
+                self._context_slot_mappings[gidx][:num_tokens]
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][:num_tokens]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:num_tokens],
+            self.context_positions[:num_tokens],
+            context_slots,
+        )
+
     @torch.inference_mode()
     def propose(
         self,
@@ -332,32 +366,23 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
-        num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
-        # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
-        # number of rejected tokens, we maintain the size of input_ids and
-        # hidden_states the same as the target model's. This means, we pad each
-        # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
-
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
-            self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
+            self._precompute_context_kv(
+                input_batch,
+                attn_metadata,
+                last_hidden_states,
+                aux_hidden_states,
+                num_rejected,
+                dummy_run=True,
             )
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
@@ -410,23 +435,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
-        if dummy_run:
-            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif self._layer_group_idx is not None:
-            context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
-                for gidx in self._layer_group_idx
-            ]
-        else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
+        self._precompute_context_kv(
+            input_batch,
+            attn_metadata,
+            last_hidden_states,
+            aux_hidden_states,
+            num_rejected,
+            dummy_run=dummy_run,
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs

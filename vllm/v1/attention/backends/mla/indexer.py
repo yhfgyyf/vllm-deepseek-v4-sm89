@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -72,6 +72,22 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
             "earlier architectures are not supported."
         )
     return use_fp4
+
+
+def dsv41_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
+    """Validate the native V4.1 MXFP4 index-cache contract."""
+    kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("mxfp4")
+    if kv_dtype != "mxfp4":
+        raise ValueError(
+            f"DeepSeek V4.1 requires indexer_kv_dtype='mxfp4', got {kv_dtype!r}"
+        )
+    supported = current_platform.is_cuda() and (
+        current_platform.is_device_capability((8, 9))
+        or current_platform.is_device_capability_family(120)
+    )
+    if not supported:
+        raise ValueError("DeepSeek V4.1 native indexer requires CUDA SM89 or SM120")
+    return True
 
 
 class PrepareUniformDecodeKernel(
@@ -300,6 +316,32 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
+
+
+class DeepseekV41IndexerBackend(DeepseekV32IndexerBackend):
+    """Model-specific backend for segregated V4.1 MXFP4 index pages."""
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V41_INDEXER"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # This is the manager/logical token block. C2 stores 64 compressed
+        # states per page and C1 stores 128 via tokens_per_state.
+        return [128]
+
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV41IndexerMetadataBuilder"]:
+        return DeepseekV41IndexerMetadataBuilder
 
 
 @dataclass
@@ -539,6 +581,9 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
+    # V4.1 dense decode only. Ordinary builds use the active compressed
+    # context; full CUDA-graph capture uses the configured compressed maximum.
+    max_indexer_kv_len: int | None = None
 
 
 @dataclass
@@ -686,11 +731,28 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _dsv41_decode_max_indexer_kv_len(
+    seq_lens_cpu_upper_bound: torch.Tensor,
+    num_decodes: int,
+    compress_ratio: int,
+) -> int:
+    """Return a safe CPU-side launch width for V4.1 dense decode."""
+    if num_decodes <= 0:
+        return 0
+    active_len = int(seq_lens_cpu_upper_bound[:num_decodes].max().item())
+    return max(1, active_len // compress_ratio)
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # The indexer opts out of the shared reorder-threshold vote (see __init__),
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    _builds_deep_gemm_scheduler_metadata: ClassVar[bool] = True
+
+    @classmethod
+    def _resolve_use_fp4(cls, vllm_config: VllmConfig) -> bool:
+        return dsa_indexer_uses_fp4(vllm_config)
 
     @classmethod
     def get_cudagraph_support(
@@ -728,7 +790,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.vllm_config.speculative_config
             else 0
         )
-        self.use_fp4_indexer_cache = dsa_indexer_uses_fp4(self.vllm_config)
+        self.use_fp4_indexer_cache = self._resolve_use_fp4(self.vllm_config)
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
@@ -1259,7 +1321,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if _uses_deep_gemm_scheduler_metadata():
+            if (
+                self._builds_deep_gemm_scheduler_metadata
+                and _uses_deep_gemm_scheduler_metadata()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
@@ -1295,6 +1360,52 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+
+class DeepseekV41IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Metadata builder for the native SM89/SM120 V4.1 indexer."""
+
+    _builds_deep_gemm_scheduler_metadata: ClassVar[bool] = False
+
+    @classmethod
+    def _resolve_use_fp4(cls, vllm_config: VllmConfig) -> bool:
+        return dsv41_indexer_uses_fp4(vllm_config)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.kernel_block_size = 128
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> DeepseekV32IndexerMetadata:
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=fast_build,
+        )
+        if metadata.decode is not None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            metadata.decode.max_indexer_kv_len = _dsv41_decode_max_indexer_kv_len(
+                seq_lens_cpu,
+                metadata.num_decodes,
+                self.compress_ratio,
+            )
+        return metadata
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> DeepseekV32IndexerMetadata:
+        metadata = super().build_for_cudagraph_capture(common_attn_metadata)
+        if metadata.decode is not None:
+            metadata.decode.max_indexer_kv_len = max(
+                1,
+                self.vllm_config.model_config.max_model_len // self.compress_ratio,
+            )
+        return metadata
 
 
 def build_prefill_chunk_metadata(

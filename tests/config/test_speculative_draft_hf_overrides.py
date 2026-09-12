@@ -185,3 +185,79 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+def _make_deepseek_v41_target_config() -> MagicMock:
+    return MagicMock(
+        model="target",
+        model_weights=None,
+        max_model_len=128,
+        quantization="deepseek_v41_fp8",
+        hf_overrides={},
+        hf_config=PretrainedConfig(
+            model_type="deepseek_v41",
+            architectures=["DeepseekV41ForCausalLM"],
+        ),
+    )
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v41_rejects_classic_mtp():
+    draft_hf_config = PretrainedConfig(
+        model_type="deepseek_mtp",
+        architectures=["DeepseekV41ForCausalLM"],
+        n_predict=5,
+    )
+    draft_model_config = MagicMock(
+        model="target",
+        hf_config=draft_hf_config,
+        architectures=draft_hf_config.architectures,
+        max_model_len=128,
+    )
+
+    with (
+        patch("vllm.config.speculative.ModelConfig", return_value=draft_model_config),
+        pytest.raises(ValueError, match="contain DSpark stages, not classic MTP"),
+    ):
+        SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=5,
+            target_model_config=_make_deepseek_v41_target_config(),
+            target_parallel_config=ParallelConfig(),
+        )
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v41_dspark_uses_checkpoint_block_size():
+    draft_hf_config = PretrainedConfig(
+        model_type="deepseek_mtp",
+        architectures=["DeepseekV41ForCausalLM"],
+        dspark_block_size=5,
+        n_predict=5,
+    )
+    draft_model_config = MagicMock(
+        model="target",
+        hf_config=draft_hf_config,
+        architectures=draft_hf_config.architectures,
+        max_model_len=128,
+    )
+    draft_model_config.registry.inspect_model_cls.return_value = (
+        MagicMock(),
+        "DSparkV41DraftModel",
+    )
+
+    with patch("vllm.config.speculative.ModelConfig", return_value=draft_model_config):
+        speculative_config = SpeculativeConfig(
+            method="dspark",
+            num_speculative_tokens=5,
+            target_model_config=_make_deepseek_v41_target_config(),
+            target_parallel_config=ParallelConfig(),
+        )
+
+    assert speculative_config.method == "dspark"
+    assert speculative_config.parallel_drafting is True
+    assert speculative_config.draft_model_config.hf_config.model_type == "deepseek_v41"
+    assert speculative_config.draft_model_config.hf_config.architectures == [
+        "DSparkV41DraftModel"
+    ]
+    assert speculative_config.draft_model_config.hf_config.n_predict == 5

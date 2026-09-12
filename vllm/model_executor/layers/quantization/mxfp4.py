@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
     select_deepseek_v4_mxfp4_moe_backend,
+    select_deepseek_v41_mxfp4_moe_backend,
     select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -38,6 +39,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -474,11 +476,15 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     """MXFP4 MoE quantization method."""
 
-    def __init__(self, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        moe: FusedMoEConfig,
+        backend_selector=select_deepseek_v4_mxfp4_moe_backend,
+    ):
         super().__init__(moe)
 
         self.weight_dtype = "mxfp4"
-        self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
+        self.mxfp4_backend, self.experts_cls = backend_selector(moe)
 
         self.max_capture_size = moe.max_capture_size
 
@@ -883,3 +889,65 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+
+
+class DeepseekV41Mxfp4MoEMethod(Mxfp4MoEMethod):
+    """V4.1 experts with mandatory MXFP8 K32 activation boundaries."""
+
+    def __init__(self, moe: FusedMoEConfig):
+        super().__init__(
+            moe,
+            backend_selector=select_deepseek_v41_mxfp4_moe_backend,
+        )
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = (
+            FusedMoEMethodBase.maybe_roundup_sizes(
+                self,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                act_dtype=act_dtype,
+                moe_parallel_config=moe_parallel_config,
+            )
+        )
+        return hidden_size, round_up(intermediate_size_per_partition, 64)
+
+    def get_fused_moe_quant_config(
+        self,
+        layer: RoutedExperts,
+    ) -> FusedMoEQuantConfig | None:
+        if self.mxfp4_backend != Mxfp4MoeBackend.MARLIN:
+            return super().get_fused_moe_quant_config(layer)
+
+        from vllm.model_executor.layers.fused_moe.config import (
+            mxfp4_mxfp8_moe_quant_config,
+        )
+
+        return mxfp4_mxfp8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+            is_scale_swizzled=False,
+            router_weight_before_fc2_quant=True,
+        )
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            get_marlin_input_dtype,
+        )
+
+        if get_marlin_input_dtype() is not None:
+            raise ValueError(
+                "DeepSeek-V4.1 uses packed Marlin W4A16 after its official "
+                "K32 MXFP8 quantize/dequantize boundary. "
+                "VLLM_MARLIN_INPUT_DTYPE must be unset."
+            )
+        super().process_weights_after_loading(layer)

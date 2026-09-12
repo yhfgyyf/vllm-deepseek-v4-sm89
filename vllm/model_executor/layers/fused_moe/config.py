@@ -261,6 +261,9 @@ class FusedMoEQuantConfig:
 
     mx_alignment: int = 0
 
+    # Preserve the V4.1 router-weight boundary before FC2 activation quant.
+    router_weight_before_fc2_quant: bool = False
+
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
             "illegal quantization"
@@ -729,6 +732,7 @@ def mxfp4_mxfp8_moe_quant_config(
     gemm1_clamp_limit: float | None = None,
     mx_alignment: int = 0,
     is_scale_swizzled: bool = True,
+    router_weight_before_fc2_quant: bool = False,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and mxfp4 weights.
@@ -743,6 +747,7 @@ def mxfp4_mxfp8_moe_quant_config(
         gemm1_clamp_limit=gemm1_clamp_limit,
         mx_alignment=mx_alignment,
         is_scale_swizzled=is_scale_swizzled,
+        router_weight_before_fc2_quant=router_weight_before_fc2_quant,
     )
 
 

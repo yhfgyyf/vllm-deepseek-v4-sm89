@@ -19,6 +19,7 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -84,8 +85,12 @@ def _make_runner(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_lookahead_tokens: int,
     num_spec_steps: int = NUM_SPEC_STEPS,
+    ced_enabled: bool | None = None,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup entry points read."""
+    model_state = SimpleNamespace(max_encoder_len=0)
+    if ced_enabled is not None:
+        model_state.ced_enabled = ced_enabled
     return SimpleNamespace(
         num_speculative_steps=num_spec_steps,
         decode_query_len=num_spec_steps + 1,
@@ -95,7 +100,7 @@ def _make_runner(
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
-        model_state=SimpleNamespace(max_encoder_len=0),
+        model_state=model_state,
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
@@ -114,9 +119,12 @@ class _StepRecorder:
     def __init__(self) -> None:
         # (blocks held per group, num_computed_tokens, num_scheduled_tokens)
         self.steps: list[tuple[list[int], int, int]] = []
+        self.scheduler_outputs: list[SchedulerOutput] = []
+        self.grammar_outputs: list[GrammarOutput | None] = []
         self._held: dict[str, list[int]] = {}
 
     def execute_model(self, scheduler_output) -> None:
+        self.scheduler_outputs.append(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._held[new_req.req_id] = [len(ids) for ids in new_req.block_ids]
             self._record(new_req.req_id, new_req.num_computed_tokens, scheduler_output)
@@ -140,7 +148,7 @@ class _StepRecorder:
         )
 
     def sample_tokens(self, grammar_output=None) -> None:
-        return None
+        self.grammar_outputs.append(grammar_output)
 
 
 def _assert_covers_lookahead(
@@ -171,6 +179,42 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+
+
+@pytest.mark.parametrize(
+    ("ced_enabled", "expected_prompt_logprobs"),
+    [(True, None), (False, 1), (None, 1)],
+)
+def test_warmup_kernels_disables_only_ced_prompt_logprobs(
+    ced_enabled: bool | None, expected_prompt_logprobs: int | None
+):
+    recorder = _StepRecorder()
+
+    warmup_kernels(
+        _make_runner(
+            [_attention_group()],
+            num_lookahead_tokens=5,
+            num_spec_steps=5,
+            ced_enabled=ced_enabled,
+        ),
+        recorder.execute_model,
+        recorder.sample_tokens,
+    )
+
+    prefill_output = recorder.scheduler_outputs[0]
+    sampling_params = prefill_output.scheduled_new_reqs[0].sampling_params
+    assert sampling_params.prompt_logprobs == expected_prompt_logprobs
+    assert sampling_params.logprobs == 5
+
+    decode_outputs = recorder.scheduler_outputs[1:-1]
+    assert len(decode_outputs) == 5
+    assert all(output.scheduled_cached_reqs.req_ids for output in decode_outputs)
+    assert len(recorder.grammar_outputs) == 6
+
+    cleanup_output = recorder.scheduler_outputs[-1]
+    assert cleanup_output.finished_req_ids == {
+        req.req_id for req in prefill_output.scheduled_new_reqs
+    }
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():

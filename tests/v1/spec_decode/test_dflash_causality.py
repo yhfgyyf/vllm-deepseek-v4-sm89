@@ -9,6 +9,7 @@ per-layer causality, and the no-``layer_types`` fallback) is worth pinning.
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm.model_executor.models.qwen3_dflash import (
@@ -16,8 +17,16 @@ from vllm.model_executor.models.qwen3_dflash import (
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    _resolve_dspark_attention_backend,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
+)
+from vllm.v1.worker.gpu_model_runner import (
+    _build_lookback_token_ids,
+    _v41_mm_prefix_span,
 )
 
 
@@ -113,3 +122,56 @@ def test_eagle_aux_layers_preserves_legacy_layer_ids(config_name):
     assert get_eagle3_aux_layers_from_config(vllm_config.speculative_config) == tuple(
         layer_ids
     )
+
+
+@pytest.mark.parametrize(
+    "model_type,expected",
+    [("deepseek_v4", (38, 39, 40)), ("deepseek_v41", (37, 38, 39))],
+)
+def test_dspark_eagle_aux_layer_index_semantics(model_type, expected):
+    config = _vllm_config(model_type=model_type, dspark_target_layer_ids=[37, 38, 39])
+    assert get_eagle3_aux_layers_from_config(config.speculative_config) == expected
+
+
+def test_dspark_deepseek_v41_reuses_target_attention_backend():
+    draft = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+    target = AttentionBackendEnum.FLASHINFER_MLA
+    assert _resolve_dspark_attention_backend(draft, None, target) is target
+
+
+@pytest.mark.parametrize(
+    "computed,prompt,expected",
+    [
+        (0, 0, [-1, -1, -1]),
+        (1, 3, [10, -1, -1]),
+        (3, 3, [12, 11, 10]),
+        (5, 3, [-1, -1, 12]),
+    ],
+)
+def test_lookback_token_ids_masks_non_prompt_positions(computed, prompt, expected):
+    tokens = np.array([[10, 11, 12, -7, -7, -7]], dtype=np.int32)
+    result = _build_lookback_token_ids(
+        tokens,
+        np.array([computed], dtype=np.int32),
+        np.array([prompt], dtype=np.int32),
+        3,
+    )
+    np.testing.assert_array_equal(result[0], expected)
+
+
+def test_lookback_token_ids_empty_warmup_batch():
+    result = _build_lookback_token_ids(
+        np.empty((0, 4), dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        3,
+    )
+    assert result.shape == (0, 3)
+
+
+@pytest.mark.parametrize(
+    "offset,length,expected",
+    [(0, 8, (7, 7)), (1, 8, (7, 8)), (2, 8, (7, 9)), (8, 16, (15, 23))],
+)
+def test_v41_mm_prefix_span_leading_pad(offset, length, expected):
+    assert _v41_mm_prefix_span(offset, length, 8) == expected

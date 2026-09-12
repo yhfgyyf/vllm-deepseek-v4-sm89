@@ -289,6 +289,8 @@ def warmup_kernels(
         pooling_params.verify(model_runner.model_config)
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
+        if getattr(model_runner.model_state, "ced_enabled", False):
+            sampling_params.prompt_logprobs = None
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.

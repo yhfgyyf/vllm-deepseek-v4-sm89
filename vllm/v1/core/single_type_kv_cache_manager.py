@@ -57,6 +57,7 @@ class SingleTypeKVCacheManager(ABC):
         pcp_world_size: int = 1,
         needs_kv_cache_zeroing: bool = False,
         max_admission_blocks_per_request: int | None = None,
+        prefix_replay_window: int = 0,
     ) -> None:
         """
         Initializes the SingleTypeKVCacheManager.
@@ -87,7 +88,8 @@ class SingleTypeKVCacheManager(ABC):
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
-        self.enable_caching = enable_caching
+        self.enable_caching = enable_caching and kv_cache_spec.prefix_cacheable
+        self.prefix_replay_window = prefix_replay_window
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
@@ -460,6 +462,10 @@ class SingleTypeKVCacheManager(ABC):
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
         """
+        if not self.enable_caching:
+            self.num_cached_block.setdefault(request.request_id, 0)
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -470,6 +476,12 @@ class SingleTypeKVCacheManager(ABC):
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
         reachable_boundaries = [request.num_prompt_tokens - 1]
+        if self.prefix_replay_window:
+            replay_boundary = max(
+                0, request.num_prompt_tokens - self.prefix_replay_window
+            )
+            replay_boundary -= replay_boundary % self.scheduler_block_size
+            reachable_boundaries.append(replay_boundary)
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -2019,6 +2031,7 @@ class SinkFullAttentionManager(FullAttentionManager):
         scheduler_block_size: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        prefix_replay_window: int = 0,
     ):
         super().__init__(
             kv_cache_spec=kv_cache_spec,
@@ -2028,6 +2041,7 @@ class SinkFullAttentionManager(FullAttentionManager):
             scheduler_block_size=scheduler_block_size,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
+            prefix_replay_window=prefix_replay_window,
         )
         sink_len = kv_cache_spec.sink_len
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0

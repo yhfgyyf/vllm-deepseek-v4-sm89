@@ -10,6 +10,9 @@ import torch
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import (
@@ -197,6 +200,199 @@ class ApplyMoEActivationConfig:
 
 
 _DEFAULT_APPLY_MOE_ACTIVATION_CONFIG = ApplyMoEActivationConfig()
+
+
+@triton.jit
+def _deepseek_v41_swiglu_router_weight_kernel(
+    output_ptr,
+    input_ptr,
+    router_weight_ptr,
+    intermediate_size: tl.constexpr,
+    clamp_limit: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < intermediate_size
+    gate = tl.load(input_ptr + row * 2 * intermediate_size + offsets, mask=mask).to(
+        tl.float32
+    )
+    up = tl.load(
+        input_ptr + row * 2 * intermediate_size + intermediate_size + offsets,
+        mask=mask,
+    ).to(tl.float32)
+    weight = tl.load(router_weight_ptr + row).to(tl.float32)
+    gate = tl.minimum(gate, clamp_limit)
+    up = tl.maximum(tl.minimum(up, clamp_limit), -clamp_limit)
+    activated = gate * tl.sigmoid(gate) * up * weight
+    tl.store(output_ptr + row * intermediate_size + offsets, activated, mask=mask)
+
+
+def _deepseek_v41_swiglu_router_weight_impl(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    assert output.dim() == input.dim() == 2
+    assert input.size(0) == output.size(0) == router_weights.numel()
+    assert input.size(1) == 2 * output.size(1)
+    assert input.dtype == output.dtype
+    assert input.is_contiguous() and output.is_contiguous()
+    assert router_weights.dtype == torch.float32 and router_weights.is_contiguous()
+    intermediate_size = output.size(1)
+    _deepseek_v41_swiglu_router_weight_kernel[(output.size(0),)](
+        output,
+        input,
+        router_weights,
+        intermediate_size=intermediate_size,
+        clamp_limit=clamp_limit,
+        BLOCK_SIZE=next_power_of_2(intermediate_size),
+        num_warps=8,
+    )
+
+
+def _deepseek_v41_swiglu_router_weight_fake(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v41_swiglu_router_weight",
+    op_func=_deepseek_v41_swiglu_router_weight_impl,
+    mutates_args=["output"],
+    fake_impl=_deepseek_v41_swiglu_router_weight_fake,
+)
+
+
+def deepseek_v41_swiglu_router_weight(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    """Apply official FP32 SwiGLU and routing before the BF16 store."""
+    torch.ops.vllm.deepseek_v41_swiglu_router_weight(
+        output,
+        input,
+        router_weights,
+        clamp_limit,
+    )
+
+
+@triton.jit
+def _deepseek_v41_swiglu_router_weight_mxfp8_kernel(
+    output_ptr,
+    input_ptr,
+    router_weight_ptr,
+    num_rows,
+    intermediate_size: tl.constexpr,
+    clamp_limit: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    MIN_AMAX: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    program = tl.program_id(0)
+    groups_per_row = intermediate_size // 32
+    row_tile = program // groups_per_row
+    group = program % groups_per_row
+    rows = row_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets = group * 32 + tl.arange(0, 32)
+    mask = rows[:, None] < num_rows
+    input_offsets = rows[:, None] * 2 * intermediate_size + offsets[None, :]
+    gate = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(
+        input_ptr + input_offsets + intermediate_size,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    router_weight = tl.load(
+        router_weight_ptr + rows, mask=rows < num_rows, other=0.0
+    ).to(tl.float32)
+
+    gate = tl.minimum(gate, clamp_limit)
+    up = tl.maximum(tl.minimum(up, clamp_limit), -clamp_limit)
+    activated = gate * tl.sigmoid(gate)
+    activated = activated * up
+    activated = activated * router_weight[:, None]
+    rounded = activated.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(rounded), axis=1), MIN_AMAX)
+    scale_exp = tl.ceil(tl.log2(amax / FP8_MAX))
+    scale_exp = tl.minimum(tl.maximum(scale_exp, -127.0), 127.0)
+    scale = tl.exp2(scale_exp)
+    quantized = tl.clamp(rounded / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    dequantized = quantized.to(tl.float32) * scale[:, None]
+    output_offsets = rows[:, None] * intermediate_size + offsets[None, :]
+    tl.store(output_ptr + output_offsets, dequantized, mask=mask)
+
+
+def _deepseek_v41_swiglu_router_weight_mxfp8_impl(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    assert output.dim() == input.dim() == 2
+    assert input.size(0) == output.size(0) == router_weights.numel()
+    assert input.size(1) == 2 * output.size(1)
+    assert input.dtype == output.dtype == torch.bfloat16
+    assert input.is_contiguous() and output.is_contiguous()
+    assert router_weights.dtype == torch.float32 and router_weights.is_contiguous()
+    assert output.size(1) % 32 == 0
+    if output.numel() == 0:
+        return
+    block_m = 32
+    intermediate_size = output.size(1)
+    grid = (triton.cdiv(output.size(0), block_m) * (intermediate_size // 32),)
+    _deepseek_v41_swiglu_router_weight_mxfp8_kernel[grid](
+        output,
+        input,
+        router_weights,
+        output.size(0),
+        intermediate_size=intermediate_size,
+        clamp_limit=clamp_limit,
+        BLOCK_M=block_m,
+        MIN_AMAX=1e-4,
+        FP8_MAX=448.0,
+        num_warps=4,
+    )
+
+
+def _deepseek_v41_swiglu_router_weight_mxfp8_fake(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v41_swiglu_router_weight_mxfp8",
+    op_func=_deepseek_v41_swiglu_router_weight_mxfp8_impl,
+    mutates_args=["output"],
+    fake_impl=_deepseek_v41_swiglu_router_weight_mxfp8_fake,
+)
+
+
+def deepseek_v41_swiglu_router_weight_mxfp8(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    router_weights: torch.Tensor,
+    clamp_limit: float,
+) -> None:
+    """Apply the V4.1 routed SwiGLU and its BF16-to-MXFP8 boundary."""
+    torch.ops.vllm.deepseek_v41_swiglu_router_weight_mxfp8(
+        output,
+        input,
+        router_weights,
+        clamp_limit,
+    )
 
 
 def _validate_moe_activation_shapes(

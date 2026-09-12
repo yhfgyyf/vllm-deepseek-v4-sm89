@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,11 +19,9 @@ import torch
 def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
     """Enable breakable cudagraphs for this module's tests only.
 
-    eager_break_during_capture reads the env at decoration time, which
-    happens inside the test bodies, so a per-test fixture suffices.
     monkeypatch restores the env so other test files running in the same
-    pytest process are unaffected (a module-level os.environ assignment
-    used to leak into test_cudagraph_dispatch.py and break it).
+    pytest process are unaffected (a module-level os.environ assignment used
+    to leak into test_cudagraph_dispatch.py and break it).
     """
     import vllm.envs as envs
 
@@ -131,6 +130,105 @@ def test_decorator_passthrough_outside_capture():
 
     assert f(3) == 6
     assert calls == [3]
+
+
+def test_decorator_observes_enable_after_decoration(monkeypatch):
+    import vllm.envs as envs
+    from vllm.compilation import breakable_cudagraph
+    from vllm.config import CUDAGraphMode
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    envs.disable_envs_cache()
+    calls = []
+    replays = []
+    state = {"factor": 2}
+
+    @breakable_cudagraph.eager_break_during_capture
+    def f(x):
+        calls.append(("fn", x))
+        return x * state["factor"]
+
+    assert hasattr(f, "__wrapped__")
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    envs.disable_envs_cache()
+
+    def add_eager(replay):
+        calls.append(("add_eager", None))
+        replays.append(replay)
+        return replay()
+
+    capture = SimpleNamespace(_capturing=True, add_eager=add_eager)
+    monkeypatch.setattr(
+        breakable_cudagraph.BreakableCUDAGraphCapture,
+        "current",
+        staticmethod(lambda: capture),
+    )
+    monkeypatch.setattr(
+        breakable_cudagraph, "is_forward_context_available", lambda: True
+    )
+    monkeypatch.setattr(
+        breakable_cudagraph,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    assert f(3) == 6
+    assert calls == [("add_eager", None), ("fn", 3)]
+    assert len(replays) == 1
+
+    state["factor"] = 4
+    assert replays[0]() == 12
+    assert calls == [("add_eager", None), ("fn", 3), ("fn", 3)]
+
+
+def test_decorator_disabled_call_stays_eager(monkeypatch):
+    import vllm.envs as envs
+    from vllm.compilation import breakable_cudagraph
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    envs.disable_envs_cache()
+
+    @breakable_cudagraph.eager_break_during_capture
+    def f(x):
+        return x + 1
+
+    monkeypatch.setattr(
+        breakable_cudagraph.BreakableCUDAGraphCapture,
+        "current",
+        staticmethod(lambda: pytest.fail("disabled call queried capture state")),
+    )
+
+    assert f(4) == 5
+
+
+def test_decorator_full_mode_does_not_break(monkeypatch):
+    from vllm.compilation import breakable_cudagraph
+    from vllm.config import CUDAGraphMode
+
+    @breakable_cudagraph.eager_break_during_capture
+    def f(x):
+        return x + 1
+
+    capture = SimpleNamespace(
+        _capturing=True,
+        add_eager=lambda _: pytest.fail("FULL mode added an eager break"),
+    )
+    monkeypatch.setattr(
+        breakable_cudagraph.BreakableCUDAGraphCapture,
+        "current",
+        staticmethod(lambda: capture),
+    )
+    monkeypatch.setattr(
+        breakable_cudagraph, "is_forward_context_available", lambda: True
+    )
+    monkeypatch.setattr(
+        breakable_cudagraph,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+    )
+
+    assert f(4) == 5
 
 
 # ---------------------------------------------------------------------------

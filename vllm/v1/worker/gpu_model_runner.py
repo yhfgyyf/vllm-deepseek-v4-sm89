@@ -261,6 +261,30 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _build_lookback_token_ids(
+    token_ids: np.ndarray,
+    num_computed_tokens: np.ndarray,
+    num_prompt_tokens: np.ndarray,
+    depth: int,
+) -> np.ndarray:
+    """Return prompt-token lookback windows, masking non-prompt positions."""
+    num_reqs = num_computed_tokens.shape[0]
+    result = np.full((num_reqs, depth), -1, dtype=token_ids.dtype)
+    if num_reqs == 0 or depth == 0:
+        return result
+    positions = num_computed_tokens[:, None] - np.arange(1, depth + 1)
+    valid = (positions >= 0) & (positions < num_prompt_tokens[:, None])
+    safe_positions = np.where(valid, positions, 0)
+    rows = np.arange(num_reqs)[:, None]
+    result[:] = np.where(valid, token_ids[rows, safe_positions], -1)
+    return result
+
+
+def _v41_mm_prefix_span(offset: int, length: int, modulus: int) -> tuple[int, int]:
+    pad = modulus - 1 - offset % modulus
+    return offset + pad, offset + length - 1
+
+
 def _slot_mapping_mode_from_policy(policy: SlotMappingPolicy) -> SlotMappingMode:
     if policy == SlotMappingPolicy.NONE:
         return SlotMappingMode.NONE
@@ -828,6 +852,7 @@ class GPUModelRunner(
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.lookback_token_ids: CpuGpuBuffer | None = None
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -1093,8 +1118,28 @@ class GPUModelRunner(
             )
         return self._mamba_bufs
 
-    def _init_model_kwargs(self):
+    def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
+        assert self.lookback_token_ids is not None
+        buf = self.lookback_token_ids
+        buf.np[:num_reqs] = _build_lookback_token_ids(
+            self.input_batch.token_ids_cpu[:num_reqs],
+            self.input_batch.num_computed_tokens[:num_reqs],
+            self.input_batch.num_prompt_tokens[:num_reqs],
+            buf.np.shape[1],
+        )
+        if num_reqs < buf.np.shape[0]:
+            buf.np[num_reqs:].fill(-1)
+        return buf.copy_to_gpu()
+
+    def _init_model_kwargs(self, num_reqs: int | None = None):
         model_kwargs = dict[str, Any]()
+
+        if self.lookback_token_ids is not None:
+            if num_reqs is None:
+                num_reqs = self.input_batch.num_reqs
+            model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                num_reqs
+            )
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -2440,7 +2485,7 @@ class GPUModelRunner(
             _bidi_sw = getattr(hf_text_config, "sliding_window", None)
             _clamps_in_kernel = getattr(
                 self.model, "mm_prefix_clamp_sliding_window", False
-            )
+            ) or getattr(hf_text_config, "mm_prefix_clamp_sliding_window", False)
             hf_config = self.model_config.hf_config
             _prefix_start_token_id = getattr(
                 hf_config, "vllm_mm_prefix_start_token_id", None
@@ -2458,12 +2503,22 @@ class GPUModelRunner(
                     if mm_feature.modality == "audio":
                         continue
                     pos_info = mm_feature.mm_position
-                    img_doc_range = extract_mm_prefix_ranges(
-                        pos_info,
-                        prompt_token_ids=req_state.prompt_token_ids,
-                        start_token_id=_prefix_start_token_id,
-                        end_token_id=_prefix_end_token_id,
+                    span_modulus = getattr(
+                        hf_text_config, "mm_prefix_span_leading_pad_modulus", 0
                     )
+                    if span_modulus:
+                        img_doc_range = [
+                            _v41_mm_prefix_span(
+                                pos_info.offset, pos_info.length, span_modulus
+                            )
+                        ]
+                    else:
+                        img_doc_range = extract_mm_prefix_ranges(
+                            pos_info,
+                            prompt_token_ids=req_state.prompt_token_ids,
+                            start_token_id=_prefix_start_token_id,
+                            end_token_id=_prefix_end_token_id,
+                        )
                     for r in img_doc_range:
                         if (
                             not _clamps_in_kernel
@@ -5425,6 +5480,11 @@ class GPUModelRunner(
                     self.model = model_loader.load_model(
                         vllm_config=self.vllm_config, model_config=self.model_config
                     )
+                lookback_depth = getattr(self.model, "token_lookback_depth", 0)
+                if lookback_depth > 0:
+                    self.lookback_token_ids = self._make_buffer(
+                        self.max_num_reqs, lookback_depth, dtype=torch.int32
+                    )
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6198,7 +6258,7 @@ class GPUModelRunner(
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs()
+                model_kwargs = self._init_model_kwargs(num_reqs=0)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None

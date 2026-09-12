@@ -11,9 +11,9 @@ torchvision==0.28.0 # Required for phi3v processor. See https://github.com/pytor
 torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile.
-# GLM-5.3-Flash and DeepSeek-V4-Flash/Vision require the paired SM89+SM120 fork.
+# GLM-5.3-Flash and DeepSeek-V4/V4.1 require the paired SM89+SM120 fork.
 # Keep this direct wheel URL so source installs resolve the validated build.
-flashinfer-python @ https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision8-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv4.vision1.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=72b774b474b7f961c2993b9cdd2337d2bec7c70560d508fee654f3423757863d
+flashinfer-python @ https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/flashinfer_python-0.6.18%2Bglm53.dsv41.vision2.sm89sm120.cu130.pt213-py3-none-any.whl#sha256=078aa7682d699c67dce619fc8acf29ec41934ab5ba916268d1fe6f8850459de8
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

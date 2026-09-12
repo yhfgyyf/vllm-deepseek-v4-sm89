@@ -83,6 +83,7 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_replay_window: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -148,6 +149,7 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                prefix_replay_window=prefix_replay_window,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -441,6 +443,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_replay_window: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -455,6 +458,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -493,6 +497,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_replay_window: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -507,6 +512,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.dcp_world_size = self.single_type_managers[0].dcp_world_size
@@ -528,6 +534,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        if not self.kv_cache_spec.prefix_cacheable:
+            return ([],), 0, 0
         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
@@ -578,6 +586,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_replay_window: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -592,6 +601,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -958,6 +968,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    prefix_replay_window: int = 0,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -972,6 +983,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -987,6 +999,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -1001,4 +1014,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
+        prefix_replay_window=prefix_replay_window,
     )

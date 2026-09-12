@@ -13,6 +13,17 @@ from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    select_candidate_blocks as _select_candidate_blocks,
+)
+from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
+    CANDIDATE_BLOCK_SIZE as DSV41_CANDIDATE_BLOCK_SIZE,
+)
+from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
+    dsv41_mxfp4_candidate_logits,
+    dsv41_mxfp4_dense_logits,
+    map_candidate_topk_,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -40,6 +51,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+DSV41_CANDIDATE_BLOCKS = 2048
+DSV41_CANDIDATE_WIDTH = DSV41_CANDIDATE_BLOCKS * DSV41_CANDIDATE_BLOCK_SIZE
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -300,6 +313,389 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _dsv41_topk_from_candidates(
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    topk_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    lengths_out: torch.Tensor,
+) -> None:
+    """Select compact candidate logits and map them to request-local tokens."""
+    rows, width = logits.shape
+    compact_lens = lengths_out[:rows]
+    compact_lens.fill_(width)
+    torch.ops._C.persistent_topk(
+        logits,
+        compact_lens,
+        topk_indices,
+        workspace,
+        topk_indices.shape[1],
+        width,
+    )
+    map_candidate_topk_(topk_indices, logits, candidates)
+
+
+def _dsv41_expand_decode_seq_lens(
+    seq_lens: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+) -> torch.Tensor:
+    if seq_lens.ndim == 2:
+        if seq_lens.shape[0] != batch_size or seq_lens.shape[1] not in (1, next_n):
+            raise ValueError("V4.1 decode lengths must be [B, 1] or [B, next_n]")
+        seq_lens = seq_lens.reshape(-1)
+    elif seq_lens.ndim != 1:
+        raise ValueError("V4.1 decode lengths must be one- or two-dimensional")
+
+    if seq_lens.numel() == batch_size * next_n:
+        return seq_lens
+    if seq_lens.numel() != batch_size:
+        raise ValueError(
+            "V4.1 decode lengths must have one entry per request or query row"
+        )
+    return seq_lens.reshape(batch_size, 1).expand(batch_size, next_n).reshape(-1)
+
+
+def _dsv41_workspace_specs(
+    max_model_len: int,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    max_logits_elements = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    if max_logits_elements < max(max_model_len, DSV41_CANDIDATE_WIDTH):
+        raise ValueError(
+            "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB must fit at least one V4.1 "
+            "dense and candidate row"
+        )
+    block_score_elements = max_logits_elements // DSV41_CANDIDATE_BLOCK_SIZE
+    row_capacity = max_logits_elements // DSV41_CANDIDATE_WIDTH
+    return (
+        ((max_logits_elements,), torch.float32),
+        ((block_score_elements,), torch.float32),
+        ((row_capacity,), torch.int32),
+        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+    )
+
+
+def _dsv41_rows_per_chunk(
+    width: int,
+    max_logits_elements: int,
+    *,
+    needs_block_scores: bool,
+    group_size: int = 1,
+) -> int:
+    if width <= 0 or group_size <= 0:
+        raise ValueError("V4.1 indexer width and decode group size must be positive")
+    row_capacity = max_logits_elements // DSV41_CANDIDATE_WIDTH
+    rows = min(row_capacity, max_logits_elements // width)
+    if needs_block_scores:
+        score_width = max(
+            DSV41_CANDIDATE_BLOCKS,
+            (width + DSV41_CANDIDATE_BLOCK_SIZE - 1) // DSV41_CANDIDATE_BLOCK_SIZE,
+        )
+        rows = min(
+            rows,
+            (max_logits_elements // DSV41_CANDIDATE_BLOCK_SIZE) // score_width,
+        )
+    rows = rows // group_size * group_size
+    if rows < group_size:
+        raise ValueError(
+            "V4.1 indexer workspace cannot fit one complete decode group; "
+            "increase VLLM_SPARSE_INDEXER_MAX_LOGITS_MB"
+        )
+    return rows
+
+
+def _dsv41_native_indexer(
+    attn_metadata: DeepseekV32IndexerMetadata,
+    kv_cache: torch.Tensor,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights: torch.Tensor,
+    topk_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    max_model_len: int,
+    candidate_blocks: torch.Tensor | None,
+    candidate_block_size: int,
+    candidate_write: bool,
+) -> torch.Tensor:
+    """Run the V4.1 MXFP4 indexer without DeepGEMM or dense K expansion."""
+    if candidate_write and candidate_blocks is None:
+        raise ValueError("V4.1 candidate source requires a candidate output buffer")
+    if candidate_blocks is not None:
+        if candidate_block_size != DSV41_CANDIDATE_BLOCK_SIZE:
+            raise ValueError(
+                "DeepSeek V4.1 native indexer requires candidate_block_size=8, "
+                f"got {candidate_block_size}"
+            )
+        if (
+            candidate_blocks.dtype != torch.int32
+            or candidate_blocks.ndim != 2
+            or candidate_blocks.shape[1] != DSV41_CANDIDATE_BLOCKS
+        ):
+            raise ValueError(
+                "V4.1 candidate buffer must be int32 with 2048 blocks per row"
+            )
+    workspace_manager = current_workspace_manager()
+    logits_scratch, block_scores_scratch, lengths_scratch, topk_workspace = (
+        workspace_manager.get_simultaneous(*_dsv41_workspace_specs(max_model_len))
+    )
+
+    if attn_metadata.num_prefills > 0:
+        assert attn_metadata.prefill is not None
+        for chunk in attn_metadata.prefill.chunks:
+            reads_candidates = candidate_blocks is not None and not candidate_write
+            width = (
+                candidate_blocks.shape[1] * candidate_block_size
+                if reads_candidates
+                else chunk.local_total_seq_lens
+            )
+            rows_per_chunk = _dsv41_rows_per_chunk(
+                width,
+                logits_scratch.numel(),
+                needs_block_scores=candidate_blocks is not None and candidate_write,
+            )
+            num_rows = chunk.token_end - chunk.token_start
+            for row_offset in range(0, num_rows, rows_per_chunk):
+                token_start = chunk.token_start + row_offset
+                token_end = min(token_start + rows_per_chunk, chunk.token_end)
+                rows = token_end - token_start
+                local_rows = slice(row_offset, row_offset + rows)
+                q_values = q_quant[token_start:token_end]
+                q_scales = q_scale[token_start:token_end]
+                chunk_weights = weights[token_start:token_end]
+                topk_indices = topk_indices_buffer[token_start:token_end, :topk_tokens]
+                chunk_candidates = (
+                    candidate_blocks[token_start:token_end]
+                    if candidate_blocks is not None
+                    else None
+                )
+                logits_out = logits_scratch[: rows * width].view(rows, width)
+                if reads_candidates:
+                    assert chunk_candidates is not None
+                    logits = dsv41_mxfp4_candidate_logits(
+                        q_values,
+                        q_scales,
+                        kv_cache,
+                        chunk_weights,
+                        chunk.block_table,
+                        chunk.cu_seqlen_ke[local_rows],
+                        chunk_candidates,
+                        row_starts=chunk.cu_seqlen_ks[local_rows],
+                        cu_seq_lens=chunk.cu_seq_lens,
+                        token_to_seq=chunk.token_to_seq,
+                        out=logits_out,
+                    )
+                    _dsv41_topk_from_candidates(
+                        logits,
+                        chunk_candidates,
+                        topk_indices,
+                        topk_workspace,
+                        lengths_scratch,
+                    )
+                    continue
+
+                logits = dsv41_mxfp4_dense_logits(
+                    q_values,
+                    q_scales,
+                    kv_cache,
+                    chunk_weights,
+                    chunk.block_table,
+                    chunk.cu_seqlen_ke[local_rows],
+                    width,
+                    row_starts=chunk.cu_seqlen_ks[local_rows],
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    out=logits_out,
+                )
+                if chunk_candidates is not None:
+                    num_blocks = (
+                        width + candidate_block_size - 1
+                    ) // candidate_block_size
+                    score_width = max(chunk_candidates.shape[1], num_blocks)
+                    scores_out = block_scores_scratch[: rows * score_width].view(
+                        rows, score_width
+                    )
+                    _select_candidate_blocks(
+                        logits,
+                        chunk.cu_seqlen_ks[local_rows],
+                        chunk.cu_seqlen_ke[local_rows],
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                        topk_workspace,
+                        scores_out=scores_out,
+                        block_lens_out=lengths_scratch[:rows],
+                    )
+                ops.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks[local_rows],
+                    chunk.cu_seqlen_ke[local_rows],
+                    topk_indices,
+                    rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+
+    if attn_metadata.num_decodes > 0:
+        assert attn_metadata.decode is not None
+        decode_metadata = attn_metadata.decode
+        decode_lens = decode_metadata.decode_lens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        if num_decode_tokens == 0:
+            padded_q_values = q_quant[:1].reshape(1, 1, *q_quant.shape[1:])
+            padded_q_scales = q_scale[:1].reshape(1, 1, *q_scale.shape[1:])
+            padded_weights = weights[:1]
+            padded_candidates = (
+                candidate_blocks[:1] if candidate_blocks is not None else None
+            )
+        elif decode_metadata.requires_padding:
+            padded_q_values = pack_seq_triton(
+                q_quant[:num_decode_tokens], decode_lens, pad_value=0
+            )
+            padded_q_scales = pack_seq_triton(
+                q_scale[:num_decode_tokens], decode_lens, pad_value=0
+            )
+            padded_weights = pack_seq_triton(
+                weights[:num_decode_tokens], decode_lens, pad_value=0
+            ).flatten(0, 1)
+            padded_candidates = (
+                pack_seq_triton(
+                    candidate_blocks[:num_decode_tokens], decode_lens, pad_value=-1
+                ).flatten(0, 1)
+                if candidate_blocks is not None
+                else None
+            )
+        else:
+            padded_q_values = q_quant[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q_quant.shape[1:]
+            )
+            padded_q_scales = q_scale[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q_scale.shape[1:]
+            )
+            padded_weights = weights[:num_decode_tokens]
+            padded_candidates = (
+                candidate_blocks[:num_decode_tokens]
+                if candidate_blocks is not None
+                else None
+            )
+
+        batch_size, next_n = padded_q_values.shape[:2]
+        num_padded_tokens = batch_size * next_n
+        seq_lens = _dsv41_expand_decode_seq_lens(
+            decode_metadata.seq_lens, batch_size, next_n
+        )
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        reads_candidates = padded_candidates is not None and not candidate_write
+        if reads_candidates:
+            width = padded_candidates.shape[1] * candidate_block_size
+        else:
+            width = decode_metadata.max_indexer_kv_len
+            if width is None:
+                raise ValueError(
+                    "V4.1 dense decode requires an active indexer KV length"
+                )
+            if width > max_model_len:
+                raise ValueError(
+                    "V4.1 dense decode context exceeds the configured maximum: "
+                    f"{width} > {max_model_len}"
+                )
+        rows_per_chunk = _dsv41_rows_per_chunk(
+            width,
+            logits_scratch.numel(),
+            needs_block_scores=padded_candidates is not None and candidate_write,
+            group_size=next_n,
+        )
+        requests_per_chunk = rows_per_chunk // next_n
+        for request_start in range(0, batch_size, requests_per_chunk):
+            request_end = min(request_start + requests_per_chunk, batch_size)
+            row_start = request_start * next_n
+            row_end = request_end * next_n
+            rows = row_end - row_start
+            row_slice = slice(row_start, row_end)
+            request_slice = slice(request_start, request_end)
+            q_values = padded_q_values[request_slice]
+            q_scales = padded_q_scales[request_slice]
+            chunk_weights = padded_weights[row_slice]
+            chunk_candidates = (
+                padded_candidates[row_slice] if padded_candidates is not None else None
+            )
+            chunk_topk_indices = topk_indices[row_slice]
+            chunk_seq_lens = seq_lens[row_slice]
+            logits_out = logits_scratch[: rows * width].view(rows, width)
+            if reads_candidates:
+                assert chunk_candidates is not None
+                logits = dsv41_mxfp4_candidate_logits(
+                    q_values,
+                    q_scales,
+                    kv_cache,
+                    chunk_weights,
+                    decode_metadata.block_table[request_slice],
+                    chunk_seq_lens,
+                    chunk_candidates,
+                    row_repeat=next_n,
+                    out=logits_out,
+                )
+                _dsv41_topk_from_candidates(
+                    logits,
+                    chunk_candidates,
+                    chunk_topk_indices,
+                    topk_workspace,
+                    lengths_scratch,
+                )
+                continue
+
+            logits = dsv41_mxfp4_dense_logits(
+                q_values,
+                q_scales,
+                kv_cache,
+                chunk_weights,
+                decode_metadata.block_table[request_slice],
+                chunk_seq_lens,
+                width,
+                row_repeat=next_n,
+                out=logits_out,
+            )
+            if chunk_candidates is not None:
+                num_blocks = (width + candidate_block_size - 1) // candidate_block_size
+                score_width = max(chunk_candidates.shape[1], num_blocks)
+                scores_out = block_scores_scratch[: rows * score_width].view(
+                    rows, score_width
+                )
+                _select_candidate_blocks(
+                    logits,
+                    None,
+                    chunk_seq_lens,
+                    chunk_candidates.shape[1],
+                    candidate_block_size,
+                    chunk_candidates,
+                    topk_workspace,
+                    scores_out=scores_out,
+                    block_lens_out=lengths_scratch[:rows],
+                )
+            torch.ops._C.persistent_topk(
+                logits,
+                chunk_seq_lens,
+                chunk_topk_indices,
+                topk_workspace,
+                topk_tokens,
+                width,
+            )
+
+        if decode_metadata.requires_padding:
+            unpacked = unpack_seq_triton(
+                topk_indices.reshape(batch_size, next_n, topk_tokens), decode_lens
+            )
+            topk_indices_buffer[: unpacked.shape[0], :topk_tokens] = unpacked
+            if candidate_write:
+                assert candidate_blocks is not None and padded_candidates is not None
+                unpacked_candidates = unpack_seq_triton(
+                    padded_candidates.reshape(batch_size, next_n, -1), decode_lens
+                )
+                candidate_blocks[: unpacked_candidates.shape[0]] = unpacked_candidates
+
+    return topk_indices_buffer
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -324,6 +720,10 @@ def sparse_attn_indexer(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
+    use_v41_native: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -331,24 +731,38 @@ def sparse_attn_indexer(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    if use_v41_native:
+        if not use_fp4_cache or q_scale is None:
+            raise ValueError("V4.1 native indexer requires packed MXFP4 Q and K")
+        if dcp_world_size != 1 or use_pcp:
+            raise NotImplementedError(
+                "V4.1 native indexer currently requires DCP=PCP=1"
+            )
+
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
-        values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
-        )
-        current_workspace_manager().get_simultaneous(
-            values_spec,
-            scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-        )
+        if use_v41_native:
+            current_workspace_manager().get_simultaneous(
+                *_dsv41_workspace_specs(max_model_len)
+            )
+        else:
+            values_spec, scales_spec = _gather_workspace_shapes(
+                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            )
+            current_workspace_manager().get_simultaneous(
+                values_spec,
+                scales_spec,
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
 
-        # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+        if not use_v41_native:
+            # Dummy allocation to simulate peak logits memory in the old path.
+            # FP8 elements so elements == bytes.
+            max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            _ = torch.empty(
+                max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
@@ -369,6 +783,10 @@ def sparse_attn_indexer(
             use_pcp,
             dense_mha_metadata_layer_name,
             use_fp4_cache,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
+            use_v41_native=use_v41_native,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -438,6 +856,21 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if use_v41_native:
+        assert q_scale is not None
+        return _dsv41_native_indexer(
+            attn_metadata_narrowed,
+            kv_cache,
+            q_quant,
+            q_scale,
+            weights,
+            topk_indices_buffer,
+            topk_tokens,
+            max_model_len,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
+        )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -720,6 +1153,10 @@ def sparse_attn_indexer_fake(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
+    use_v41_native: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -727,7 +1164,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=["topk_indices_buffer", "candidate_blocks"],
     fake_impl=sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -759,6 +1196,10 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
+        use_v41_native: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -772,6 +1213,10 @@ class SparseAttnIndexer(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         self.compress_ratio = compress_ratio
+        self.candidate_blocks = candidate_blocks
+        self.candidate_block_size = candidate_block_size
+        self.candidate_write = candidate_write
+        self.use_v41_native = use_v41_native
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
@@ -782,8 +1227,10 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not _has_cuda_indexer_mqa_backend(
-            use_fp4_cache
+        if (
+            current_platform.is_cuda()
+            and not use_v41_native
+            and not _has_cuda_indexer_mqa_backend(use_fp4_cache)
         ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM, or an "
@@ -856,6 +1303,10 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            candidate_blocks=self.candidate_blocks,
+            candidate_block_size=self.candidate_block_size,
+            candidate_write=self.candidate_write,
+            use_v41_native=self.use_v41_native,
         )
 
     def forward_xpu(

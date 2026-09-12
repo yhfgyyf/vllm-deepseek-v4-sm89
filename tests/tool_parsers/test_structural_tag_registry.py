@@ -78,6 +78,32 @@ def test_supported_structural_tag_models_include_vllm_builtins():
         XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
     )
     assert "hermes" in VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
+    assert "deepseek_v41" in VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
+
+
+@pytest.mark.parametrize("choice", ["auto", "required", "get_weather"])
+def test_deepseek_v41_spaced_dsml_constraints(choice, sample_tools_strict):
+    tool_choice = (
+        ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name=choice)
+        )
+        if choice == "get_weather"
+        else choice
+    )
+    tag = get_model_structural_tag(
+        "deepseek_v41", sample_tools_strict, tool_choice, reasoning=False
+    )
+    grammar = Grammar.from_structural_tag(tag)
+    begin = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
+    end = "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    parameter = (
+        '<｜DSML｜ parameter name="city" string="true">杭州</｜DSML｜ parameter>\n'
+    )
+    assert _is_grammar_accept_string(grammar, begin + parameter + end)
+    assert not _is_grammar_accept_string(
+        grammar, (begin + parameter + end).replace("｜ parameter", "｜parameter")
+    )
+    assert _is_grammar_accept_string(grammar, "Hello") == (choice == "auto")
 
 
 @pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))

@@ -38,6 +38,7 @@ def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
 def _mxfp8_e4m3_quantize_torch(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
+    min_amax: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Naive MXFP8 quantization.
     For each block of 32 elements along the last dimension, compute a
@@ -57,7 +58,7 @@ def _mxfp8_e4m3_quantize_torch(
     x_blocked = x_fp32.view(*orig_shape[:-1], num_blocks, MXFP8_BLOCK_SIZE)
 
     amax = x_blocked.abs().amax(dim=-1)
-    amax = amax.clamp(min=torch.finfo(torch.float32).tiny)
+    amax = amax.clamp(min=max(min_amax, torch.finfo(torch.float32).tiny))
     fp8_max = torch.finfo(MXFP8_VALUE_DTYPE).max
     scale_biased = torch.ceil(torch.log2(amax / fp8_max)) + 127.0
     scale_biased = scale_biased.clamp(0, 254)
@@ -108,7 +109,7 @@ def _mxfp8_quant_triton_kernel():
         ssk,
         BLOCK_M: tl.constexpr,
         FP8_MAX: tl.constexpr,
-        TINY: tl.constexpr,
+        MIN_AMAX: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_b = tl.program_id(1)  # which 32-element block along K
@@ -123,7 +124,7 @@ def _mxfp8_quant_triton_kernel():
         # Mirror _mxfp8_e4m3_quantize_torch: the scale has to put the block amax
         # at the top of the e4m3 range rather than at 1.0, or small elements of
         # the block end up in the subnormals.
-        amax = tl.maximum(tl.max(tl.abs(x), axis=1), TINY)  # [BLOCK_M]
+        amax = tl.maximum(tl.max(tl.abs(x), axis=1), MIN_AMAX)  # [BLOCK_M]
         sb = tl.ceil(tl.log2(amax / FP8_MAX)) + 127.0
         sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
         descale = tl.exp2(sb - 127.0)
@@ -143,6 +144,7 @@ _MXFP8_QUANT_KERNEL = None
 
 def _mxfp8_e4m3_quantize_triton(
     x: torch.Tensor,
+    min_amax: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused 2D MXFP8 quant (non-swizzled, row-major [M, K//32] scales)."""
     from vllm.triton_utils import triton
@@ -173,7 +175,7 @@ def _mxfp8_e4m3_quantize_triton(
         scales.stride(1),
         BLOCK_M=BLOCK_M,
         FP8_MAX=float(torch.finfo(MXFP8_VALUE_DTYPE).max),
-        TINY=float(torch.finfo(torch.float32).tiny),
+        MIN_AMAX=max(min_amax, float(torch.finfo(torch.float32).tiny)),
     )
     return xq, scales
 
@@ -182,11 +184,16 @@ def _mxfp8_e4m3_quantize_impl(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
+    min_amax: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
-    if current_platform.has_device_capability(100) and has_flashinfer():
+    if (
+        min_amax == 0.0
+        and current_platform.has_device_capability(100)
+        and has_flashinfer()
+    ):
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
         x_q, x_scales = flashinfer_mxfp8_quantize(
@@ -199,26 +206,32 @@ def _mxfp8_e4m3_quantize_impl(
             x_scales = x_scales.view(x.size(0), -1)
         return x_q, x_scales
 
-    # ROCm: a single fused Triton kernel beats the multi-pass torch path for the
-    # common 2D, non-swizzled activation-quant case (used by the native MX
-    # linear/MoE). Falls back to torch otherwise (3D weights, swizzled layout).
+    # Preserve the legacy ROCm fused path. CUDA opts in only through the V4.1
+    # minimum-amax contract so existing MXFP8 consumers keep their dispatcher.
+    use_triton = (
+        current_platform.is_rocm() and not is_sf_swizzled_layout
+    ) or min_amax > 0.0
     if (
-        current_platform.is_rocm()
-        and not is_sf_swizzled_layout
+        use_triton
+        and x.device.type == "cuda"
         and x.ndim == 2
         and x.shape[-1] % MXFP8_BLOCK_SIZE == 0
     ):
-        return _mxfp8_e4m3_quantize_triton(x)
+        xq, scales = _mxfp8_e4m3_quantize_triton(x, min_amax=min_amax)
+        if is_sf_swizzled_layout:
+            scales = swizzle_mxfp8_scale(scales, M=x.shape[0], K=x.shape[1])
+        return xq, scales
 
-    return _mxfp8_e4m3_quantize_torch(x, is_sf_swizzled_layout)
+    return _mxfp8_e4m3_quantize_torch(x, is_sf_swizzled_layout, min_amax)
 
 
 def mxfp8_e4m3_quantize(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
+    min_amax: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.mxfp8_quantize(x, is_sf_swizzled_layout, alignment)
+    return torch.ops.vllm.mxfp8_quantize(x, is_sf_swizzled_layout, alignment, min_amax)
 
 
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -241,6 +254,7 @@ def mxfp8_e4m3_quantize_fake(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
+    min_amax: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
     fp_data = torch.empty_like(x, dtype=MXFP8_VALUE_DTYPE)
@@ -282,6 +296,106 @@ direct_register_custom_op(
     op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
+
+
+def _mxfp8_quantize_dequantize_triton_kernel():
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _kernel(
+        x_ptr,
+        output_ptr,
+        M,
+        K,
+        stride_m,
+        BLOCK_M: tl.constexpr,
+        MIN_AMAX: tl.constexpr,
+        FP8_MAX: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_k = pid_k * 32 + tl.arange(0, 32)
+        mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        offsets = offs_m[:, None] * stride_m + offs_k[None, :]
+        values = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(values), axis=1), MIN_AMAX)
+        scale_exp = tl.ceil(tl.log2(amax / FP8_MAX))
+        scale_exp = tl.minimum(tl.maximum(scale_exp, -127.0), 127.0)
+        scale = tl.exp2(scale_exp)
+        quantized = tl.clamp(values / scale[:, None], -FP8_MAX, FP8_MAX).to(
+            tl.float8e4nv
+        )
+        dequantized = quantized.to(tl.float32) * scale[:, None]
+        tl.store(output_ptr + offsets, dequantized, mask=mask)
+
+    return _kernel
+
+
+_MXFP8_QDQ_KERNEL = None
+
+
+def _mxfp8_quantize_dequantize_impl(
+    x: torch.Tensor,
+    min_amax: float = 1e-4,
+) -> torch.Tensor:
+    """Apply the official K32 MXFP8 activation boundary and return BF16/FP16.
+
+    This keeps packed-weight W4 kernels native on GPUs without FP4 tensor
+    cores while preserving the checkpoint's activation quantization semantics.
+    No weight tensor is expanded or dequantized by this operation.
+    """
+    x_shape = x.shape
+    x_2d = x.reshape(-1, x_shape[-1]).contiguous()
+    if x.device.type == "cuda":
+        from vllm.triton_utils import triton
+
+        global _MXFP8_QDQ_KERNEL
+        if _MXFP8_QDQ_KERNEL is None:
+            _MXFP8_QDQ_KERNEL = _mxfp8_quantize_dequantize_triton_kernel()
+        output = torch.empty_like(x_2d)
+        block_m = 32
+        grid = (
+            triton.cdiv(x_2d.shape[0], block_m),
+            triton.cdiv(x_2d.shape[1], MXFP8_BLOCK_SIZE),
+        )
+        _MXFP8_QDQ_KERNEL[grid](
+            x_2d,
+            output,
+            x_2d.shape[0],
+            x_2d.shape[1],
+            x_2d.stride(0),
+            BLOCK_M=block_m,
+            MIN_AMAX=min_amax,
+            FP8_MAX=float(torch.finfo(MXFP8_VALUE_DTYPE).max),
+        )
+    else:
+        xq, scales = _mxfp8_e4m3_quantize_torch(
+            x_2d, is_sf_swizzled_layout=False, min_amax=min_amax
+        )
+        output = dequant_mxfp8_to_bf16(xq, scales).to(x.dtype)
+    return output.reshape(x_shape)
+
+
+def _mxfp8_quantize_dequantize_fake(
+    x: torch.Tensor,
+    min_amax: float = 1e-4,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="mxfp8_quantize_dequantize",
+    op_func=_mxfp8_quantize_dequantize_impl,
+    fake_impl=_mxfp8_quantize_dequantize_fake,
+)
+
+
+def mxfp8_quantize_dequantize(
+    x: torch.Tensor,
+    min_amax: float = 1e-4,
+) -> torch.Tensor:
+    return torch.ops.vllm.mxfp8_quantize_dequantize(x, min_amax)
 
 
 def xpu_mxfp8_quantize(

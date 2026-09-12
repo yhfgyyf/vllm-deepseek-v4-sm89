@@ -721,6 +721,66 @@ def select_deepseek_v4_mxfp4_moe_backend(
     )
 
 
+def select_deepseek_v41_mxfp4_moe_backend(
+    config: FusedMoEConfig,
+) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
+    """Select only native backends that preserve V4.1 MXFP8 activations."""
+    activation_format = (
+        mk.FusedMoEActivationFormat.BatchedExperts
+        if config.moe_parallel_config.use_batched_activation_format
+        else mk.FusedMoEActivationFormat.Standard
+    )
+    if activation_format != mk.FusedMoEActivationFormat.Standard:
+        raise NotImplementedError(
+            "DeepSeek-V4.1 MXFP4/MXFP8 experts currently require the standard "
+            "activation format."
+        )
+
+    runner_backend = config.moe_backend
+    if runner_backend == "auto":
+        if current_platform.is_device_capability_family(
+            120
+        ) or current_platform.is_device_capability(89):
+            backends = [Mxfp4MoeBackend.MARLIN]
+        else:
+            backends = []
+    elif runner_backend == "b12x":
+        raise NotImplementedError(
+            "b12x 1.3.0 MXFP8 activation quantization does not implement "
+            "DeepSeek-V4.1's minimum amax of 1e-4. Refusing an inexact "
+            "activation boundary."
+        )
+    elif runner_backend == "marlin":
+        backends = [Mxfp4MoeBackend.MARLIN]
+    else:
+        raise ValueError(
+            "DeepSeek-V4.1 MXFP4/MXFP8 experts support only moe_backend="
+            f"'auto', 'b12x', or 'marlin', got {runner_backend!r}."
+        )
+
+    unsupported_reasons = []
+    for backend in backends:
+        for kernel_cls in backend_to_kernel_cls(backend):
+            supported, reason = kernel_cls.is_supported_config(
+                kernel_cls,
+                config,
+                kMxfp4Static,
+                kMxfp8Dynamic,
+                activation_format,
+            )
+            if supported:
+                logger.info_once(_make_log_backend(backend), scope="local")
+                return backend, kernel_cls
+            unsupported_reasons.append(f"{backend.value}: {reason}")
+
+    raise NotImplementedError(
+        "No native DeepSeek-V4.1 MXFP4/MXFP8 MoE backend supports this "
+        "deployment. Refusing a backend that changes the official K32 "
+        "activation quantization boundary. Candidates: "
+        + "; ".join(unsupported_reasons or ["none for this architecture"])
+    )
+
+
 def mxfp4_round_up_hidden_size_and_intermediate_size(
     backend: Mxfp4MoeBackend,
     hidden_size: int,

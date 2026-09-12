@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on SM89 / SM120 — vLLM fork
+# DeepSeek-V4.1-Flash, DeepSeek-V4-Flash / Vision, and GLM-5.3-Flash on SM89 / SM120 — vLLM fork
 
 <!-- markdownlint-disable MD060 -->
 
@@ -6,8 +6,8 @@
 >
 > This repository is based on
 > [vllm-project/vllm](https://github.com/vllm-project/vllm). It runs
-> DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on
-> SM89/Ada and SM120/RTX Blackwell.
+> DeepSeek-V4.1-Flash, DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and
+> GLM-5.3-Flash on SM89/Ada and SM120/RTX Blackwell.
 
 The current source is a vLLM `0.28.1rc1.dev517` development build paired with
 FlashInfer `0.6.18`. Validated configurations include
@@ -15,14 +15,24 @@ FlashInfer `0.6.18`. Validated configurations include
 
 ## Support matrix
 
-| GPU architecture | Validated GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
-|---|---|---:|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48 GB | Yes | Yes | Yes |
-| SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes | Yes |
+| GPU architecture | Validated GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
+|---|---|---:|---:|---:|---:|
+| SM89 / Ada | 8× RTX 4090 48 GB | Offline compilation only | Yes | Yes | Yes |
+| SM120 / RTX Blackwell | 4× RTX PRO 6000 96 GB | Yes | Yes | Yes | Yes |
 
 ---
 
 ## Changelog
+
+### 2026-09-12
+
+- Added native DeepSeek-V4.1-Flash model, Engram, DSpark, and experimental CED
+  prefill support, published as the SM89+SM120 `vision9` wheels.
+- Validated the full model server on 4× RTX PRO 6000 (SM120). SM89 validation
+  was limited to offline compilation; no kernel numerical execution or
+  full-model validation was performed on SM89 hardware.
+- For the tested long-text prefill workloads, the prefill proxy (input tokens /
+  TTFT) roughly doubled relative to CED off; the gain remains workload-dependent.
 
 ### 2026-09-07
 
@@ -76,9 +86,10 @@ Earlier SM89 builds and environments remain available in
 | Python | 3.12 |
 | CUDA toolkit | 13.0 |
 | PyTorch | 2.13.0+cu130 |
-| Triton | 3.7.1 |
-| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv4.vision8.sm89sm120.cu130` |
+| Triton | 3.7.1 (`ptxas-blackwell` from CUDA 13.1) |
+| Transformers | 5.16.1 |
+| FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
@@ -93,19 +104,20 @@ shape is compiled once and then reused from the JIT cache.
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc1-vision8-sm89-sm120-cu130 \
+gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision8-release
+  --dir /tmp/vllm-sm89-sm120-vision9-release
 
-cd /tmp/vllm-sm89-sm120-vision8-release
+cd /tmp/vllm-sm89-sm120-vision9-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl \
+uv pip install ./vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
+uv pip install 'transformers==5.16.1' 'triton==3.7.1'
 ```
 
 The vLLM wheel installs the paired FlashInfer wheel from a pinned URL in the
@@ -114,11 +126,101 @@ same release. `SHA256SUMS` verifies both wheels downloaded above.
 If the Aliyun mirror is slow, replace it with the Tencent Cloud or USTC PyPI
 mirror.
 
+The existing `vision7` Docker image does **not** include DeepSeek-V4.1-Flash.
+Use the release wheels above or the source build below for V4.1.
+
+### 2.1 Full source build
+
+This path recompiles the vLLM C++ / CUDA extensions for both SM89 and SM120.
+`requirements/cuda.txt` installs the paired FlashInfer wheel from this release.
+Prerequisites are the CUDA 13.0 toolkit, a C++ compiler, and Rust/Cargo with
+Rust 2024 edition support.
+
+```bash
+git clone --branch main \
+  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
+cd vllm-deepseek-v4-sm89
+
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
+uv pip install -r requirements/cuda.txt --torch-backend=cu130
+uv pip install 'transformers==5.16.1' 'triton==3.7.1'
+
+export CUDA_HOME=/usr/local/cuda-13.0
+export TORCH_CUDA_ARCH_LIST='8.9;12.0'
+export MAX_JOBS=4
+
+VLLM_VERSION_OVERRIDE='0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130' \
+  uv build --wheel --no-build-isolation
+uv pip install --no-build-isolation \
+  dist/vllm-0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130-*.whl
+```
+
 ---
 
-## 3. DeepSeek-V4-Flash launch commands
+## 3. DeepSeek-V4.1-Flash launch command (SM120)
 
-### 3.1 SM89: 4× RTX 4090 48 GB
+The following text-serving configuration was validated on 4× RTX PRO 6000
+96 GB. It uses TP=4, expert parallelism, FP8 KV, Engram CPU offload, DSpark 5,
+and experimental CED prefill. CPU offload also requires sufficient host memory.
+V4.1 uses Model Runner V2; switching to the legacy V1 runner is unsupported:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export FLASHINFER_CUDA_ARCH_LIST=12.0
+export VLLM_USE_V2_MODEL_RUNNER=1
+export TRITON_PTXAS_BLACKWELL_PATH="$(
+  "$VIRTUAL_ENV/bin/python" -c \
+    'from pathlib import Path; import triton; print(Path(triton.__file__).parent / "backends/nvidia/bin/ptxas-blackwell")'
+)"
+"$TRITON_PTXAS_BLACKWELL_PATH" --version
+
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v4.1-flash \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --kv-cache-dtype fp8 \
+  --block-size 128 \
+  --max-model-len auto \
+  --max-num-seqs 20 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-prefix-caching \
+  --engram-config '{"cpu_offload":true}' \
+  --load-format safetensors \
+  --safetensors-load-strategy lazy \
+  --tokenizer-mode deepseek_v41 \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --hf-overrides '{"ced_prefill":true}' \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+```
+
+`ptxas-blackwell --version` must report the CUDA 13.1 toolchain.
+
+CED is currently an experimental approximate text-prefill path. For the tested
+long-text prefill workloads, the prefill proxy (input tokens / TTFT) roughly
+doubled relative to CED off, but the gain depends on the prompt, length, and
+runtime configuration. It is not guaranteed to be output-equivalent to the
+non-CED path; validate quality for the target workload. CED does not support
+multimodal inputs, prompt embeddings, or prompt logprobs, so do not send images
+or other multimodal content while it is enabled.
+
+The full model server was validated on SM120. SM89 validation was limited to
+offline compilation; no kernel numerical execution or full-model validation
+was performed on SM89 hardware.
+
+## 4. DeepSeek-V4-Flash launch commands
+
+### 4.1 SM89: 4× RTX 4090 48 GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
@@ -149,7 +251,7 @@ This preserves the established SM89 deployment profile. It has been validated
 with 8K, 32K, and 128K inputs, 512 output tokens, and four concurrent 8K
 requests.
 
-### 3.2 SM120: 4× RTX PRO 6000 96 GB
+### 4.2 SM120: 4× RTX PRO 6000 96 GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
@@ -177,9 +279,9 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. DeepSeek-V4-Flash-Vision-Exp launch commands
+## 5. DeepSeek-V4-Flash-Vision-Exp launch commands
 
-### 4.1 SM89: 8× RTX 4090 48 GB
+### 5.1 SM89: 8× RTX 4090 48 GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -213,7 +315,7 @@ draft model and KV cache do not have enough memory headroom. 8× RTX 4090
 The 8-GPU command above is the recommended deployment configuration. This
 round of SM89 runtime regression used 4× RTX 4090 48 GB without DSpark.
 
-### 4.2 SM120: 4× RTX PRO 6000 96 GB
+### 5.2 SM120: 4× RTX PRO 6000 96 GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -239,9 +341,9 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
-## 5. GLM-5.3-Flash launch commands
+## 6. GLM-5.3-Flash launch commands
 
-### 5.1 SM89: 8× RTX 4090 48 GB
+### 6.1 SM89: 8× RTX 4090 48 GB
 
 The following configuration is based on the community deployment validation
 with the official FP8 weights in
@@ -272,7 +374,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### 5.2 SM120: 4× RTX PRO 6000 96 GB
+### 6.2 SM120: 4× RTX PRO 6000 96 GB
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -293,7 +395,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### 5.3 SM120 key parameters
+### 6.3 SM120 key parameters
 
 | Option | Recommended value | Purpose |
 |---|---:|---|
@@ -310,7 +412,7 @@ vllm serve /path/to/GLM-5.3-Flash \
 
 ---
 
-## 6. GLM-5.3-Flash SM120 throughput baseline
+## 7. GLM-5.3-Flash SM120 throughput baseline
 
 These results are retained from the project's first complete SM120 benchmark.
 The setup used 4× RTX PRO 6000, TP=4, FP8 KV, MTP=5, CUDA Graph,
@@ -352,10 +454,14 @@ Repeating the same prompt produced:
 
 ---
 
-## 7. Correctness validation
+## 8. Correctness validation
 
-- DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash passed
-  server startup on SM120.
+- DeepSeek-V4.1-Flash, DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and
+  GLM-5.3-Flash passed server startup on SM120.
+- DeepSeek-V4.1-Flash passed text serving, tool calling, DSpark, and experimental
+  CED prefill validation on SM120. SM89 validation was limited to offline
+  compilation; no kernel numerical execution or full-model validation was
+  performed on SM89 hardware.
 - DeepSeek-V4-Flash and GLM-5.3-Flash passed 8K/32K to 512-token tests on
   SM120.
 - DeepSeek-V4-Flash passed 8K/32K/128K, four-concurrency, tool-calling, and UTF-8
@@ -370,7 +476,7 @@ Repeating the same prompt produced:
 
 ---
 
-## 8. License / provenance
+## 9. License / provenance
 
 The code is based on [vllm-project/vllm](https://github.com/vllm-project/vllm)
 and remains under Apache-2.0. The FlashInfer wheel is based on

@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
     apply_moe_activation_masked_supported,
     apply_moe_activation_supported,
+    deepseek_v41_swiglu_router_weight_mxfp8,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -38,6 +39,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_intermediate_size,
     marlin_quant_input,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_quantize_dequantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -94,6 +98,8 @@ def _fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
     activation_config: ApplyMoEActivationConfig | None = None,
+    mxfp8_activation: bool = False,
+    router_weight_before_fc2_quant: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -126,7 +132,9 @@ def _fused_marlin_moe(
 
     a_scales1 = None
     gate_up_input = hidden_states
-    if input_dtype == torch.int8:
+    if mxfp8_activation:
+        gate_up_input = mxfp8_quantize_dequantize(hidden_states)
+    elif input_dtype == torch.int8:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
         if input_global_scale1 is not None:
             a_scales1 = a_scales1 * input_global_scale1
@@ -151,7 +159,9 @@ def _fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=num_topk,
-        mul_topk_weights=apply_router_weight_on_input,
+        mul_topk_weights=(
+            apply_router_weight_on_input and not router_weight_before_fc2_quant
+        ),
         b_q_type=quant_type,
         size_m=M,
         size_n=w13_num_shards * N,
@@ -162,7 +172,20 @@ def _fused_marlin_moe(
         is_zp_float=False,
     )
     activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
-    if activation_func is None:
+    fused_activation_qdq = router_weight_before_fc2_quant and mxfp8_activation
+    if router_weight_before_fc2_quant:
+        assert mxfp8_activation
+        assert activation == MoEActivation.SILU
+        assert activation_config is not None
+        assert activation_config.clamp_limit is not None
+        assert topk_weights.is_contiguous()
+        deepseek_v41_swiglu_router_weight_mxfp8(
+            intermediate_cache2,
+            activation_input,
+            topk_weights,
+            activation_config.clamp_limit,
+        )
+    elif activation_func is None:
         config = (
             ApplyMoEActivationConfig()
             if activation_config is None
@@ -189,7 +212,9 @@ def _fused_marlin_moe(
         output = intermediate_cache3
 
     a_scales2 = None
-    if input_dtype == torch.int8:
+    if mxfp8_activation and not fused_activation_qdq:
+        intermediate_cache2 = mxfp8_quantize_dequantize(intermediate_cache2)
+    elif input_dtype == torch.int8:
         intermediate_cache2, a_scales2 = marlin_quant_input(
             intermediate_cache2, input_dtype
         )
@@ -218,7 +243,9 @@ def _fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=not apply_router_weight_on_input,
+        mul_topk_weights=(
+            not apply_router_weight_on_input and not router_weight_before_fc2_quant
+        ),
         b_q_type=quant_type,
         size_m=M * num_topk,
         size_n=K,
@@ -266,6 +293,8 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    mxfp8_activation: bool = False,
+    router_weight_before_fc2_quant: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -368,6 +397,8 @@ def fused_marlin_moe(
         activation=activation,
         activation_func=activation_func,
         activation_config=activation_config,
+        mxfp8_activation=mxfp8_activation,
+        router_weight_before_fc2_quant=router_weight_before_fc2_quant,
         input_global_scale1=input_global_scale1,
         input_global_scale2=input_global_scale2,
         global_scale1=global_scale1,
@@ -430,6 +461,8 @@ def batched_fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     activation_func: Callable[..., None] | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    mxfp8_activation: bool = False,
+    router_weight_before_fc2_quant: bool = False,
 ) -> torch.Tensor:
     """
     This function massages the inputs so the batched hidden_states can be
@@ -539,6 +572,8 @@ def batched_fused_marlin_moe(
         activation=activation,
         activation_func=activation_func,
         activation_config=activation_config,
+        mxfp8_activation=mxfp8_activation,
+        router_weight_before_fc2_quant=router_weight_before_fc2_quant,
         expert_map=expert_map,
         block_size_m=block_size_m,
         sorted_token_ids=sorted_token_ids,
@@ -583,6 +618,11 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         # TODO (varun) : Enable activation quantization
         assert (
             quant_config.use_mxfp4_w4a16
+            or (
+                quant_config.weight_quant_dtype == "mxfp4"
+                and quant_config.quant_dtype == "mxfp8"
+                and quant_config.router_weight_before_fc2_quant
+            )
             or quant_config.use_nvfp4_w4a16
             or quant_config.use_int4_w4a16
             or quant_config.use_int8_w8a16
@@ -594,6 +634,9 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
+        self.router_weight_before_fc2_quant = (
+            quant_config.router_weight_before_fc2_quant
+        )
 
         super().__init__(
             moe_config=moe_config,
@@ -633,6 +676,10 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         ]
         return weight_key in SUPPORTED_W
 
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return self.router_weight_before_fc2_quant
+
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
         # Marlin uses apply_moe_activation() callback for activation,
@@ -654,7 +701,14 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             return scalar_types.uint4b8.id
         elif self.quant_config.use_int8_w8a16:
             return scalar_types.uint8b128.id
-        elif self.quant_config.use_mxfp4_w4a16 or self.quant_config.use_nvfp4_w4a16:
+        elif (
+            self.quant_config.use_mxfp4_w4a16
+            or self.quant_config.use_nvfp4_w4a16
+            or (
+                self.quant_config.weight_quant_dtype == "mxfp4"
+                and self.quant_config.quant_dtype == "mxfp8"
+            )
+        ):
             return scalar_types.float4_e2m1f.id
         elif (
             self.quant_config.use_fp8_w8a16
@@ -756,6 +810,11 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         assert self.w2_scale is not None
 
         ctx = self._lora_context
+        if self.router_weight_before_fc2_quant and ctx is not None:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 expert LoRA requires routing inside the fused "
+                "FP32 SwiGLU boundary."
+            )
         if ctx is None:
             fused_marlin_moe(
                 hidden_states=hidden_states,
@@ -792,6 +851,8 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
+                mxfp8_activation=self.router_weight_before_fc2_quant,
+                router_weight_before_fc2_quant=self.router_weight_before_fc2_quant,
             )
             return
 
@@ -907,6 +968,8 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            mxfp8_activation=self.router_weight_before_fc2_quant,
+            router_weight_before_fc2_quant=self.router_weight_before_fc2_quant,
         )
 
     def moe_sum(
@@ -1045,6 +1108,8 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             w1_zeros=self.w1_zp,
             w2_zeros=self.w2_zp,
             input_dtype=self.input_dtype,
+            mxfp8_activation=self.router_weight_before_fc2_quant,
+            router_weight_before_fc2_quant=self.router_weight_before_fc2_quant,
             is_k_full=self.is_k_full,
             activation_func=activation_func,
             activation_config=self.activation_config,

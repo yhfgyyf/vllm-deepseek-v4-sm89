@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import importlib.metadata
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -12,12 +15,128 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+_DEEPSEEK_V41_ENGRAM_MXFP8_SHAPE = (25600, 6144)
+_DEEPSEEK_V41_ENGRAM_MXFP8_TACTICS = {
+    1: 1,
+    4: 1,
+    8: 1,
+    16: 1,
+    32: 1,
+    128: 2,
+    1024: 4,
+}
+_DEEPSEEK_V41_MXFP8_TACTIC_FLASHINFER_VERSION = (
+    "0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213"
+)
+_FLASHINFER_MXFP8_WORKSPACE_KEY = "mm_mxfp8_workspace"
+
+
+def _deepseek_v41_engram_mxfp8_tactic(rows: int, n: int, k: int) -> int | None:
+    if (n, k) != _DEEPSEEK_V41_ENGRAM_MXFP8_SHAPE:
+        return None
+    return _DEEPSEEK_V41_ENGRAM_MXFP8_TACTICS.get(rows)
+
+
+@functools.cache
+def _has_deepseek_v41_sm120_mxfp8_tactics() -> bool:
+    try:
+        version = importlib.metadata.version("flashinfer-python")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return version == _DEEPSEEK_V41_MXFP8_TACTIC_FLASHINFER_VERSION
+
+
+def _deepseek_v41_sm120_mxfp8_impl(
+    input_mxfp8: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    tactic = _deepseek_v41_engram_mxfp8_tactic(
+        input_mxfp8.shape[0], weight.shape[0], weight.shape[1]
+    )
+    if tactic is None:
+        return vllm_flashinfer.mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            backend="cutlass",
+        )
+
+    with torch.cuda.device(input_mxfp8.device):
+        from flashinfer.gemm.gemm_base import (
+            DEFAULT_WORKSPACE_SIZE,
+            _load_gemm_sm120_mxfp8_module,
+        )
+        from flashinfer.utils import _get_cache_buf
+
+        output = torch.empty(
+            (input_mxfp8.shape[0], weight.shape[0]),
+            dtype=out_dtype,
+            device=input_mxfp8.device,
+        )
+        workspace = _get_cache_buf(
+            _FLASHINFER_MXFP8_WORKSPACE_KEY,
+            DEFAULT_WORKSPACE_SIZE,
+            input_mxfp8.device,
+        )
+        module = _load_gemm_sm120_mxfp8_module()
+        if module.mxfp8_gemm_tactic_num() != 10:
+            raise RuntimeError(
+                "DeepSeek-V4.1 SM120 MXFP8 tactics require the pinned ten-tactic "
+                "FlashInfer CUTLASS module."
+            )
+        module.mxfp8_gemm(
+            input_mxfp8,
+            weight,
+            input_scale,
+            weight_scale,
+            output,
+            workspace,
+            tactic,
+        )
+    return output
+
+
+def _deepseek_v41_sm120_mxfp8_fake(
+    input_mxfp8: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    del input_scale, weight_scale
+    return torch.empty(
+        (input_mxfp8.shape[0], weight.shape[0]),
+        dtype=out_dtype,
+        device=input_mxfp8.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="deepseek_v41_sm120_mxfp8",
+    op_func=_deepseek_v41_sm120_mxfp8_impl,
+    fake_impl=_deepseek_v41_sm120_mxfp8_fake,
+)
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
+
+    def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
+        super().__init__(c)
+        self._deepseek_v41_engram_tactics_enabled = (
+            c.model_profile == "deepseek_v41"
+            and current_platform.is_device_capability(120)
+            and _has_deepseek_v41_sm120_mxfp8_tactics()
+        )
 
     @classmethod
     def is_supported(
@@ -76,20 +195,35 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         )
 
         input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-            input_2d, is_sf_swizzled_layout=True
+            input_2d,
+            is_sf_swizzled_layout=True,
+            min_amax=(1e-4 if self.config.model_profile == "deepseek_v41" else 0.0),
         )
 
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cutlass",
+        use_deepseek_v41_engram_tactics = (
+            self._deepseek_v41_engram_tactics_enabled
+            and (N, K) == _DEEPSEEK_V41_ENGRAM_MXFP8_SHAPE
         )
+        if not use_deepseek_v41_engram_tactics:
+            output = vllm_flashinfer.mm_mxfp8(
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                backend="cutlass",
+            )
+        else:
+            output = torch.ops.vllm.deepseek_v41_sm120_mxfp8(
+                input_mxfp8,
+                weight,
+                input_scale,
+                weight_scale,
+                out_dtype,
+            )
 
         if bias is not None:
             output = output + bias

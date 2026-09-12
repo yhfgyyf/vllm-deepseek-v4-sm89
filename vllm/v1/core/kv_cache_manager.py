@@ -132,6 +132,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        prefix_replay_window: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -141,6 +142,9 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        if prefix_replay_window < 0:
+            raise ValueError("prefix_replay_window must be non-negative")
+        self.prefix_replay_window = prefix_replay_window
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -163,6 +167,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_replay_window=prefix_replay_window,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -225,6 +230,15 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    def _get_max_cache_hit_length(self, request: Request) -> int:
+        if self.prefix_replay_window:
+            return max(
+                0,
+                min(request.num_prompt_tokens, request.num_tokens)
+                - self.prefix_replay_window,
+            )
+        return request.num_tokens - 1
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -249,13 +263,10 @@ class KVCacheManager:
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        # Ordinarily, recompute the last token to obtain logits. A configured
+        # replay window instead leaves that many original-prompt tokens for the
+        # model to rebuild before any generated history is teacher-forced.
+        max_cache_hit_length = self._get_max_cache_hit_length(request)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -327,7 +338,8 @@ class KVCacheManager:
 
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            self._get_max_cache_hit_length(request),
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its

@@ -157,6 +157,54 @@ def _make_csa_linear_specs(
     return specs
 
 
+def _make_deepseek_v41_specs(block_size: int) -> dict[str, KVCacheSpec]:
+    specs: dict[str, KVCacheSpec] = {}
+    kv_sources = {2: 2, 8: 2, 14: 2, 20: 1}
+    for layer_index in range(40):
+        prefix = f"language_model.model.layers.{layer_index}.attn"
+        specs[f"{prefix}.swa_cache"] = SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            state_content_bytes=528,
+            alignment=16,
+            model_version="deepseek_v4_1",
+        )
+        if (compress_ratio := kv_sources.get(layer_index)) is None:
+            continue
+        specs[prefix] = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            state_content_bytes=288,
+            alignment=32,
+            model_version="deepseek_v4_1",
+        )
+        specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            state_content_bytes=68,
+            alignment=128,
+            model_version="deepseek_v4_1",
+        )
+        if compress_ratio == 2:
+            specs[f"{prefix}.compressor.state_cache"] = CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                head_size_v=0,
+                dtype=torch.float32,
+            )
+    return specs
+
+
 def _shared_layout_config():
     config = _mock_vllm_config("BLNHC")
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
@@ -172,6 +220,88 @@ def _shared_layout_config():
     config.cache_config.prefix_match_unit = None
     config.cache_config.mamba_cache_mode = "none"
     return config
+
+
+class TestDeepseekV41Grouping:
+    @pytest.mark.parametrize("block_size", [32, 128])
+    def test_preserves_all_compressor_state_caches(self, block_size):
+        config = _shared_layout_config()
+        config.cache_config.block_size = block_size
+        config.cache_config.kv_cache_layout = "BLHNC"
+        config.model_config.hf_config.model_type = "deepseek_v41"
+        specs = _make_deepseek_v41_specs(block_size)
+
+        groups = get_kv_cache_groups(config, specs)
+        grouped_names = [name for group in groups for name in group.layer_names]
+        assert len(grouped_names) == len(set(grouped_names)) == len(specs)
+        assert set(grouped_names) == set(specs)
+
+        state_names = {
+            name for name, spec in specs.items() if isinstance(spec, CircularBufferSpec)
+        }
+        assert len(state_names) == 3
+        state_groups = [
+            group for group in groups if state_names.intersection(group.layer_names)
+        ]
+        assert {name for group in state_groups for name in group.layer_names} == (
+            state_names
+        )
+        assert all(not group.kv_cache_spec.prefix_cacheable for group in state_groups)
+        assert all(
+            group.kv_cache_spec.max_num_blocks_per_req(config, 1_000_000) == 1
+            for group in state_groups
+        )
+
+        bytes_per_block = _get_kv_cache_bytes_per_block(groups)
+        pages = _pages(groups)
+        assert bytes_per_block == _expected_bytes_per_block(groups)
+        if block_size == 128:
+            assert bytes_per_block == 113_920
+            assert sorted(len(group.layer_names) for group in groups) == [
+                3,
+                5,
+                5,
+                6,
+                6,
+                6,
+                6,
+                6,
+                8,
+            ]
+        assert all(
+            sum(pages[name] for name in group.layer_names) <= bytes_per_block
+            for group in groups
+        )
+        kv_cache_config = get_kv_cache_config_from_groups(
+            config, groups, available_memory=bytes_per_block * 32
+        )
+        assert kv_cache_config.num_blocks == 32
+        assert {
+            name
+            for tensor in kv_cache_config.kv_cache_tensors
+            for name in tensor.layers
+        } == set(specs)
+        assert all(
+            tensor.block_stride == bytes_per_block
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
+        views = allocate_kv_cache(
+            kv_cache_config, torch.device("cpu"), KVCacheLayout.BLHNC, None
+        )
+        assert set(views) == set(specs)
+        assert all(
+            views[name].shape == (32, 1, 8, 1024) and views[name].dtype == torch.float32
+            for name in state_names
+        )
+        for spec in specs.values():
+            unpadded = spec.num_heads * spec.num_states * spec.state_content_size_bytes
+            alignment = getattr(spec, "alignment", None)
+            expected = (
+                (unpadded + alignment - 1) // alignment * alignment
+                if alignment is not None
+                else unpadded
+            )
+            assert spec.page_size_bytes == expected
 
 
 class TestCSALinearGrouping:

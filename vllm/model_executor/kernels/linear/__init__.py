@@ -106,6 +106,9 @@ from vllm.model_executor.kernels.linear.mxfp8 import (
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.mxfp8.ada import (
+    AdaMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.b12x import (
     B12xMxfp8LinearKernel,
 )
@@ -512,6 +515,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
+        AdaMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
         B12xMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
@@ -845,13 +849,22 @@ def choose_mp_linear_kernel(
     )
 
 
-def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
+def init_mxfp8_linear_kernel(
+    model_profile: str | None = None,
+) -> Mxfp8LinearKernel:
     """Select and instantiate the best MXFP8 linear kernel for the
     current platform."""
-    config = Mxfp8LinearLayerConfig()
+    config = Mxfp8LinearLayerConfig(model_profile=model_profile)
 
     platform = current_platform._enum
     possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
+
+    if model_profile == "deepseek_v41":
+        possible = [
+            kernel
+            for kernel in possible
+            if kernel in (FlashInferCutlassMxfp8LinearKernel, AdaMxfp8LinearKernel)
+        ]
 
     # Apply --linear-backend filtering when set.
     possible = _resolve_backend_kernels(possible, "MXFP8")
@@ -1224,6 +1237,7 @@ __all__ = [
     "init_mxfp8_linear_kernel",
     "Mxfp8LinearKernel",
     "Mxfp8LinearLayerConfig",
+    "AdaMxfp8LinearKernel",
     "B12xMxfp8LinearKernel",
     "B12xMxFp4LinearKernel",
     "B12xNvFp4LinearKernel",

@@ -70,6 +70,20 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+_CED_PREFIX_REPLAY_WINDOW = 128
+
+
+def _cap_ced_replay_chunk(
+    request: Request, num_computed_tokens: int, num_new_tokens: int
+) -> int:
+    """Keep CED recomputation on one side of the original prompt boundary."""
+    prompt_end = request.num_prompt_tokens
+    if num_computed_tokens < prompt_end:
+        return min(num_new_tokens, prompt_end - num_computed_tokens)
+    if num_computed_tokens < request.num_tokens:
+        return min(num_new_tokens, _CED_PREFIX_REPLAY_WINDOW)
+    return num_new_tokens
+
 
 class Scheduler(SchedulerInterface):
     @staticmethod
@@ -106,6 +120,11 @@ class Scheduler(SchedulerInterface):
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.model_uses_xdrope = vllm_config.model_config.uses_xdrope
+        hf_config = vllm_config.model_config.hf_config
+        self.ced_prefill = (
+            getattr(hf_config, "model_type", None) == "deepseek_v41"
+            and bool(getattr(hf_config, "ced_prefill", False))
+        )
         self.enable_mm_atomic_spans = self._should_enable_mm_atomic_spans(
             vllm_config.model_config
         )
@@ -327,6 +346,9 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            prefix_replay_window=(
+                _CED_PREFIX_REPLAY_WINDOW if self.ced_prefill else 0
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -729,6 +751,11 @@ class Scheduler(SchedulerInterface):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
+                )
+
+            if self.ced_prefill:
+                num_new_tokens = _cap_ced_replay_chunk(
+                    request, request.num_computed_tokens, num_new_tokens
                 )
 
             num_new_tokens = self._trim_mm_atomic_chunk(
@@ -1174,6 +1201,11 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
+
+                    if self.ced_prefill:
+                        num_new_tokens = _cap_ced_replay_chunk(
+                            request, num_computed_tokens, num_new_tokens
+                        )
 
                     num_new_tokens = self._trim_mm_atomic_chunk(
                         request,

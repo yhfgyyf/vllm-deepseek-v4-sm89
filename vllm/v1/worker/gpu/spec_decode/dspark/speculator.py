@@ -30,6 +30,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -116,6 +117,73 @@ class DSparkSpeculator(DFlashSpeculator):
                 " a fixed number of drafts instead."
             )
         return model
+
+    def _precompute_context_kv(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_rejected: torch.Tensor,
+        *,
+        dummy_run: bool,
+    ) -> None:
+        from vllm.models.deepseek_v4_1.nvidia.ced import CED_METADATA_KEY, CEDStep
+
+        step = (
+            attn_metadata.get(CED_METADATA_KEY)
+            if isinstance(attn_metadata, dict)
+            else None
+        )
+        if dummy_run or not isinstance(step, CEDStep):
+            return super()._precompute_context_kv(
+                input_batch,
+                attn_metadata,
+                last_hidden_states,
+                aux_hidden_states,
+                num_rejected,
+                dummy_run=dummy_run,
+            )
+        context = step.draft_context
+        if context is None:
+            raise RuntimeError("CED target did not produce its DSpark context")
+        num_reqs = input_batch.num_reqs
+        active = torch.zeros(num_reqs, dtype=torch.bool, device=self.device)
+        active[list(context.active_requests)] = True
+        # Intermediate encoder chunks have no decoder context. Keep their graph
+        # rows inert instead of reading or publishing uninitialized draft KV.
+        for gid in self.draft_kv_cache_group_ids:
+            self.block_tables.slot_mappings[gid][
+                : num_reqs * self.num_query_per_req
+            ].view(num_reqs, self.num_query_per_req).masked_fill_(~active[:, None], -1)
+        self.sample_idx_mapping[: num_reqs * self.num_speculative_steps].view(
+            num_reqs, self.num_speculative_steps
+        ).masked_fill_(~active[:, None], -1)
+        self.input_buffers.seq_lens[:num_reqs].masked_fill_(~active, 0)
+        if context.positions.numel() == 0:
+            return
+
+        hidden_states = self.model.combine_hidden_states(
+            torch.cat(context.aux_hidden_states, dim=-1)
+        )
+        group_slots = [
+            context.slot_mapping(
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.block_sizes[gid],
+                input_batch.seq_lens,
+                num_rejected,
+            )
+            for gid in self.draft_kv_cache_group_ids
+        ]
+        context_slots = (
+            [group_slots[index] for index in self._layer_group_idx]
+            if self._layer_group_idx is not None
+            else group_slots[0]
+        )
+        self.model.precompute_and_store_context_kv(
+            hidden_states, context.positions, context_slots
+        )
 
     def _sample_logits(
         self,

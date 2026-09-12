@@ -1796,6 +1796,7 @@ class CkptCtx:
     """Per-checkpoint facts a QuantKey cannot carry."""
 
     group_size: int | None = None
+    scale_block_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -2128,6 +2129,27 @@ class KMxfp8Static(QuantKeyScheme):
 
     key = kMxfp8Static
 
+    @staticmethod
+    def get_scale_weight_loader(weight_loader: Callable, ctx: CkptCtx) -> Callable:
+        block_rows, block_cols = ctx.scale_block_size or (1, MXFP8_BLOCK_SIZE)
+        if block_rows < 1 or block_cols != MXFP8_BLOCK_SIZE:
+            raise NotImplementedError(
+                f"MXFP8 checkpoint scale block {ctx.scale_block_size} is unsupported"
+            )
+
+        def scaled_loader(param, loaded_weight, *args, **kwargs):
+            if loaded_weight.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+                raise TypeError(
+                    "MXFP8 weight scales must be uint8 or float8_e8m0fnu, got "
+                    f"{loaded_weight.dtype}."
+                )
+            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
+                block_rows, dim=0
+            )
+            return weight_loader(param, loaded_weight, *args, **kwargs)
+
+        return scaled_loader if block_rows > 1 else weight_loader
+
     def create_weights(self, layer, role, ctx, shapes, wl) -> None:
         if role is not WEIGHT:
             self.reject(role)
@@ -2146,6 +2168,7 @@ class KMxfp8Static(QuantKeyScheme):
             input_dim=1,
             output_dim=0,
         )
+        scale_loader = self.get_scale_weight_loader(wl, ctx)
         self.register_params(
             layer,
             "weight_scale",
@@ -2155,10 +2178,11 @@ class KMxfp8Static(QuantKeyScheme):
             ),
             MXFP8_SCALE_DTYPE,
             ModelWeightParameter,
-            wl,
+            scale_loader,
             input_dim=1,
             output_dim=0,
         )
+        layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
 
     def process(self, layer, role) -> None:
         if role is not WEIGHT:
@@ -2225,7 +2249,9 @@ def select_linear_kernel(spec: QuantSpec, layer, rt: RuntimeDtypes):
         # after #50273); W4A4 → use_a16=False.
         return init_nvfp4_linear_kernel(use_a16=spec.activation is None)
     if w.scale.dtype == MXFP8_SCALE_DTYPE:
-        return init_mxfp8_linear_kernel()
+        return init_mxfp8_linear_kernel(
+            model_profile=getattr(layer, "_mxfp8_model_profile", None)
+        )
     # fp8 family: init_fp8 routes block-vs-plain itself off the activation key,
     # and needs a real key -- weight-only fp8 is not a ModelOpt format.
     act = spec.activation

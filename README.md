@@ -1,26 +1,35 @@
-# DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 与 GLM-5.3-Flash on SM89 / SM120 — vLLM fork
+# DeepSeek-V4.1-Flash、DeepSeek-V4-Flash / Vision 与 GLM-5.3-Flash on SM89 / SM120 — vLLM fork
 
 <!-- markdownlint-disable MD060 -->
 
 > English version: [`README_EN.md`](README_EN.md)
 >
 > 本仓库基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，用于在
-> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash、
-> DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
+> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4.1-Flash、
+> DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
 当前代码为 vLLM `0.28.1rc1.dev517` 开发版，配套 FlashInfer `0.6.18`。已验证配置包括
 **4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
 
 ## 支持矩阵
 
-| GPU 架构 | 已验证 GPU | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
-|---|---|---:|---:|---:|
-| SM89 / Ada | 8× RTX 4090 48GB | 是 | 是 | 是 |
-| SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 | 是 |
+| GPU 架构 | 已验证 GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
+|---|---|---:|---:|---:|---:|
+| SM89 / Ada | 8× RTX 4090 48GB | 仅离线编译验证 | 是 | 是 | 是 |
+| SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 | 是 | 是 |
 
 ---
 
 ## Changelog
+
+### 2026-09-12
+
+- 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
+  支持，发布 SM89+SM120 `vision9` wheel。
+- 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证；SM89 本轮仅完成
+  离线编译验证，未在 SM89 硬件上执行内核数值测试或完整模型服务验证。
+- 已测长文本 prefill 中，按输入 token 数 / TTFT 估算的 prefill 代理指标相对
+  关闭 CED 时约翻倍；实际收益取决于 prompt 和运行配置。
 
 ### 2026-09-07
 
@@ -78,9 +87,10 @@
 | Python | 3.12 |
 | CUDA toolkit | 13.0 |
 | PyTorch | 2.13.0+cu130 |
-| Triton | 3.7.1 |
-| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv4.vision8.sm89sm120.cu130` |
+| Triton | 3.7.1（`ptxas-blackwell` CUDA 13.1） |
+| Transformers | 5.16.1 |
+| FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -97,19 +107,20 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc1-vision8-sm89-sm120-cu130 \
+gh release download v0.28.1rc1-vision9-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
-  --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
-  --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
+  --pattern 'flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-*.whl' \
+  --pattern 'vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision8-release
+  --dir /tmp/vllm-sm89-sm120-vision9-release
 
-cd /tmp/vllm-sm89-sm120-vision8-release
+cd /tmp/vllm-sm89-sm120-vision9-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
-uv pip install ./vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl \
+uv pip install ./vllm-*glm53.dsv41.vision9.sm89sm120.cu130-*.whl \
   --torch-backend=cu130
+uv pip install 'transformers==5.16.1' 'triton==3.7.1'
 ```
 
 vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashInfer wheel。
@@ -117,7 +128,38 @@ vLLM wheel 会通过锁定的依赖 URL 安装同一 Release 中配套的 FlashI
 
 如果阿里云镜像速度较慢，可以替换为腾讯云或中科大 PyPI 镜像。
 
-### 2.2 Docker 镜像（阿里云上海 ACR）
+### 2.2 从源码完整构建
+
+以下流程会重新编译 vLLM 的 C++ / CUDA 扩展，并同时生成 SM89 与 SM120
+目标代码。`requirements/cuda.txt` 会安装本次 Release 配套的 FlashInfer wheel。
+构建前需准备 CUDA 13.0 toolkit、C++ 编译器和支持 Rust 2024 edition 的
+Rust/Cargo。
+
+```bash
+git clone --branch main \
+  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
+cd vllm-deepseek-v4-sm89
+
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
+uv pip install -r requirements/cuda.txt --torch-backend=cu130
+uv pip install 'transformers==5.16.1' 'triton==3.7.1'
+
+export CUDA_HOME=/usr/local/cuda-13.0
+export TORCH_CUDA_ARCH_LIST='8.9;12.0'
+export MAX_JOBS=4
+
+VLLM_VERSION_OVERRIDE='0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130' \
+  uv build --wheel --no-build-isolation
+uv pip install --no-build-isolation \
+  dist/vllm-0.28.1rc1.dev517+glm53.dsv41.vision9.sm89sm120.cu130-*.whl
+```
+
+### 2.3 Docker 镜像（阿里云上海 ACR）
+
+> **注意：** 以下现有 Docker 镜像不包含 DeepSeek-V4.1-Flash 支持；V4.1
+> 请使用本次 Release wheel 或上述源码构建流程。
 
 镜像地址：
 
@@ -156,9 +198,64 @@ docker run --rm --gpus all --ipc=host \
 
 ---
 
-## 3. DeepSeek-V4-Flash 启动命令
+## 3. DeepSeek-V4.1-Flash 启动命令（SM120）
 
-### 3.1 SM89：4× RTX 4090 48GB
+以下为 4× RTX PRO 6000 96GB 上验证过的文本服务配置。它使用 TP=4、EP、
+FP8 KV、Engram CPU offload、DSpark 5 和实验性 CED prefill；CPU offload
+还需预留充足的主机内存。V4.1 使用 Model Runner V2，不支持切换到旧 V1 runner：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export FLASHINFER_CUDA_ARCH_LIST=12.0
+export VLLM_USE_V2_MODEL_RUNNER=1
+export TRITON_PTXAS_BLACKWELL_PATH="$(
+  "$VIRTUAL_ENV/bin/python" -c \
+    'from pathlib import Path; import triton; print(Path(triton.__file__).parent / "backends/nvidia/bin/ptxas-blackwell")'
+)"
+"$TRITON_PTXAS_BLACKWELL_PATH" --version
+
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v4.1-flash \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --kv-cache-dtype fp8 \
+  --block-size 128 \
+  --max-model-len auto \
+  --max-num-seqs 20 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-prefix-caching \
+  --engram-config '{"cpu_offload":true}' \
+  --load-format safetensors \
+  --safetensors-load-strategy lazy \
+  --tokenizer-mode deepseek_v41 \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --hf-overrides '{"ced_prefill":true}' \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+```
+
+`ptxas-blackwell --version` 必须显示 CUDA 13.1 工具链。
+
+CED 当前是实验性的近似文本 prefill 路径。在已测长文本 prefill 中，按输入 token
+数 / TTFT 估算的 prefill 代理指标相对关闭 CED 时约翻倍，但收益会随 prompt、
+长度和运行配置变化。它不保证与非 CED 路径输出等价；部署前应按实际任务验证
+质量。CED 不支持多模态输入、prompt embeddings 或 prompt logprobs，因此启用
+CED 时不要发送图片或其他多模态内容。
+
+SM120 已完成完整模型服务验证；SM89 本轮仅完成离线编译验证，未在 SM89
+硬件上执行内核数值测试或完整模型服务验证。
+
+## 4. DeepSeek-V4-Flash 启动命令
+
+### 4.1 SM89：4× RTX 4090 48GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
@@ -188,7 +285,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 该配置保持原有 SM89 部署口径，已验证 8K、32K、128K 输入，512 输出，以及
 4 并发 8K 输入。
 
-### 3.2 SM120：4× RTX PRO 6000 96GB
+### 4.2 SM120：4× RTX PRO 6000 96GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
@@ -216,14 +313,14 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ---
 
-## 4. DeepSeek-V4-Flash-Vision-Exp 启动命令
+## 5. DeepSeek-V4-Flash-Vision-Exp 启动命令
 
 4× RTX 4090 48GB 可以运行 DeepSeek-V4-Flash-Vision-Exp，但不建议启用
 DSpark：目标模型和 draft model 会占用大部分显存，剩余空间不足以提供实用的
 draft KV cache。8× RTX 4090 48GB 可以启用 DSpark，建议将
 `--max-num-batched-tokens` 设置为 `4096`。
 
-### 4.1 SM120：4× RTX PRO 6000 96GB
+### 5.1 SM120：4× RTX PRO 6000 96GB
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -249,7 +346,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
-### 4.2 SM89：8× RTX 4090 48GB（DSpark）
+### 5.2 SM89：8× RTX 4090 48GB（DSpark）
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
@@ -278,9 +375,9 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
 上述 8 卡命令是推荐部署配置；本轮 SM89 实机回归使用 4× RTX 4090 48GB，
 且未启用 DSpark。
 
-## 5. GLM-5.3-Flash 启动命令
+## 6. GLM-5.3-Flash 启动命令
 
-### 5.1 SM89：8× RTX 4090 48GB
+### 6.1 SM89：8× RTX 4090 48GB
 
 以下参数参考社区用户在
 [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)
@@ -311,7 +408,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### 5.2 SM120：4× RTX PRO 6000 96GB
+### 6.2 SM120：4× RTX PRO 6000 96GB
 
 ```bash
 vllm serve /path/to/GLM-5.3-Flash \
@@ -332,7 +429,7 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-### 5.3 SM120 关键参数
+### 6.3 SM120 关键参数
 
 | 参数 | 推荐值 | 说明 |
 |---|---:|---|
@@ -349,7 +446,7 @@ vllm serve /path/to/GLM-5.3-Flash \
 
 ---
 
-## 6. GLM-5.3-Flash SM120 吞吐基线
+## 7. GLM-5.3-Flash SM120 吞吐基线
 
 以下数据来自本项目第一版 SM120 完整基准，使用 4× RTX PRO 6000、TP=4、
 FP8 KV、MTP=5、CUDA Graph、`block-size=2304`、chunked prefill 8192，关闭
@@ -388,10 +485,14 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
 
 ---
 
-## 7. 正确性验证
+## 8. 正确性验证
 
-- DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 与 GLM-5.3-Flash
+- DeepSeek-V4.1-Flash、DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp
+  与 GLM-5.3-Flash
   在 SM120 上均通过服务启动。
+- DeepSeek-V4.1-Flash 在 SM120 上通过文本服务、工具调用、DSpark 和实验性
+  CED prefill 验证；SM89 本轮仅完成离线编译验证，未在 SM89 硬件上执行
+  内核数值测试或完整模型服务验证。
 - DeepSeek-V4-Flash 与 GLM-5.3-Flash 在 SM120 上通过 8K/32K 输入和
   512 输出测试。
 - DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8
@@ -405,7 +506,7 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
 
 ---
 
-## 8. License / 来源
+## 9. License / 来源
 
 代码基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，沿用
 Apache-2.0 协议。FlashInfer wheel 基于
