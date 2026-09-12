@@ -4,6 +4,8 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
@@ -275,3 +277,41 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_device_reallocation_updates_mixed_prefill_and_clears_zero_budget():
+    """Live confidences drive GPU offsets; zero budgets must erase old drafts."""
+    query_start_loc = torch.full((6,), -1, dtype=torch.int32, device="cuda")
+    manager = AdaptiveVerificationManager(
+        SimpleNamespace(
+            num_speculative_steps=2, device=torch.device("cuda"), max_num_reqs=5
+        ),
+        query_start_loc,
+        num_bonus_tokens=1,
+        max_total_logits=64,
+    )
+    req_ids = ["low", "high", "prefill"]
+    indices = torch.tensor([2, 0, 4], dtype=torch.int32, device="cuda")
+    manager._confidence_probs.fill_(1)
+    manager._confidence_probs[0] = torch.tensor([0.95, 0.9], device="cuda")
+    manager._confidence_probs[2] = torch.tensor([0.2, 0.1], device="cuda")
+    original_ptr = query_start_loc.data_ptr()
+
+    for budget, expected_capacities in [(3, [1, 2, 0]), (0, [0, 0, 0]), (2, [0, 2, 0])]:
+        manager._batch_budget = (
+            dict(zip(req_ids, [2, 2, 0])),
+            dict(zip(req_ids, [1, 1, 4])),
+            budget,
+        )
+        logits, starts, actual_budget = manager.reallocate_drafts(req_ids, indices)
+        capacities = np.array(expected_capacities, dtype=np.int32)
+        expected_starts = np.cumsum(np.r_[0, capacities + [1, 1, 4]])
+        expected_logits = np.cumsum(np.r_[0, capacities + 1])
+
+        assert actual_budget == budget
+        assert starts.data_ptr() == original_ptr
+        assert starts[:4].tolist() == expected_starts.tolist()
+        assert starts[4:].tolist() == [6 + budget, 6 + budget]
+        assert logits.tolist() == expected_logits.tolist()
+        assert manager._batch_draft_capacity[:3].tolist() == expected_capacities

@@ -40,6 +40,24 @@ def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
+def dequantize_packed_fp8_kv_cache(
+    kv_cache: torch.Tensor, head_dim: int
+) -> torch.Tensor:
+    num_blocks, block_size, num_heads, _ = kv_cache.shape
+    raw = kv_cache.view(num_blocks, -1)
+    values = raw[:, : block_size * head_dim].view(
+        num_blocks, block_size, num_heads, head_dim
+    )
+    values = values.view(torch.float8_e4m3fn).float()
+    scales = (
+        raw[:, block_size * head_dim :]
+        .contiguous()
+        .view(torch.float32)
+        .view(num_blocks, block_size, num_heads, 1)
+    )
+    return values * scales
+
+
 def per_custom_dims_cast_to_fp8(
     x: torch.Tensor, dims: tuple, use_ue8m0: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -313,3 +331,79 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits(batch_size: int, next_n: int):
             ref_logits = ref_logits.masked_fill(~mask, 0)
             diff = calc_diff(logits, ref_logits)
             assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="SM120 DeepGEMM varlen path only",
+)
+def test_deepgemm_fp8_paged_mqa_logits_varlen_indices():
+    torch.manual_seed(6)
+    num_heads, head_dim = 32, 128
+    block_size, max_model_len = 64, 96
+    num_blocks = 8
+    row_indices = torch.tensor([0, 0, 0, 1, 3], device="cuda", dtype=torch.int32)
+    context_lens = torch.tensor(
+        [[62], [63], [64], [37], [0]], device="cuda", dtype=torch.int32
+    )
+    num_rows = row_indices.numel()
+    q = torch.randn(
+        num_rows,
+        1,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(num_rows, num_heads, device="cuda", dtype=torch.float32)
+    kv_cache = torch.randn(
+        num_blocks,
+        block_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    request_block_tables = torch.tensor(
+        [[5, 0], [2, 7], [4, 6]], device="cuda", dtype=torch.int32
+    )
+    block_tables = request_block_tables[
+        torch.tensor([0, 0, 0, 1, 0], device="cuda")
+    ].contiguous()
+    block_tables[-1].zero_()
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+    kv_cache_dequant = dequantize_packed_fp8_kv_cache(kv_cache_fp8, head_dim)
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens,
+        block_size,
+        get_num_sms(),
+        indices=row_indices,
+    )
+    actual = fp8_fp4_paged_mqa_logits(
+        (q_fp8, None),
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=False,
+        indices=row_indices,
+    )
+
+    expected = _ref_fp8_fp4_paged_mqa_logits(
+        q_fp8.float(),
+        kv_cache_dequant,
+        weights,
+        context_lens.flatten(),
+        block_tables,
+        max_model_len,
+    )
+    valid = torch.arange(max_model_len, device="cuda") < context_lens
+    assert not valid[-1].any()
+    diff = calc_diff(actual.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
+    assert diff < 1e-3, f"{diff=}"

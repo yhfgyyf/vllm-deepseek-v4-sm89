@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness checks for the native DeepSeek V4.1 MXFP4 indexer."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -20,10 +22,14 @@ from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
     map_candidate_topk_,
 )
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
+    DeepseekV41IndexerMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 HEADS = 32
 HEAD_DIM = 128
@@ -31,6 +37,19 @@ HEAD_DIM = 128
 requires_cuda_and_triton = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAS_TRITON,
     reason="requires CUDA and Triton",
+)
+
+
+def _supports_dsv41_gpu() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    capability = torch.cuda.get_device_capability()
+    return capability == (8, 9) or capability[0] == 12
+
+
+requires_dsv41_gpu = pytest.mark.skipif(
+    not HAS_TRITON or not _supports_dsv41_gpu(),
+    reason="requires a CUDA SM89 or SM120 GPU and Triton",
 )
 
 
@@ -162,6 +181,91 @@ def _reference(
     return (torch.einsum("qhd,qtd->qht", q, k).relu() * weights[:, :, None]).sum(dim=1)
 
 
+def _decode_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    row_ends: torch.Tensor,
+    width: int,
+    row_repeat: int,
+) -> torch.Tensor:
+    expected = torch.full(
+        (q.shape[0], width), -torch.inf, device=q.device, dtype=torch.float32
+    )
+    for row, end in enumerate(row_ends.tolist()):
+        if end == 0:
+            continue
+        req = row // row_repeat
+        scores = (
+            torch.einsum("hd,td->ht", q[row], k[req, :end]).relu()
+            * weights[row, :, None]
+        ).sum(dim=0)
+        expected[row, :end] = scores
+    return expected
+
+
+def _mapped_decode_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    row_ends: torch.Tensor,
+    row_requests: list[int],
+    width: int,
+) -> torch.Tensor:
+    expected = torch.full(
+        (q.shape[0], width), -torch.inf, device=q.device, dtype=torch.float32
+    )
+    for row, (end, request) in enumerate(zip(row_ends.tolist(), row_requests)):
+        if end == 0 or request < 0:
+            continue
+        scores = (
+            torch.einsum("hd,td->ht", q[row], k[request, :end]).relu()
+            * weights[row, :, None]
+        ).sum(dim=0)
+        expected[row, :end] = scores
+    return expected
+
+
+def _dense_topk_reference(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    values, tokens = torch.topk(logits, topk, dim=1)
+    return torch.where(torch.isfinite(values), tokens, -1).to(torch.int32)
+
+
+def _candidate_reference(
+    dense: torch.Tensor,
+    candidates: torch.Tensor,
+    row_ends: torch.Tensor,
+) -> torch.Tensor:
+    expected = torch.full(
+        (candidates.shape[0], candidates.shape[1] * 8),
+        -torch.inf,
+        device=dense.device,
+        dtype=torch.float32,
+    )
+    for row, end in enumerate(row_ends.tolist()):
+        for slot, block in enumerate(candidates[row].tolist()):
+            for offset in range(8):
+                token = block * 8 + offset
+                if 0 <= token < end:
+                    expected[row, slot * 8 + offset] = dense[row, token]
+    return expected
+
+
+def _candidate_topk_reference(
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    values, compact = torch.topk(logits, topk, dim=1)
+    slots = compact // 8
+    offsets = compact % 8
+    blocks = candidates.gather(1, slots)
+    tokens = blocks * 8 + offsets
+    return torch.where(torch.isfinite(values) & (blocks >= 0), tokens, -1).to(
+        torch.int32
+    )
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 @requires_cuda_and_triton
 def test_dense_indexer_reads_segregated_pages(page_size: int) -> None:
@@ -194,6 +298,335 @@ def test_dense_indexer_reads_segregated_pages(page_size: int) -> None:
     positions = torch.arange(width, device="cuda")
     expected.masked_fill_(positions[None] >= lengths[:, None], -torch.inf)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_and_triton
+def test_native_operator_cuda_graph_replay_reads_live_lengths_and_candidates() -> None:
+    torch.manual_seed(5)
+    batch, row_repeat, rows = 3, 2, 6
+    page_size, max_kv_len, width = 64, 530, 544
+    q = torch.randn(rows, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, max_kv_len, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q_packed, q_scales = _quantize_mxfp4(q)
+    block_table = torch.tensor(
+        [
+            [8, 0, 17, 5, 24, 2, 20, 11, 26],
+            [1, 14, 6, 25, 9, 18, 3, 22, 12],
+            [15, 4, 23, 10, 19, 7, 21, 13, 16],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cache, k_dequant = _make_cache(k, page_size, block_table)
+    q_dequant = _dequantize_mxfp4(q_packed, q_scales)
+    weights = torch.randn(rows, HEADS, device="cuda", dtype=torch.float32)
+    row_ends = torch.empty(rows, device="cuda", dtype=torch.int32)
+    candidates = torch.empty(rows, 68, device="cuda", dtype=torch.int32)
+    dense_out = torch.empty(rows, width, device="cuda", dtype=torch.float32)
+    candidate_out = torch.empty(rows, width, device="cuda", dtype=torch.float32)
+    topk = 512
+    topk_indices = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    topk_workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+    compact_lens = torch.empty(rows, device="cuda", dtype=torch.int32)
+
+    def candidate_row(prefix: list[int]) -> list[int]:
+        return (prefix + list(range(68)))[:68]
+
+    states = [
+        (
+            [530, 521, 317, 0, 0, 0],
+            [
+                candidate_row([0, 66, -1, 1 << 29]),
+                candidate_row([64, 1, 67, -1]),
+                candidate_row([39, 0, -1, 1 << 29]),
+                candidate_row([0, 1, 2, 3]),
+                candidate_row([0, -1, 1 << 29, 1]),
+                candidate_row([1, 0, -1, 2]),
+            ],
+        ),
+        (
+            [129, 127, 530, 519, 1, 0],
+            [
+                candidate_row([16, 0, -1, 1 << 29]),
+                candidate_row([0, 15, 67, -1]),
+                candidate_row([66, 2, 0, 1]),
+                candidate_row([64, 1, -1, 0]),
+                candidate_row([0, 1, 1 << 29, -1]),
+                candidate_row([0, 2, -1, 1]),
+            ],
+        ),
+    ]
+
+    def launch() -> None:
+        dsv41_mxfp4_dense_logits(
+            q_packed,
+            q_scales,
+            cache,
+            weights,
+            block_table,
+            row_ends,
+            width,
+            row_repeat=row_repeat,
+            out=dense_out,
+        )
+        dsv41_mxfp4_candidate_logits(
+            q_packed,
+            q_scales,
+            cache,
+            weights,
+            block_table,
+            row_ends,
+            candidates,
+            row_repeat=row_repeat,
+            out=candidate_out,
+        )
+        sparse_indexer._dsv41_topk_from_candidates(
+            candidate_out,
+            candidates,
+            topk_indices,
+            topk_workspace,
+            compact_lens,
+        )
+
+    row_ends.copy_(torch.tensor(states[0][0], device="cuda", dtype=torch.int32))
+    candidates.copy_(torch.tensor(states[0][1], device="cuda", dtype=torch.int32))
+    launch()
+    torch.accelerator.synchronize()
+
+    storage_ptrs = (row_ends.data_ptr(), candidates.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    for lengths, candidate_blocks in states:
+        row_ends.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        candidates.copy_(
+            torch.tensor(candidate_blocks, device="cuda", dtype=torch.int32)
+        )
+        graph.replay()
+        torch.accelerator.synchronize()
+
+        assert storage_ptrs == (row_ends.data_ptr(), candidates.data_ptr())
+        dense_expected = _decode_reference(
+            q_dequant, k_dequant, weights, row_ends, width, row_repeat
+        )
+        candidate_expected = _candidate_reference(dense_expected, candidates, row_ends)
+        topk_expected = _candidate_topk_reference(candidate_expected, candidates, topk)
+        torch.testing.assert_close(dense_out, dense_expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            candidate_out, candidate_expected, rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(
+            topk_indices.sort(dim=1).values,
+            topk_expected.sort(dim=1).values,
+            rtol=0,
+            atol=0,
+        )
+
+
+@requires_dsv41_gpu
+def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
+    workspace_init,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+    torch.manual_seed(6)
+    max_model_len = 1088
+    max_tokens = 9
+    topk = 512
+    page_size = 128
+    width = max_model_len // 2
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            resolve_indexer_kv_dtype=lambda default: default
+        ),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_tokens,
+            max_num_seqs=4,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=True,
+            num_speculative_tokens=3,
+        ),
+        num_speculative_tokens=3,
+    )
+    block_table = torch.arange(20, device="cuda", dtype=torch.int32).view(4, 5)
+    builder = DeepseekV41IndexerMetadataBuilder(
+        kv_cache_spec=MLAAttentionSpec(
+            block_size=page_size,
+            num_kv_heads=1,
+            head_size=HEAD_DIM,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+            state_content_bytes=68,
+            alignment=128,
+            model_version="deepseek_v4_1",
+        ),
+        layer_names=["model.layers.20.attn.indexer.k_cache"],
+        vllm_config=config,
+        device=torch.device("cuda", torch.accelerator.current_device_index()),
+        block_table_width=block_table.shape[1],
+    )
+
+    def make_common(
+        query_locs: list[int],
+        query_locs_cpu: list[int],
+        seq_lens: list[int],
+        is_prefilling: list[bool],
+    ) -> CommonAttentionMetadata:
+        return CommonAttentionMetadata(
+            query_start_loc=torch.tensor(query_locs, device="cuda", dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor(query_locs_cpu, dtype=torch.int32),
+            seq_lens=torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
+            num_reqs=4,
+            num_actual_tokens=max_tokens,
+            max_query_len=max(
+                right - left for left, right in zip(query_locs, query_locs[1:])
+            ),
+            max_seq_len=max(seq_lens),
+            block_table_tensor=block_table,
+            slot_mapping=torch.zeros(max_tokens, device="cuda", dtype=torch.int64),
+            seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
+            is_prefilling=torch.tensor(is_prefilling, device="cuda", dtype=torch.bool),
+        )
+
+    def expected_compressed_seq_lens(
+        query_locs: list[int], seq_lens: list[int]
+    ) -> list[int]:
+        expected: list[int] = []
+        for start, end, seq_len in zip(
+            query_locs[:-1], query_locs[1:], seq_lens, strict=True
+        ):
+            query_len = end - start
+            expected.extend(
+                (seq_len - query_len + token_offset + 1) // 2
+                for token_offset in range(query_len)
+            )
+        return expected + [0] * (max_tokens - len(expected))
+
+    capture_query_locs = [0, 1, 2, 3, 4]
+    capture_seq_lens = [1060, 1042, 634, 258]
+    capture_metadata = builder.build_for_cudagraph_capture(
+        make_common(
+            capture_query_locs,
+            [0, 1, 2, 3, 4],
+            capture_seq_lens,
+            [False, False, False, False],
+        )
+    )
+    assert capture_metadata.decode is not None
+    assert capture_metadata.decode.max_indexer_kv_len == width
+    assert capture_metadata.decode.seq_lens.squeeze(-1).tolist() == (
+        expected_compressed_seq_lens(capture_query_locs, capture_seq_lens)
+    )
+    metadata_ptrs = (
+        capture_metadata.decode.seq_lens.data_ptr(),
+        capture_metadata.decode.block_table.data_ptr(),
+    )
+
+    q = torch.randn(max_tokens, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(4, 530, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q_packed, q_scales = _quantize_mxfp4(q)
+    cache, k_dequant = _make_cache(k, page_size, block_table)
+    q_dequant = _dequantize_mxfp4(q_packed, q_scales)
+    weights = torch.randn(max_tokens, HEADS, device="cuda", dtype=torch.float32)
+    topk_indices = torch.empty(max_tokens, topk, device="cuda", dtype=torch.int32)
+    logits_scratch = current_workspace_manager().get_simultaneous(
+        *sparse_indexer._dsv41_workspace_specs(max_model_len)
+    )[0]
+
+    def launch() -> None:
+        sparse_indexer._dsv41_native_indexer(
+            capture_metadata,
+            cache,
+            q_packed,
+            q_scales,
+            weights,
+            topk_indices,
+            topk,
+            max_model_len,
+            None,
+            8,
+            False,
+        )
+
+    launch()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    replay_states = [
+        (
+            [0, 3, 4, 6, 9],
+            [0, 2, 4, 7, 9],
+            [1060, 1042, 634, 258],
+            [False, False, False, False],
+            [0, 0, 0, 1, 2, 2, 3, 3, 3],
+        ),
+        (
+            [0, 3, 4, 4, 7],
+            [0, 2, 4, 4, 7],
+            [1060, 1042, 0, 258],
+            [False, False, False, True],
+            [0, 0, 0, 1, 3, 3, 3, -1, -1],
+        ),
+        (
+            [0, 1, 2, 2, 7],
+            [0, 1, 2, 2, 7],
+            [1060, 1042, 0, 258],
+            [False, False, False, True],
+            [0, 1, 3, 3, 3, 3, 3, -1, -1],
+        ),
+    ]
+    for (
+        query_locs,
+        query_locs_cpu,
+        seq_lens,
+        is_prefilling,
+        row_requests,
+    ) in replay_states:
+        common = make_common(query_locs, query_locs_cpu, seq_lens, is_prefilling)
+        live_metadata = builder.build(0, common)
+        assert live_metadata.decode is not None
+        assert (
+            live_metadata.decode.seq_lens.data_ptr(),
+            live_metadata.decode.block_table.data_ptr(),
+        ) == metadata_ptrs
+        assert (live_metadata.num_decodes, live_metadata.num_decode_tokens) == (4, 9)
+        assert live_metadata.decode.seq_lens.squeeze(-1).tolist() == (
+            expected_compressed_seq_lens(query_locs, seq_lens)
+        )
+
+        topk_indices.fill_(-2)
+        graph.replay()
+        torch.accelerator.synchronize()
+
+        row_ends = live_metadata.decode.seq_lens.squeeze(-1)
+        expected_logits = _mapped_decode_reference(
+            q_dequant,
+            k_dequant,
+            weights,
+            row_ends,
+            row_requests,
+            width,
+        )
+        actual_logits = logits_scratch[: max_tokens * width].view(max_tokens, width)
+        expected_topk = _dense_topk_reference(expected_logits, topk)
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            topk_indices.sort(dim=1).values,
+            expected_topk.sort(dim=1).values,
+            rtol=0,
+            atol=0,
+        )
 
 
 @requires_cuda_and_triton
@@ -307,7 +740,7 @@ def test_breakable_replay_reads_fresh_v41_decode_width(monkeypatch) -> None:
         marker.zero_()
         with override_forward_context(context(width)):
             graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert marker.item() == 2
 
     assert observed_widths == [17, 65, 9]
@@ -392,7 +825,7 @@ def test_dense_indexer_one_million_width_eager_and_cudagraph(
 
     graph_out = torch.full((2, width), 17.0, device="cuda")
     graph = torch.cuda.CUDAGraph()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     with torch.cuda.graph(graph):
         actual = dsv41_mxfp4_dense_logits(
             q_packed,
@@ -408,7 +841,7 @@ def test_dense_indexer_one_million_width_eager_and_cudagraph(
     assert actual is graph_out
     graph_out.fill_(17.0)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     check(graph_out)
 
 
@@ -472,18 +905,18 @@ def test_candidate_indexer_masks_invalid_physical_pages() -> None:
 
 
 @requires_cuda_and_triton
-def test_candidate_prefill_uses_packed_bounds_and_request_local_blocks() -> None:
+def test_candidate_prefill_uses_uneven_packed_bounds_and_masks_padding() -> None:
     torch.manual_seed(2)
-    q = torch.randn(2, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(3, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(2, 5, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     q_packed, q_scales = _quantize_mxfp4(q)
     block_table = torch.tensor([[0], [1]], device="cuda", dtype=torch.int32)
     cache, k_dequant = _make_cache(k, 64, block_table)
     q_dequant = _dequantize_mxfp4(q_packed, q_scales)
-    weights = torch.randn(2, HEADS, device="cuda", dtype=torch.float32)
-    candidates = torch.zeros(2, 1, device="cuda", dtype=torch.int32)
-    starts = torch.tensor([0, 5], device="cuda", dtype=torch.int32)
-    ends = torch.tensor([5, 9], device="cuda", dtype=torch.int32)
+    weights = torch.randn(3, HEADS, device="cuda", dtype=torch.float32)
+    candidates = torch.zeros(3, 1, device="cuda", dtype=torch.int32)
+    starts = torch.tensor([0, 5, 9], device="cuda", dtype=torch.int32)
+    ends = torch.tensor([5, 9, 9], device="cuda", dtype=torch.int32)
     cu_seq_lens = torch.tensor([0, 5, 9], device="cuda", dtype=torch.int32)
     token_to_seq = torch.tensor(
         [0, 0, 0, 0, 0, 1, 1, 1, 1], device="cuda", dtype=torch.int32
@@ -501,7 +934,7 @@ def test_candidate_prefill_uses_packed_bounds_and_request_local_blocks() -> None
         cu_seq_lens=cu_seq_lens,
         token_to_seq=token_to_seq,
     )
-    dense = _reference(q_dequant, k_dequant, weights)
+    dense = _reference(q_dequant[:2], k_dequant, weights[:2])
     expected = torch.full_like(actual, -torch.inf)
     expected[0, :5] = dense[0, :5]
     expected[1, :4] = dense[1, :4]

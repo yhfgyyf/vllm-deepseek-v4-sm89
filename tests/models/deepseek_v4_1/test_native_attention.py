@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.attention import (
     DeepseekV4IndexerCache,
     DeepseekV41SWACache,
@@ -17,6 +19,7 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV41NativeMixedAttention,
     DeepseekV41NativeSparseBackend,
     DeepseekV41NativeSWABackend,
+    DeepseekV41NativeSWAMetadataBuilder,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -27,6 +30,50 @@ def test_v41_native_backends_advertise_native_cache_page_sizes():
     assert DeepseekV41NativeSparseBackend.get_supported_kernel_block_sizes() == [128]
     assert DeepseekV41NativeSWABackend.get_supported_kernel_block_sizes() == [32]
     assert DeepseekV41NativeSWABackend.get_preferred_block_size(64) == 32
+
+
+@pytest.mark.parametrize(
+    ("adaptive", "graph_mode", "capability", "expected_threshold"),
+    [
+        (True, CUDAGraphMode.FULL, DeviceCapability(8, 9), 2048),
+        (True, CUDAGraphMode.FULL, DeviceCapability(12, 0), 2048),
+        (False, CUDAGraphMode.FULL, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL_AND_PIECEWISE, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL_DECODE_ONLY, DeviceCapability(12, 0), 7),
+        (True, CUDAGraphMode.FULL, DeviceCapability(10, 0), 7),
+    ],
+)
+def test_v41_adaptive_full_mixed_builder_uses_all_token_decode_capacity(
+    monkeypatch,
+    adaptive,
+    graph_mode,
+    capability,
+    expected_threshold,
+):
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=adaptive),
+        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+    )
+    monkeypatch.setattr(
+        flashinfer_sparse.current_platform,
+        "get_device_capability",
+        lambda: capability,
+    )
+
+    def fake_base_init(self, *args, **kwargs):
+        self.vllm_config = config
+        self.decode_threshold = 7
+
+    monkeypatch.setattr(
+        flashinfer_sparse.DeepseekV41SparseSWAMetadataBuilder,
+        "__init__",
+        fake_base_init,
+    )
+
+    builder = DeepseekV41NativeSWAMetadataBuilder()
+
+    assert builder.decode_threshold == expected_threshold
 
 
 def test_v41_cache_specs_match_native_row_layouts():
@@ -118,7 +165,7 @@ def test_v41_attention_selector_rejects_unsupported_hardware(monkeypatch):
 
 
 def test_v41_native_attention_passes_separate_cache_strides(monkeypatch):
-    seen = {}
+    seen: dict[str, Any] = {}
     workspace = torch.empty(4096, dtype=torch.uint8)
 
     def fake_native(*args, **kwargs):

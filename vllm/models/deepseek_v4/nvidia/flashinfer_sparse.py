@@ -8,6 +8,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -23,6 +24,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
@@ -75,6 +77,22 @@ _SPARSE_MLA_SUPPORTED_Q_HEADS = (8, 16, 32, 64, 128)
 
 def _is_flashinfer_sparse_jit_capability(capability: DeviceCapability) -> bool:
     return capability.major == 12 or capability == DeviceCapability(8, 9)
+
+
+def _adaptive_full_mixed_decode_capacity(vllm_config: VllmConfig) -> int | None:
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or not speculative_config.enable_adaptive_verification
+        or vllm_config.compilation_config.cudagraph_mode.mixed_mode()
+        != CUDAGraphMode.FULL
+    ):
+        return None
+
+    capability = current_platform.get_device_capability()
+    if capability is None or not _is_flashinfer_sparse_jit_capability(capability):
+        return None
+    return vllm_config.scheduler_config.max_num_batched_tokens
 
 
 def _flashinfer_sparse_mla_support_error(
@@ -221,11 +239,23 @@ class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBu
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        capacity = _adaptive_full_mixed_decode_capacity(self.vllm_config)
+        if capacity is not None:
+            self.reorder_batch_threshold = capacity
+
 
 class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        capacity = _adaptive_full_mixed_decode_capacity(self.vllm_config)
+        if capacity is not None:
+            self.decode_threshold = capacity
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):

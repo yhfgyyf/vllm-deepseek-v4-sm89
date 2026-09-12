@@ -7,15 +7,17 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _dsv41_expand_decode_seq_lens,
     _dsv41_rows_per_chunk,
     _dsv41_workspace_specs,
 )
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer as indexer_backend
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
+    DeepseekV4IndexerMetadataBuilder,
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV41IndexerBackend,
     DeepseekV41IndexerMetadataBuilder,
@@ -38,12 +40,25 @@ def _config(dtype: str = "auto"):
     return SimpleNamespace(attention_config=_AttentionConfig(dtype))
 
 
-def _builder_config(max_model_len: int = 128):
+def _builder_config(
+    max_model_len: int = 128,
+    *,
+    adaptive: bool = False,
+    num_speculative_tokens: int = 0,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
+    max_num_batched_tokens: int = 8,
+):
+    speculative_config = None
+    if adaptive or num_speculative_tokens:
+        speculative_config = SimpleNamespace(
+            enable_adaptive_verification=adaptive,
+            num_speculative_tokens=num_speculative_tokens,
+        )
     return SimpleNamespace(
         attention_config=_AttentionConfig("auto"),
         model_config=SimpleNamespace(max_model_len=max_model_len),
         scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=8,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=4,
         ),
         parallel_config=SimpleNamespace(
@@ -51,9 +66,28 @@ def _builder_config(max_model_len: int = 128):
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        speculative_config=None,
-        num_speculative_tokens=0,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=cudagraph_mode,
+            max_cudagraph_capture_size=max_num_batched_tokens,
+        ),
+        speculative_config=speculative_config,
+        num_speculative_tokens=num_speculative_tokens,
     )
+
+
+def _set_cuda_capability(monkeypatch, capability, *, has_deep_gemm: bool) -> None:
+    monkeypatch.setattr(indexer_backend.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer_backend.current_platform,
+        "is_device_capability",
+        lambda target: capability == target,
+    )
+    monkeypatch.setattr(
+        indexer_backend.current_platform,
+        "is_device_capability_family",
+        lambda family: capability[0] == family // 10,
+    )
+    monkeypatch.setattr(indexer_backend, "has_deep_gemm", lambda: has_deep_gemm)
 
 
 def _build_single_decode(
@@ -115,12 +149,474 @@ def _build_single_decode(
 
 def test_v41_backend_isolated_interface() -> None:
     assert DeepseekV4IndexerBackend.get_supported_kernel_block_sizes() == [256]
+    assert (
+        DeepseekV4IndexerBackend.get_builder_cls() is DeepseekV4IndexerMetadataBuilder
+    )
     assert DeepseekV41IndexerBackend.get_name() == "DEEPSEEK_V41_INDEXER"
     assert not DeepseekV41IndexerBackend.supports_pcp()
     assert DeepseekV41IndexerBackend.get_supported_kernel_block_sizes() == [128]
     assert (
         DeepseekV41IndexerBackend.get_builder_cls() is DeepseekV41IndexerMetadataBuilder
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "capability",
+        "has_deep_gemm",
+        "backend_cls",
+        "builder_cls",
+        "flattened",
+        "varlen",
+    ),
+    [
+        (
+            (8, 9),
+            False,
+            DeepseekV4IndexerBackend,
+            DeepseekV4IndexerMetadataBuilder,
+            True,
+            False,
+        ),
+        (
+            (12, 0),
+            True,
+            DeepseekV4IndexerBackend,
+            DeepseekV4IndexerMetadataBuilder,
+            False,
+            True,
+        ),
+        (
+            (8, 9),
+            False,
+            DeepseekV41IndexerBackend,
+            DeepseekV41IndexerMetadataBuilder,
+            True,
+            False,
+        ),
+        (
+            (12, 0),
+            True,
+            DeepseekV41IndexerBackend,
+            DeepseekV41IndexerMetadataBuilder,
+            True,
+            False,
+        ),
+    ],
+)
+def test_adaptive_model_specific_metadata_capabilities(
+    monkeypatch,
+    capability,
+    has_deep_gemm,
+    backend_cls,
+    builder_cls,
+    flattened,
+    varlen,
+) -> None:
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=has_deep_gemm)
+    config = _builder_config(adaptive=True)
+
+    assert backend_cls.supports_device_cpu_query_lens_mismatch()
+    assert builder_cls.get_cudagraph_support(config, None) is AttentionCGSupport.ALWAYS
+    assert builder_cls._use_flattened_decode(config) is flattened
+    assert builder_cls._supports_varlen_decode(config) is varlen
+
+
+@pytest.mark.parametrize(
+    ("capability", "has_deep_gemm", "builder_cls"),
+    [
+        ((8, 9), False, DeepseekV32IndexerMetadataBuilder),
+        ((8, 9), False, DeepseekV4IndexerMetadataBuilder),
+        ((12, 0), True, DeepseekV4IndexerMetadataBuilder),
+        ((8, 9), False, DeepseekV41IndexerMetadataBuilder),
+        ((12, 0), True, DeepseekV41IndexerMetadataBuilder),
+    ],
+)
+def test_nonadaptive_k1_metadata_paths_remain_uniform_batch(
+    monkeypatch,
+    capability,
+    has_deep_gemm,
+    builder_cls,
+) -> None:
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=has_deep_gemm)
+    config = _builder_config()
+
+    assert (
+        builder_cls.get_cudagraph_support(config, None)
+        is AttentionCGSupport.UNIFORM_BATCH
+    )
+    assert not builder_cls._use_flattened_decode(config)
+    assert not builder_cls._supports_varlen_decode(config)
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0)])
+def test_v4_adaptive_full_preserves_sm90_sm100_split(monkeypatch, capability) -> None:
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=True)
+    config = _builder_config(
+        adaptive=True,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    assert DeepseekV4IndexerMetadataBuilder._use_flattened_decode(
+        config
+    ) is DeepseekV32IndexerMetadataBuilder._use_flattened_decode(config)
+    assert DeepseekV4IndexerMetadataBuilder._supports_varlen_decode(
+        config
+    ) is DeepseekV32IndexerMetadataBuilder._supports_varlen_decode(config)
+    assert not DeepseekV4IndexerMetadataBuilder._supports_adaptive_full_mixed_decode()
+
+
+@pytest.mark.parametrize(
+    ("capability", "has_deep_gemm"),
+    [((8, 9), False), ((12, 0), True)],
+)
+def test_v4_adaptive_builds_flattened_device_metadata(
+    monkeypatch, capability, has_deep_gemm
+) -> None:
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=has_deep_gemm)
+    monkeypatch.setattr(indexer_backend, "num_compute_units", lambda _: 4)
+    monkeypatch.setattr(indexer_backend, "dsa_indexer_uses_fp4", lambda _: False)
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_compressed_slot_mapping",
+        lambda num_tokens, *_args, out, **_kwargs: out[:num_tokens],
+    )
+    monkeypatch.setattr(
+        indexer_backend,
+        "_uses_deep_gemm_scheduler_metadata",
+        lambda: has_deep_gemm,
+    )
+    calls = []
+
+    def fake_metadata(seq_lens, block_size, num_sms, *, indices):
+        calls.append((seq_lens.clone(), block_size, num_sms, indices.clone()))
+        return torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_backend, "get_paged_mqa_logits_metadata", fake_metadata)
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        alignment=512,
+        model_version="deepseek_v4",
+    )
+    builder = DeepseekV4IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["model.layers.20.attn.indexer.k_cache"],
+        vllm_config=_builder_config(
+            adaptive=True,
+            num_speculative_tokens=3,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            max_num_batched_tokens=16,
+        ),
+        device=torch.device("cpu"),
+        block_table_width=2,
+    )
+    capture_common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([40, 44, 52, 80], dtype=torch.int32),
+        num_reqs=4,
+        num_actual_tokens=9,
+        max_query_len=1,
+        max_seq_len=80,
+        block_table_tensor=torch.tensor(
+            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32
+        ),
+        slot_mapping=torch.zeros(9, dtype=torch.int64),
+        seq_lens_cpu_upper_bound=torch.tensor([40, 44, 52, 80], dtype=torch.int32),
+        is_prefilling=torch.zeros(4, dtype=torch.bool),
+    )
+    capture_metadata = builder.build_for_cudagraph_capture(capture_common)
+    assert capture_metadata.decode is not None
+    capture_seq_lens_ptr = capture_metadata.decode.seq_lens.data_ptr()
+    assert capture_metadata.decode.seq_lens.squeeze(-1).tolist() == [
+        10,
+        11,
+        13,
+        20,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    if has_deep_gemm:
+        assert capture_metadata.decode.indices is not None
+        assert capture_metadata.decode.indices.tolist() == list(range(9))
+    else:
+        assert capture_metadata.decode.indices is None
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 3, 4, 4, 9], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 4, 4, 9], dtype=torch.int32),
+        seq_lens=torch.tensor([40, 44, 0, 80], dtype=torch.int32),
+        num_reqs=4,
+        num_actual_tokens=9,
+        max_query_len=5,
+        max_seq_len=80,
+        block_table_tensor=torch.tensor(
+            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32
+        ),
+        slot_mapping=torch.zeros(9, dtype=torch.int64),
+        seq_lens_cpu_upper_bound=torch.tensor([40, 44, 0, 80], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False, False, True]),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens.data_ptr() == capture_seq_lens_ptr
+    assert (metadata.num_decodes, metadata.num_prefills) == (4, 0)
+    if has_deep_gemm:
+        assert metadata.decode.indices is not None
+        assert metadata.decode.indices.tolist() == [0, 0, 0, 1, 3, 3, 3, 3, 3]
+    else:
+        assert metadata.decode.indices is None
+    assert metadata.decode.seq_lens.squeeze(-1).tolist() == [
+        9,
+        9,
+        10,
+        11,
+        19,
+        19,
+        19,
+        19,
+        20,
+    ]
+    assert metadata.decode.block_table.tolist() == [
+        [1, 2],
+        [1, 2],
+        [1, 2],
+        [3, 4],
+        [7, 8],
+        [7, 8],
+        [7, 8],
+        [7, 8],
+        [7, 8],
+    ]
+    assert metadata.decode.per_req_decode_lens is not None
+    assert metadata.decode.per_req_decode_lens.tolist() == [3, 1, 0, 5]
+    if has_deep_gemm:
+        assert len(calls) == 2
+        seq_lens, block_size, num_sms, indices = calls[1]
+        torch.testing.assert_close(seq_lens, metadata.decode.seq_lens)
+        assert block_size == 64
+        assert num_sms == 4
+        assert indices.tolist() == [0, 0, 0, 1, 3, 3, 3, 3, 3]
+    else:
+        assert not calls
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (12, 0)])
+@pytest.mark.parametrize("prefill_lens", [[5], [6], [20], [5, 5]])
+def test_v4_adaptive_prefill_outside_capture_uses_bounded_chunks(
+    monkeypatch, capability, prefill_lens
+) -> None:
+    """Only graph-sized batches may bypass the prefill logits budget."""
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=capability == (12, 0))
+    monkeypatch.setattr(indexer_backend, "num_compute_units", lambda _: 4)
+    monkeypatch.setattr(indexer_backend, "dsa_indexer_uses_fp4", lambda _: False)
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_compressed_slot_mapping",
+        lambda num_tokens, *_args, out, **_kwargs: out[:num_tokens],
+    )
+    monkeypatch.setattr(
+        indexer_backend, "_uses_deep_gemm_scheduler_metadata", lambda: False
+    )
+    monkeypatch.setattr(indexer_backend.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
+    chunks: list[slice] = []
+
+    def record_chunk(*args, query_slice, **kwargs):
+        chunks.append(query_slice)
+        return None
+
+    monkeypatch.setattr(indexer_backend, "build_prefill_chunk_metadata", record_chunk)
+    config = _builder_config(
+        max_model_len=1024 * 1024,
+        adaptive=True,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        max_num_batched_tokens=32,
+    )
+    config.compilation_config.max_cudagraph_capture_size = 9
+    builder = DeepseekV4IndexerMetadataBuilder(
+        kv_cache_spec=MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+            alignment=512,
+            model_version="deepseek_v4",
+        ),
+        layer_names=["model.layers.20.attn.indexer.k_cache"],
+        vllm_config=config,
+        device=torch.device("cpu"),
+        block_table_width=1,
+    )
+    device_lens = [3, 1, *prefill_lens]
+    cpu_lens = [2, 2, *prefill_lens]
+    num_tokens = sum(device_lens)
+    num_reqs = len(device_lens)
+    seq_lens = torch.tensor(
+        [40, 44, *([config.model_config.max_model_len] * len(prefill_lens))],
+        dtype=torch.int32,
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, *device_lens], dtype=torch.int32).cumsum(
+            0, dtype=torch.int32
+        ),
+        query_start_loc_cpu=torch.tensor([0, *cpu_lens], dtype=torch.int32).cumsum(
+            0, dtype=torch.int32
+        ),
+        seq_lens=seq_lens,
+        seq_lens_cpu_upper_bound=seq_lens.clone(),
+        num_reqs=num_reqs,
+        num_actual_tokens=num_tokens,
+        max_query_len=max(cpu_lens),
+        max_seq_len=config.model_config.max_model_len,
+        block_table_tensor=torch.ones((num_reqs, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
+        is_prefilling=torch.tensor([False, False, *([True] * len(prefill_lens))]),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert builder.decode_threshold == 32
+    assert builder.adaptive_full_mixed_decode
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens[:4].flatten().tolist() == [9, 9, 10, 11]
+    if num_tokens <= 9:
+        assert (metadata.num_decodes, metadata.num_decode_tokens) == (
+            num_reqs,
+            num_tokens,
+        )
+        assert metadata.prefill is None
+        assert not chunks
+    else:
+        assert (metadata.num_decodes, metadata.num_decode_tokens) == (2, 4)
+        assert (metadata.num_prefills, metadata.num_prefill_tokens) == (
+            len(prefill_lens),
+            sum(prefill_lens),
+        )
+        assert metadata.prefill is not None
+        assert len(chunks) == sum(prefill_lens)
+        assert all(chunk.stop - chunk.start == 1 for chunk in chunks)
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (12, 0)])
+@pytest.mark.parametrize(
+    "cudagraph_mode",
+    [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL],
+)
+def test_v41_adaptive_flattens_device_lens_with_padding_and_prefill(
+    monkeypatch, capability, cudagraph_mode
+) -> None:
+    _set_cuda_capability(monkeypatch, capability, has_deep_gemm=capability == (12, 0))
+    monkeypatch.setattr(indexer_backend, "num_compute_units", lambda _: 4)
+    monkeypatch.setattr(indexer_backend, "dsv41_indexer_uses_fp4", lambda _: True)
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_compressed_slot_mapping",
+        lambda num_tokens, *_args, out, **_kwargs: out[:num_tokens],
+    )
+    monkeypatch.setattr(
+        indexer_backend,
+        "get_paged_mqa_logits_metadata",
+        lambda *_args, **_kwargs: pytest.fail("V4.1 requested DeepGEMM metadata"),
+    )
+    prefill_calls = []
+
+    def fake_prefill(*args, **kwargs):
+        prefill_calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(indexer_backend, "build_prefill_chunk_metadata", fake_prefill)
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        state_content_bytes=68,
+        alignment=128,
+        model_version="deepseek_v4_1",
+    )
+    builder = DeepseekV41IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["model.layers.20.attn.indexer.k_cache"],
+        vllm_config=_builder_config(
+            adaptive=True,
+            num_speculative_tokens=3,
+            cudagraph_mode=cudagraph_mode,
+            max_num_batched_tokens=16,
+        ),
+        device=torch.device("cpu"),
+        block_table_width=1,
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 3, 4, 4, 9], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 4, 4, 9], dtype=torch.int32),
+        seq_lens=torch.tensor([13, 21, 0, 50], dtype=torch.int32),
+        num_reqs=4,
+        num_actual_tokens=9,
+        max_query_len=5,
+        max_seq_len=50,
+        block_table_tensor=torch.tensor([[1], [2], [0], [3]], dtype=torch.int32),
+        slot_mapping=torch.zeros(9, dtype=torch.int64),
+        seq_lens_cpu_upper_bound=torch.tensor([16, 24, 0, 50], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False, False, True]),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.decode is not None
+    assert metadata.decode.indices is None
+    assert metadata.decode.per_req_decode_lens is not None
+    if cudagraph_mode == CUDAGraphMode.FULL:
+        assert (metadata.num_decodes, metadata.num_decode_tokens) == (4, 9)
+        assert (metadata.num_prefills, metadata.num_prefill_tokens) == (0, 0)
+        assert metadata.decode.seq_lens.squeeze(-1).tolist() == [
+            11,
+            12,
+            13,
+            21,
+            46,
+            47,
+            48,
+            49,
+            50,
+        ]
+        assert metadata.decode.block_table.tolist() == [
+            [1],
+            [1],
+            [1],
+            [2],
+            [3],
+            [3],
+            [3],
+            [3],
+            [3],
+        ]
+        assert metadata.decode.decode_lens.tolist() == [1] * 9
+        assert metadata.decode.per_req_decode_lens.tolist() == [3, 1, 0, 5]
+        assert metadata.decode.max_indexer_kv_len == 50
+        assert not prefill_calls
+    else:
+        assert (metadata.num_decodes, metadata.num_decode_tokens) == (3, 4)
+        assert (metadata.num_prefills, metadata.num_prefill_tokens) == (1, 5)
+        assert metadata.decode.seq_lens.squeeze(-1).tolist() == [11, 12, 13, 21]
+        assert metadata.decode.block_table.tolist() == [[1], [1], [1], [2]]
+        assert metadata.decode.decode_lens.tolist() == [1, 1, 1, 1]
+        assert metadata.decode.per_req_decode_lens.tolist() == [3, 1, 0]
+        assert metadata.decode.max_indexer_kv_len == 24
+        assert len(prefill_calls) == 1
+        args, _ = prefill_calls[0]
+        assert args[:2] == (3, 4)
 
 
 def test_v41_builder_skips_deep_gemm_scheduler_metadata(monkeypatch) -> None:
