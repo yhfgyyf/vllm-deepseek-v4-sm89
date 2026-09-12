@@ -298,6 +298,37 @@ FlashInfer Vision2 environment with this adaptive patch applied, not a new
 benchmark of the Vision10 wheel. There is no same-workload baseline, so it
 does not establish an adaptive speedup percentage or quality equivalence.
 
+**Single-concurrency (C1)** results from the same patched environment follow.
+Each input length had one warmup followed by four measured requests, all
+with 512 output tokens. All 12 measured requests succeeded with zero
+prefix-cache hits.
+
+| Input / output tokens | Mean TTFT (ms) | Prefill proxy (tokens/s) | Decode (tokens/s) | DSpark acceptance rate | Mean accepted draft tokens | Mean acceptance length (including +1) |
+|---|---:|---:|---:|---:|---:|---:|
+| 8,192 / 512 | 913.30 | 8,969.81 | 267.11 | 84.11% | 4.206 | 5.206 |
+| 32,768 / 512 | 3,279.21 | 9,992.67 | 271.67 | 85.89% | 4.295 | 5.295 |
+| 131,072 / 512 | 15,529.54 | 8,440.21 | 80.00 | 4.64% | 0.232 | 1.232 |
+
+Metric definitions:
+
+- Prefill proxy is input tokens / TTFT in seconds. TTFT includes queueing,
+  scheduling, prefill, and first-token work; it is not pure GPU-kernel or
+  engine prefill throughput.
+- Decode is `1000 / TPOT (ms)`. TTFT is averaged across the four measured
+  requests; both throughput values are calculated per request and then
+  averaged, not obtained by inverting the mean latency.
+- Acceptance rate = total accepted draft tokens / total proposed draft
+  tokens; mean accepted draft tokens = total accepted draft tokens / total
+  draft rounds; vLLM mean acceptance length adds 1 for the extra target token.
+  These three metrics use pooled counters from the four measured requests,
+  not averages of ratios.
+
+These are native vLLM counters: proposed drafts are counted before adaptive
+trimming, and accepted tokens before stop/output-limit truncation. They are
+not the acceptance rate of actual post-trim verification slots or the final
+accepted-token count returned to clients. Random-input results are not a
+quality evaluation.
+
 ## 4. DeepSeek-V4-Flash launch commands
 
 These commands now enable adaptive by default. V4 validation in this round
