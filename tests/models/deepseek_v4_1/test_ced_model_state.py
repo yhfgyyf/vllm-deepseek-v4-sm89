@@ -9,8 +9,16 @@ import pytest
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    create_error_response,
+)
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs.engine import embeds_input, mm_input, tokens_input
 from vllm.models.deepseek_v4_1.nvidia.ced import CED_METADATA_KEY, CEDRequest
 from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+from vllm.multimodal.inputs import PlaceholderRange
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -72,6 +80,102 @@ def _request_state() -> DeepseekV41ModelState:
     state._mm_prefix_prompt_token_ids = {}
     state.model_config = SimpleNamespace(hf_config=SimpleNamespace())
     return state
+
+
+def _input_processor(ced_enabled=True, model_type="deepseek_v41"):
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type=model_type, ced_prefill=ced_enabled),
+        max_model_len=512,
+        runner_type="generate",
+        max_logprobs=20,
+        get_vocab_size=lambda: 130000,
+        logits_processors=None,
+        is_diffusion=False,
+        return_sampling_mask=False,
+    )
+    processor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False
+        ),
+        reasoning_config=None,
+    )
+    processor.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: None)
+    processor.speculative_config = None
+    processor.structured_outputs_config = None
+    processor.lora_config = None
+    processor.generation_config_fields = {}
+    processor.supports_mm_inputs = True
+    processor.mm_encoder_cache_size = 512
+    processor.skip_prompt_length_check = False
+    return processor
+
+
+def _image_input(modality="image"):
+    return mm_input(
+        [1, 129264, 2],
+        {modality: [None]},  # Encoder-cache hit still represents multimodal input.
+        {modality: ["cached-feature"]},
+        {modality: [PlaceholderRange(offset=1, length=1)]},
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt, prompt_logprobs, feature",
+    [
+        (_image_input(), None, "multimodal inputs"),
+        (_image_input("prompt_embeds"), None, "multimodal inputs"),
+        (embeds_input(torch.zeros(3, 8)), None, "prompt embeddings"),
+        (tokens_input([1, 2, 3]), 0, "prompt log probabilities"),
+        (tokens_input([1, 2, 3]), 1, "prompt log probabilities"),
+    ],
+)
+def test_ced_unsupported_input_is_rejected_before_engine_request(
+    prompt, prompt_logprobs, feature
+):
+    processor = _input_processor()
+    params = SamplingParams(max_tokens=1, prompt_logprobs=prompt_logprobs)
+
+    with pytest.raises(VLLMValidationError, match=feature) as exc_info:
+        processor.process_inputs("unsupported", prompt, params, ("generate",))
+
+    error = create_error_response(exc_info.value).error
+    assert error.code == 400
+    assert error.type == "BadRequestError"
+    assert error.param == "ced_prefill"
+
+    request = processor.process_inputs(
+        "text", tokens_input([1, 2, 3]), SamplingParams(max_tokens=1), ("generate",)
+    )
+    assert request.prompt_token_ids == [1, 2, 3]
+    assert request.mm_features is None
+
+
+@pytest.mark.parametrize(
+    "ced_enabled, model_type",
+    [(False, "deepseek_v41"), (True, "other_model")],
+)
+def test_ced_input_guard_preserves_other_execution_paths(ced_enabled, model_type):
+    processor = _input_processor(ced_enabled, model_type)
+    request = processor.process_inputs(
+        "image", _image_input(), SamplingParams(max_tokens=1), ("generate",)
+    )
+    assert request.mm_features is not None
+    assert request.mm_features[0].modality == "image"
+    assert request.prompt_token_ids == [1, 129264, 2]
+
+
+@pytest.mark.parametrize("placeholders", [{}, {"image": []}])
+def test_ced_accepts_text_rendered_by_multimodal_processor(placeholders):
+    processor = _input_processor()
+    request = processor.process_inputs(
+        "text",
+        mm_input([1, 2, 3], {}, {}, placeholders),
+        SamplingParams(max_tokens=1),
+        ("generate",),
+    )
+    assert request.prompt_token_ids == [1, 2, 3]
+    assert request.mm_features == []
 
 
 @pytest.mark.parametrize(

@@ -201,6 +201,34 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    def _validate_ced_inputs(
+        self,
+        decoder_input: SingletonInput,
+        params: SamplingParams | PoolingParams,
+    ) -> None:
+        """Reject unsupported CED requests before they can terminate a worker."""
+        hf_config = self.model_config.hf_config
+        if getattr(hf_config, "model_type", None) != "deepseek_v41" or not getattr(
+            hf_config, "ced_prefill", False
+        ):
+            return
+
+        unsupported = None
+        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
+            unsupported = "prompt log probabilities"
+        elif decoder_input["type"] == "embeds":
+            unsupported = "prompt embeddings"
+        elif decoder_input["type"] == "multimodal" and any(
+            decoder_input["mm_placeholders"].values()
+        ):
+            unsupported = "multimodal inputs"
+        if unsupported is not None:
+            raise VLLMValidationError(
+                f"Experimental CED prefill does not support {unsupported}. "
+                "Disable ced_prefill to use this request.",
+                parameter="ced_prefill",
+            )
+
     def _get_mm_identifier(
         self,
         mm_hash: str,
@@ -338,6 +366,7 @@ class InputProcessor:
 
         encoder_input, decoder_input = split_enc_dec_input(engine_input)
         self._validate_model_inputs(encoder_input, decoder_input)
+        self._validate_ced_inputs(decoder_input, params)
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_input["type"] == "embeds":
