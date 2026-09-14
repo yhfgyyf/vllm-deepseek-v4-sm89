@@ -264,8 +264,11 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 CED 当前是实验性的近似文本 prefill 路径。在已测长文本 prefill 中，按输入 token
 数 / TTFT 估算的 prefill 代理指标相对关闭 CED 时约翻倍，但收益会随 prompt、
 长度和运行配置变化。它不保证与非 CED 路径输出等价；部署前应按实际任务验证
-质量。CED 不支持多模态输入、prompt embeddings 或 prompt logprobs，因此启用
-CED 时不要发送图片或其他多模态内容。
+质量。CED 不支持多模态输入、prompt embeddings 或 prompt logprobs。包含
+issue #111 修复的源码会在正常 API 请求进入推理引擎前拒绝这些组合，返回客户端
+错误，而不是让 worker 退出；已发布的 vision10 wheel 尚不包含这项前端保护。
+需要图片或其他多模态输入时，请移除 `--hf-overrides '{"ced_prefill":true}'` 或改成
+`'{"ced_prefill":false}'`；无需因此关闭 DSpark/adaptive。
 
 SM120 已完成完整模型服务验证；SM89 本轮仅完成离线编译验证，未在 SM89
 硬件上执行内核数值测试或完整模型服务验证。
