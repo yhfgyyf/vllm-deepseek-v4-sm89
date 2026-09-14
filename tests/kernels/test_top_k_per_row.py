@@ -1265,6 +1265,170 @@ def test_persistent_topk_reused_group_after_short_row() -> None:
     assert set(indices[target_row].cpu().tolist()) == set(expected.cpu().tolist())
 
 
+def _persistent_topk_replanning_width(
+    alignment_offset: int = 0, smem_budget: int = 35_968
+) -> int:
+    medium_smem = 35_968
+    fixed_smem = 2_080
+    medium_chunk = (medium_smem - fixed_smem) // 4
+    props = torch.cuda.get_device_properties(0)
+
+    if not smem_budget < props.shared_memory_per_block_optin < 128 * 1024:
+        pytest.skip("This test requires a low-smem GPU with opt-in headroom")
+
+    resident_upper_bound = props.multi_processor_count * min(
+        props.shared_memory_per_multiprocessor // smem_budget,
+        props.max_threads_per_multi_processor // 1024,
+    )
+    chunk = (smem_budget - fixed_smem) // 4
+    width = (resident_upper_bound + 1) * chunk + alignment_offset
+    original_ctas = (width + medium_chunk - 1) // medium_chunk
+    assert original_ctas > resident_upper_bound
+
+    opt_in_chunk = (props.shared_memory_per_block_optin - fixed_smem) // 4
+    opt_in_chunk = opt_in_chunk // 4 * 4
+    if (width + opt_in_chunk - 1) // opt_in_chunk > props.multi_processor_count:
+        pytest.skip("Cannot construct a resident replanned group on this GPU")
+    return width
+
+
+def _assert_exact_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    indices: torch.Tensor,
+    top_k: int,
+    max_seq_len: int | None = None,
+) -> None:
+    assert indices.dtype == torch.int32
+    row_bound = min(
+        logits.shape[1],
+        max_seq_len if max_seq_len is not None else logits.shape[1],
+    )
+    for row, raw_length in enumerate(lengths.reshape(-1).tolist()):
+        length = max(0, min(raw_length, row_bound))
+        num_valid = min(length, top_k)
+        actual = indices[row, :num_valid]
+
+        if num_valid:
+            assert torch.all((actual >= 0) & (actual < length))
+            assert actual.unique().numel() == num_valid
+            actual_values = logits[row, actual.long()].sort(descending=True).values
+            expected_values = torch.topk(logits[row, :length], num_valid).values
+            torch.testing.assert_close(actual_values, expected_values, rtol=0, atol=0)
+
+        assert torch.all(indices[row, num_valid:] == -1)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize(
+    ("top_k", "alignment_offset", "smem_budget"),
+    [
+        pytest.param(512, 0, 35_968, id="topk512-vec4-48k"),
+        pytest.param(1024, 1, 48 * 1024, id="topk1024-vec1-opt-in"),
+        pytest.param(2048, 2, 48 * 1024, id="topk2048-vec2-opt-in"),
+    ],
+)
+@torch.inference_mode()
+def test_persistent_topk_replans_oversubscribed_low_smem(
+    top_k: int, alignment_offset: int, smem_budget: int
+) -> None:
+    """A low-smem launch must grow its chunks instead of rejecting the grid."""
+    width = _persistent_topk_replanning_width(alignment_offset, smem_budget)
+    lengths = torch.tensor([0, 1, top_k - 1, width], dtype=torch.int32, device="cuda")
+    logits = torch.arange(4 * width, dtype=torch.float32, device="cuda").reshape(
+        4, width
+    )
+    logits.remainder_(4096).mul_(1 / 4096).add_(1)
+    logits[1, 0] = float("-inf")
+    logits[3, -1] = float("inf")
+    indices = torch.empty((4, top_k), dtype=torch.int32, device="cuda")
+    max_seq_len = width - 1
+
+    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, max_seq_len)
+    torch.accelerator.synchronize()
+
+    _assert_exact_topk(logits, lengths, indices, top_k, max_seq_len)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize(
+    "width",
+    [
+        pytest.param(779_424, id="779424"),
+        pytest.param(779_425, id="779425"),
+        pytest.param(1_048_576, id="1048576"),
+    ],
+)
+@torch.inference_mode()
+def test_persistent_topk_reported_long_stride_boundaries(width: int) -> None:
+    """Reported L20 widths must return exact top-k values."""
+    props = torch.cuda.get_device_properties(0)
+    max_chunk = (props.shared_memory_per_block_optin - 2_080) // 16 * 4
+    if (
+        props.shared_memory_per_block_optin < 128 * 1024
+        and (width + max_chunk - 1) // max_chunk > props.multi_processor_count
+    ):
+        pytest.skip("This GPU cannot fit the reported width in a resident group")
+
+    top_k = 512
+    logits = torch.randn(1, width, dtype=torch.float32, device="cuda")
+    lengths = torch.tensor([width], dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, width)
+    torch.accelerator.synchronize()
+
+    _assert_exact_topk(logits, lengths, indices, top_k)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_replanned_grid_cudagraph_replay() -> None:
+    """Captured device lengths may grow from short rows into the radix path."""
+    top_k = 1024
+    width = _persistent_topk_replanning_width(smem_budget=48 * 1024)
+    if width < 1_048_576:
+        pytest.skip("This GPU cannot cover the reported long-row boundaries")
+
+    lengths = torch.tensor(
+        [[0, 1], [top_k - 1, top_k]], dtype=torch.int32, device="cuda"
+    )
+    logits = torch.randn(4, width, dtype=torch.float32, device="cuda")
+    logits[0, 0] = float("-inf")
+    logits[1, 0] = float("-inf")
+    indices = torch.empty((4, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+
+    def launch() -> None:
+        torch.ops._C.persistent_topk(logits, lengths, indices, workspace, top_k, width)
+
+    launch()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    graph.replay()
+    torch.accelerator.synchronize()
+    _assert_exact_topk(logits, lengths, indices, top_k)
+
+    lengths.copy_(
+        torch.tensor(
+            [[1, 779_424], [779_425, 1_048_576]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+    )
+    graph.replay()
+    torch.accelerator.synchronize()
+    _assert_exact_topk(logits, lengths, indices, top_k)
+
+    indices.fill_(-2)
+    graph.replay()
+    torch.accelerator.synchronize()
+    _assert_exact_topk(logits, lengths, indices, top_k)
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 @pytest.mark.parametrize(
