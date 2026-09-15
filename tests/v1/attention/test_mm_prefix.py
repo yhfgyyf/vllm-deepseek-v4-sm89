@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
@@ -29,6 +30,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     compute_mm_prefix_ranges,
     extract_mm_prefix_ranges,
 )
+from vllm.v1.worker.gpu.model_states import default as default_model_state_module
 
 
 def _fa4_available() -> bool:
@@ -162,6 +164,131 @@ def test_compute_mm_prefix_ranges_uses_explicit_prefix_tokens():
     )
 
     assert ranges == {0: [(2, 6)]}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [({}, []), ({"mm_prefix_clamp_sliding_window": True}, [(4, 163)])],
+)
+def test_compute_mm_prefix_ranges_respects_in_kernel_sliding_window_clamp(
+    kwargs: dict[str, bool],
+    expected: list[tuple[int, int]],
+):
+    req_id = "req-0"
+    mm_features = {
+        req_id: [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-0",
+                mm_position=PlaceholderRange(offset=4, length=160),
+            )
+        ]
+    }
+
+    ranges = compute_mm_prefix_ranges(
+        req_ids=[req_id],
+        mm_features=mm_features,
+        sliding_window=128,
+        **kwargs,
+    )
+
+    assert ranges == {0: expected}
+
+
+def test_compute_mm_prefix_ranges_uses_embed_mask_for_exact_bounds():
+    req_id = "req-0"
+    mm_features = {
+        req_id: [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-0",
+                mm_position=PlaceholderRange(
+                    offset=4,
+                    length=163,
+                    is_embed=torch.tensor([False] * 3 + [True] * 160),
+                ),
+            )
+        ]
+    }
+
+    ranges = compute_mm_prefix_ranges(
+        req_ids=[req_id],
+        mm_features=mm_features,
+        sliding_window=128,
+        mm_prefix_clamp_sliding_window=True,
+    )
+
+    assert ranges == {0: [(7, 166)]}
+
+
+@pytest.mark.parametrize("flag_owner", ["model", "config"])
+def test_default_model_state_passes_mm_prefix_sliding_window_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_owner: str,
+):
+    from types import SimpleNamespace
+
+    captured: dict[str, object] = {}
+
+    def fake_compute_mm_prefix_ranges(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        default_model_state_module,
+        "compute_mm_prefix_ranges",
+        fake_compute_mm_prefix_ranges,
+    )
+    monkeypatch.setattr(
+        default_model_state_module,
+        "build_attn_metadata",
+        lambda **kwargs: {},
+    )
+
+    state = default_model_state_module.DefaultModelState.__new__(
+        default_model_state_module.DefaultModelState
+    )
+    state.supports_mm_inputs = True
+    state.encoder_cache = SimpleNamespace(mm_features={})
+    state.model = SimpleNamespace(mm_prefix_clamp_sliding_window=flag_owner == "model")
+    state.model_config = SimpleNamespace(
+        is_mm_prefix_lm=True,
+        hf_config=SimpleNamespace(),
+        hf_text_config=SimpleNamespace(
+            mm_prefix_clamp_sliding_window=flag_owner == "config"
+        ),
+        get_sliding_window=lambda: 128,
+    )
+    state.max_model_len = 256
+    state._mm_prefix_prompt_token_ids = {}
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        num_scheduled_tokens=torch.tensor([1], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+        req_ids=["req-0"],
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+        positions=torch.tensor([0], dtype=torch.int64),
+        is_prefilling_np=np.array([True]),
+        prompt_lens=torch.tensor([1], dtype=torch.int32),
+    )
+
+    state.prepare_attn(
+        input_batch=input_batch,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        block_tables=(),
+        slot_mappings=torch.empty(0),
+        attn_groups=[],
+        kv_cache_config=object(),
+    )
+
+    assert captured["mm_prefix_clamp_sliding_window"] is True
 
 
 def test_matches_range_scan_semantics_with_context_offset():

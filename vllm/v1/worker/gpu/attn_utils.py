@@ -427,11 +427,13 @@ def compute_mm_prefix_ranges(
     prompt_token_ids_by_req: Mapping[str, Sequence[int]] | None = None,
     start_token_id: int | None = None,
     end_token_id: int | None = None,
+    mm_prefix_clamp_sliding_window: bool = False,
 ) -> dict[int, list[tuple[int, int]]]:
     """Compute PrefixLM bidirectional ranges for multimodal tokens.
 
     Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
+    from attending across the entire image span unless the attention kernel
+    clamps multimodal prefix attention to the sliding window.
     """
     has_explicit_prefix_tokens = start_token_id is not None and end_token_id is not None
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
@@ -452,7 +454,8 @@ def compute_mm_prefix_ranges(
             )
             for r in ranges:
                 if (
-                    not has_explicit_prefix_tokens
+                    not mm_prefix_clamp_sliding_window
+                    and not has_explicit_prefix_tokens
                     and sliding_window is not None
                     and (r[1] - r[0] + 1) > sliding_window
                 ):

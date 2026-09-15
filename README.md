@@ -261,17 +261,30 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 这不改变 CUDA toolkit / PyTorch 的 cu130 配套。首次 JIT 和 graph capture
 可能耗时，应在服务就绪及预热完成后测吞吐。
 
-CED 当前是实验性的近似文本 prefill 路径。在已测长文本 prefill 中，按输入 token
+CED 当前是实验性的近似 prefill 路径。在已测长文本 prefill 中，按输入 token
 数 / TTFT 估算的 prefill 代理指标相对关闭 CED 时约翻倍，但收益会随 prompt、
 长度和运行配置变化。它不保证与非 CED 路径输出等价；部署前应按实际任务验证
-质量。CED 不支持多模态输入、prompt embeddings 或 prompt logprobs。包含
-issue #111 修复的源码会在正常 API 请求进入推理引擎前拒绝这些组合，返回客户端
-错误，而不是让 worker 退出；已发布的 vision10 wheel 尚不包含这项前端保护。
-需要图片或其他多模态输入时，请移除 `--hf-overrides '{"ced_prefill":true}'` 或改成
+质量，也不能把文本测试的收益推广到图片请求。
+
+本仓库源码在 PR #112 的前端保护基础上增加了 CED 图片输入路径，按请求中的
+全部图片范围处理单图和多图；图片与最后 128 个 query token 相交时，回放边界
+向前扩展以保留完整图片，不会自动关闭 CED。可保留 DSpark 和 prefix caching。
+按需设置 `--limit-mm-per-prompt '{"image":2}'`；每张图片必须能放入一个 prefill
+chunk，扩展回放也必须满足 batch token 预算。视觉模型每卡预留
+`128 + vision_max_n_token` 行回放状态，增加 TP 不会按比例减少这部分显存。
+非图片模态、prompt embeddings 和 prompt logprobs 仍在进入引擎前被拒绝。
+
+图片路径已完成 CPU 回归和 SM120 单卡小型权重的 GPU 数值测试，包括 DSpark
+context 对接与模拟 prefix hit；真实缓存管理器的图片命中和边界回退另有 CPU
+测试。双图的输入和请求状态有 CPU 覆盖，但完整 DSpark 接受/拒绝闭环、多图
+整模型质量及 TP4/TP8 图片推理尚未验证，不能据此承诺图片吞吐或准确率。
+
+已发布的 vision10 wheel 不包含 PR #112 前端保护或本次 CED 图片支持。继续使用
+该 wheel 处理图片时，请移除 `--hf-overrides '{"ced_prefill":true}'` 或改成
 `'{"ced_prefill":false}'`；无需因此关闭 DSpark/adaptive。
 
-SM120 已完成完整模型服务验证；SM89 本轮仅完成离线编译验证，未在 SM89
-硬件上执行内核数值测试或完整模型服务验证。
+此前 SM120 完整模型服务验证针对既有文本配置；SM89 本轮仅完成离线编译验证，
+未在 SM89 硬件上执行内核数值测试或完整模型服务验证。
 
 ### 3.1 DSpark 默认开启 adaptive verification
 

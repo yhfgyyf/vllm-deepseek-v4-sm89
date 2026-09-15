@@ -1723,6 +1723,22 @@ def test_allocate_with_lookahead():
     assert len(blocks.get_block_ids()[0]) == 2
 
 
+def test_get_kv_cache_configs_preserves_model_required_swa_retention():
+    config = VllmConfig(model_config=ModelConfig(max_model_len=2048))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    config.cache_config.prefix_cache_retention_interval = None
+    spec = replace(
+        new_sliding_window_spec(sliding_window=128), extra_retained_tokens=1024
+    )
+    worker_configs = get_kv_cache_configs(
+        config, [{"decoder": spec}], [spec.page_size_bytes * 512]
+    )
+    scheduler_config = generate_scheduler_kv_cache_config(worker_configs)
+    assert (
+        scheduler_config.kv_cache_groups[0].kv_cache_spec.extra_retained_tokens == 1024
+    )
+
+
 def test_get_kv_cache_config_one_worker():
     # pass max_model_len to pass check_enough_kv_cache_memory
     model_config = ModelConfig(max_model_len=16)

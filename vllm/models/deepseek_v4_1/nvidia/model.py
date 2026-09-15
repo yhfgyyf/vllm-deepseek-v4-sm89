@@ -69,6 +69,7 @@ from vllm.models.deepseek_v4_1.nvidia.ced import (
     CEDDraftContext,
     CEDStep,
     CEDTailState,
+    get_ced_replay_capacity,
     validate_ced_config,
 )
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
@@ -401,7 +402,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.ced_enabled:
             validate_ced_config(vllm_config, self.use_sequence_parallel)
             self.ced_tail = CEDTailState(
-                vllm_config.scheduler_config.max_num_seqs, config.hidden_size
+                vllm_config.scheduler_config.max_num_seqs,
+                config.hidden_size,
+                window=get_ced_replay_capacity(config),
             )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -632,7 +635,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.ced_enabled and is_forward_context_available():
             metadata = get_forward_context().attn_metadata
             if isinstance(metadata, dict):
-                ced_step = metadata.get(CED_METADATA_KEY)
+                ced_step = typing.cast(CEDStep | None, metadata.get(CED_METADATA_KEY))
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Numerical contracts for V4.1 native codecs, compression and delayed mHC."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +11,75 @@ from vllm.models.deepseek_v4_1.common.ops.quant_utils import _fp32x2_to_fp4x2
 from vllm.triton_utils import tl, triton
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@cuda
+@pytest.mark.parametrize("decode_metadata", [False, True])
+def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
+    from vllm.models.deepseek_v4_1.nvidia.ced import clamp_replay_swa
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        ComputeSWAIndicesAndLensKernel,
+        fill_mm_prefix_query_ranges,
+    )
+
+    replay_start, image_end, prompt_len = 64, 320, 400
+    count, width, block_size = prompt_len - replay_start, 384, 32
+    positions = torch.arange(replay_start, prompt_len, device="cuda")
+    query_start_cpu = torch.tensor([0, count], dtype=torch.int32)
+    seq_lens_cpu = torch.tensor([prompt_len], dtype=torch.int32)
+    ranges_cpu = torch.full((count, 2), -1, dtype=torch.int32)
+    fill_mm_prefix_query_ranges(
+        ranges_cpu.numpy(),
+        {0: [(replay_start, image_end - 1)]},
+        query_start_cpu,
+        seq_lens_cpu,
+    )
+    ranges = ranges_cpu.cuda()
+    # Physical slot order must not be used to clamp logical replay positions.
+    blocks = torch.arange(1, 17, dtype=torch.int32).flip(0)[None].cuda()
+    slots = torch.empty(count, width, dtype=torch.int32, device="cuda")
+    lengths = torch.empty(count, dtype=torch.int32, device="cuda")
+    ComputeSWAIndicesAndLensKernel()(
+        slots,
+        lengths,
+        128,
+        width,
+        query_start_cpu.cuda(),
+        seq_lens_cpu.cuda(),
+        torch.zeros(count, dtype=torch.int32, device="cuda"),
+        torch.ones(count, dtype=torch.bool, device="cuda"),
+        blocks,
+        block_size,
+        ranges,
+        True,
+        num_tokens=count,
+        token_offset=0,
+    )
+    metadata = SimpleNamespace(
+        num_decode_tokens=count if decode_metadata else 0,
+        decode_swa_indices=slots[:, None] if decode_metadata else None,
+        decode_swa_lens=lengths if decode_metadata else None,
+        prefill_swa_indices=None if decode_metadata else slots,
+        prefill_swa_lens=None if decode_metadata else lengths,
+        mm_prefix_query_ranges=ranges,
+    )
+    clamp_replay_swa(metadata, positions, torch.full_like(positions, replay_start), 128)
+
+    expected = torch.full((count, width), -1, dtype=torch.int32)
+    physical_blocks = blocks.cpu()[0]
+    for row, pos in enumerate(range(replay_start, prompt_len)):
+        first = max(0, pos - 127)
+        end = pos + 1
+        if replay_start <= pos < image_end:
+            first = min(first, replay_start)
+            end = image_end
+        for offset, key in enumerate(range(first, end)):
+            if key >= replay_start:
+                expected[row, offset] = (
+                    physical_blocks[key // block_size] * block_size + key % block_size
+                )
+    torch.testing.assert_close(slots.cpu(), expected)
+    torch.testing.assert_close(lengths.cpu(), (expected >= 0).sum(-1).int())
 
 
 def _rope(x, positions, cache, inverse=False):

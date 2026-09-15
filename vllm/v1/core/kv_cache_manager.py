@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.multimodal.utils import get_mm_safe_replay_start
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -145,6 +146,7 @@ class KVCacheManager:
         if prefix_replay_window < 0:
             raise ValueError("prefix_replay_window must be non-negative")
         self.prefix_replay_window = prefix_replay_window
+        self.scheduler_block_size = scheduler_block_size
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -232,19 +234,29 @@ class KVCacheManager:
 
     def _get_max_cache_hit_length(self, request: Request) -> int:
         if self.prefix_replay_window:
-            return max(
-                0,
-                min(request.num_prompt_tokens, request.num_tokens)
-                - self.prefix_replay_window,
+            return get_mm_safe_replay_start(
+                min(request.num_prompt_tokens, request.num_tokens),
+                self.prefix_replay_window,
+                (
+                    (
+                        feature.mm_position.offset,
+                        feature.mm_position.offset + feature.mm_position.length - 1,
+                    )
+                    for feature in request.mm_features
+                ),
+                block_size=self.scheduler_block_size if request.mm_features else 1,
             )
         return request.num_tokens - 1
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            max_cache_hit_length: Optional cap when retrying at an image boundary.
 
         Returns:
             A tuple containing:
@@ -266,7 +278,12 @@ class KVCacheManager:
         # Ordinarily, recompute the last token to obtain logits. A configured
         # replay window instead leaves that many original-prompt tokens for the
         # model to rebuild before any generated history is teacher-forced.
-        max_cache_hit_length = self._get_max_cache_hit_length(request)
+        request_limit = self._get_max_cache_hit_length(request)
+        max_cache_hit_length = (
+            request_limit
+            if max_cache_hit_length is None
+            else min(request_limit, max_cache_hit_length)
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

@@ -1923,14 +1923,19 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[
-        tuple[int, int, bool], dict[str, KVCacheSpec]
-    ] = defaultdict(dict)
+    grouped_swa_mla_specs: dict[tuple[int, int, bool, int], dict[str, KVCacheSpec]] = (
+        defaultdict(dict)
+    )
     # Group SWA layers by allocation geometry and cacheability, separating
     # C4I+C4A, C128A, and request-private DeepSeek V4-family groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            key = (spec.block_size, spec.sliding_window, spec.prefix_cacheable)
+            key = (
+                spec.block_size,
+                spec.sliding_window,
+                spec.prefix_cacheable,
+                spec.extra_retained_tokens,
+            )
             grouped_swa_mla_specs[key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
@@ -2730,7 +2735,10 @@ def get_kv_cache_configs(
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec,
+                extra_retained_tokens=max(
+                    layer_spec.extra_retained_tokens, extra_retained_tokens
+                ),
             )
 
     # Get global KV cache groups. This also handles spec unification for

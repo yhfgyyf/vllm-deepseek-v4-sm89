@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import numpy as np
@@ -16,7 +17,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.inputs.engine import embeds_input, mm_input, tokens_input
 from vllm.models.deepseek_v4_1.nvidia.ced import CED_METADATA_KEY, CEDRequest
 from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
-from vllm.multimodal.inputs import PlaceholderRange
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.kv_cache_interface import (
@@ -66,15 +67,30 @@ def _request(**overrides):
         prompt_len=128,
     )
     fields.update(overrides)
+    fields.setdefault("prefill_token_ids", list(range(cast(int, fields["prompt_len"]))))
     return SimpleNamespace(**fields)
+
+
+def _mm_feature(
+    modality: str = "image", offset: int = 1, length: int = 1
+) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=None,
+        modality=modality,
+        identifier=f"cached-{modality}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
 
 
 def _request_state() -> DeepseekV41ModelState:
     state = object.__new__(DeepseekV41ModelState)
     state.ced_enabled = True
     state.ced_tail = Mock()
+    state.ced_tail.window = 384
     state._ced_request_slots = {}
     state._ced_prompt_lens = {}
+    state._ced_replay_starts = {}
+    state._ced_mm_ranges = {}
     state.rope_state = None
     state.prompt_embeds_state = None
     state._mm_prefix_prompt_token_ids = {}
@@ -82,7 +98,9 @@ def _request_state() -> DeepseekV41ModelState:
     return state
 
 
-def _input_processor(ced_enabled=True, model_type="deepseek_v41"):
+def _input_processor(
+    ced_enabled=True, model_type="deepseek_v41", max_num_batched_tokens=512
+):
     processor = InputProcessor.__new__(InputProcessor)
     processor.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(model_type=model_type, ced_prefill=ced_enabled),
@@ -108,23 +126,30 @@ def _input_processor(ced_enabled=True, model_type="deepseek_v41"):
     processor.supports_mm_inputs = True
     processor.mm_encoder_cache_size = 512
     processor.skip_prompt_length_check = False
+    processor.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_scheduled_tokens=None,
+        long_prefill_token_threshold=0,
+    )
     return processor
 
 
-def _image_input(modality="image"):
+def _image_input(modality="image", *, prompt_len=3, offset=1, length=1):
+    token_ids = [1] * prompt_len
+    token_ids[-1] = 2
+    token_ids[offset : offset + length] = [129264] * length
     return mm_input(
-        [1, 129264, 2],
+        token_ids,
         {modality: [None]},  # Encoder-cache hit still represents multimodal input.
         {modality: ["cached-feature"]},
-        {modality: [PlaceholderRange(offset=1, length=1)]},
+        {modality: [PlaceholderRange(offset=offset, length=length)]},
     )
 
 
 @pytest.mark.parametrize(
     "prompt, prompt_logprobs, feature",
     [
-        (_image_input(), None, "multimodal inputs"),
-        (_image_input("prompt_embeds"), None, "multimodal inputs"),
+        (_image_input("video"), None, "multimodal inputs"),
         (embeds_input(torch.zeros(3, 8)), None, "prompt embeddings"),
         (tokens_input([1, 2, 3]), 0, "prompt log probabilities"),
         (tokens_input([1, 2, 3]), 1, "prompt log probabilities"),
@@ -149,6 +174,54 @@ def test_ced_unsupported_input_is_rejected_before_engine_request(
     )
     assert request.prompt_token_ids == [1, 2, 3]
     assert request.mm_features is None
+
+
+def test_ced_accepts_image_before_engine_request():
+    processor = _input_processor()
+
+    request = processor.process_inputs(
+        "image", _image_input(), SamplingParams(max_tokens=1), ("generate",)
+    )
+
+    assert request.mm_features is not None
+    assert len(request.mm_features) == 1
+    assert request.mm_features[0].modality == "image"
+    assert request.mm_features[0].identifier == "cached-feature"
+    assert request.mm_features[0].mm_position == PlaceholderRange(offset=1, length=1)
+    assert request.prompt_token_ids == [1, 129264, 2]
+
+
+def test_ced_rejects_image_replay_larger_than_the_worker_capacity():
+    processor = _input_processor(max_num_batched_tokens=256)
+    prompt = _image_input(prompt_len=400, offset=96, length=220)
+
+    with pytest.raises(
+        VLLMValidationError, match="image replay exceeds max_num_batched_tokens"
+    ) as exc_info:
+        processor.process_inputs(
+            "oversized-image", prompt, SamplingParams(max_tokens=1), ("generate",)
+        )
+
+    error = create_error_response(exc_info.value).error
+    assert error.code == 400
+    assert error.type == "BadRequestError"
+    assert error.param == "ced_prefill"
+
+
+@pytest.mark.parametrize("image_length", [253, 254, 256])
+def test_ced_image_admission_reserves_dspark_draft_slots(image_length):
+    processor = _input_processor(max_num_batched_tokens=256)
+    processor.speculative_config = SimpleNamespace(max_num_new_slots_for_drafting=3)
+    prompt = _image_input(prompt_len=512, offset=0, length=image_length)
+    params = SamplingParams(max_tokens=1)
+    if image_length == 253:
+        processor._validate_ced_inputs(prompt, params)
+    else:
+        with pytest.raises(
+            VLLMValidationError, match="fit in one prefill chunk"
+        ) as exc:
+            processor._validate_ced_inputs(prompt, params)
+        assert create_error_response(exc.value).error.code == 400
 
 
 @pytest.mark.parametrize(
@@ -190,7 +263,7 @@ def test_ced_accepts_text_rendered_by_multimodal_processor(placeholders):
             "prompt log probabilities",
         ),
         ({"prompt_embeds": torch.zeros(1, 2)}, "prompt embeddings"),
-        ({"mm_features": [object()]}, "multimodal inputs"),
+        ({"mm_features": [_mm_feature("video")]}, "multimodal inputs"),
         ({"num_computed_tokens": 1}, "insufficient encoder replay"),
     ],
 )
@@ -204,6 +277,75 @@ def test_ced_rejects_request_features_before_reset(overrides, message):
     assert state._ced_request_slots == {}
 
 
+@pytest.mark.parametrize("draft_slots", [0, 3])
+@pytest.mark.parametrize(
+    ("prompt_len", "image_spans", "expected_ranges", "expected_replay_start"),
+    [
+        pytest.param(
+            480,
+            ((16, 220), (236, 220)),
+            [(16, 235), (236, 455)],
+            236,
+            id="adjacent-second-crosses-tail",
+        ),
+        pytest.param(
+            336,
+            ((16, 220), (260, 48)),
+            [(16, 235), (260, 307)],
+            16,
+            id="first-crosses-tail",
+        ),
+        pytest.param(
+            160,
+            ((40, 48), (96, 48)),
+            [(40, 87), (96, 143)],
+            32,
+            id="both-inside-tail",
+        ),
+    ],
+)
+def test_ced_multi_image_request_retains_full_replay_ranges(
+    draft_slots, prompt_len, image_spans, expected_ranges, expected_replay_start
+):
+    processor = _input_processor(max_num_batched_tokens=2048)
+    if draft_slots:
+        processor.speculative_config = SimpleNamespace(
+            max_num_new_slots_for_drafting=draft_slots
+        )
+    token_ids = [7] * prompt_len
+    placeholders = [
+        PlaceholderRange(offset=offset, length=length) for offset, length in image_spans
+    ]
+    for offset, length in image_spans:
+        token_ids[offset : offset + length] = [129264] * length
+    prompt = mm_input(
+        token_ids,
+        {"image": [None, None]},
+        {"image": ["cached-image-0", "cached-image-1"]},
+        {"image": placeholders},
+    )
+
+    request = processor.process_inputs(
+        "multi-image", prompt, SamplingParams(max_tokens=1), ("generate",)
+    )
+    assert request.mm_features is not None
+    assert [
+        (feature.modality, feature.identifier, feature.mm_position)
+        for feature in request.mm_features
+    ] == [
+        ("image", "cached-image-0", placeholders[0]),
+        ("image", "cached-image-1", placeholders[1]),
+    ]
+    state = _request_state()
+    state.add_request(
+        2, _request(prompt_len=prompt_len, mm_features=request.mm_features)
+    )
+
+    state.ced_tail.reset.assert_called_once_with(2, 0)
+    assert state._ced_replay_starts == {2: expected_replay_start}
+    assert state._ced_mm_ranges == {2: expected_ranges}
+
+
 def test_ced_resets_tail_when_slot_zero_is_added_and_removed():
     state = _request_state()
 
@@ -213,6 +355,8 @@ def test_ced_resets_tail_when_slot_zero_is_added_and_removed():
     assert state.ced_tail.reset.call_args_list == [((0, 0),), ((0,),)]
     assert state._ced_request_slots == {}
     assert state._ced_prompt_lens == {}
+    assert state._ced_replay_starts == {}
+    assert state._ced_mm_ranges == {}
 
 
 def test_ced_prefix_hit_retains_original_prompt_length_for_resumed_history():
@@ -304,6 +448,9 @@ def test_ced_prepare_attn_uses_independent_compact_metadata_builders(
     state.ced_enabled = True
     state._ced_attn_groups = None
     state._ced_prompt_lens = {9: 128, 3: 10}
+    state._ced_replay_starts = {9: 0, 3: 0}
+    state._ced_mm_ranges = {9: [(4, 123)], 3: []}
+    state.ced_tail = SimpleNamespace(window=384)
     state.supports_mm_inputs = False
     state.max_model_len = 256
     state.device = torch.device("cpu")
@@ -381,9 +528,11 @@ def test_ced_prepare_attn_uses_independent_compact_metadata_builders(
         64 if optimistic_cpu_counts else 57,
     ]
     assert step.plan.decoder_requests == (1, 0)
+    assert step.plan.cache_window == 384
     assert decoder.common.query_start_loc_cpu.tolist() == [0, 1, 129]
     assert decoder.common.seq_lens.tolist() == [11, 128]
     assert decoder.common.is_prefilling.tolist() == [False, True]
+    assert decoder.common.mm_req_doc_ranges == {0: [], 1: [(4, 123)]}
     assert step.positions.tolist() == [10, *range(128)]
     assert step.decoder_slot_mapping["layer"][0].item() == 410
 

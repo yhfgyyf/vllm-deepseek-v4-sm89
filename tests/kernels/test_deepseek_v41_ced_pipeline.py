@@ -49,6 +49,25 @@ from vllm.models.deepseek_v4_1.nvidia.model import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 CAPACITY = 512
 HIDDEN = 256
+IMAGE_TOKEN_ID = 129264
+
+
+def logical_swa_slots(positions, replay_start, image_span=None):
+    """Build logical ``(causal SWA) OR (same image span)`` cache slots."""
+    first = (positions - 127).clamp_min(0)
+    end = positions + 1
+    width = 128
+    if image_span is not None:
+        image_start, image_end = image_span
+        in_image = (positions >= image_start) & (positions < image_end)
+        first = torch.where(in_image, first.clamp_max(image_start), first)
+        end = torch.where(in_image, end.clamp_min(image_end), end)
+        width = max(width, image_end - min(image_start, replay_start))
+    first = first.clamp_min(replay_start)
+    slots = first[:, None] + torch.arange(width, device=positions.device)
+    return torch.where(
+        (slots < end[:, None]) & (slots >= replay_start), slots, -1
+    ).int()
 
 
 class PackedAttention(nn.Module):
@@ -85,10 +104,10 @@ class PackedAttention(nn.Module):
         kv = hidden.repeat(1, 2).contiguous()
         q = kv[:, None].expand(-1, 8, -1).contiguous()
         q = fused_q_rope_swa_insert(q, kv, positions, self.cs, self.cache, positions)
-        start = get_forward_context().attn_metadata["replay_start"]
-        offsets = torch.arange(128, device="cuda")
-        swa = (positions[:, None] - 127).clamp_min(0) + offsets
-        swa = torch.where((swa <= positions[:, None]) & (swa >= start), swa, -1).int()
+        metadata = get_forward_context().attn_metadata
+        swa = logical_swa_slots(
+            positions, metadata["replay_start"], metadata.get("image_span")
+        )
         global_slots = torch.arange(CAPACITY, device="cuda")[None].expand(
             len(positions), -1
         )
@@ -112,17 +131,19 @@ class DenseFFN(nn.Module):
         self.weight = nn.Parameter(
             torch.randn(HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.002
         )
+        self.input_ids_seen = []
 
     def forward(self, hidden, input_ids):
+        self.input_ids_seen.append(input_ids.clone())
         return (hidden @ self.weight).contiguous()
 
 
-def make_model(seed):
+def make_model(seed, tail_capacity=128):
     torch.manual_seed(seed)
     model = DeepseekV4Model.__new__(DeepseekV4Model)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(hidden_size=HIDDEN)
-    model.ced_tail = CEDTailState(1, HIDDEN).cuda()
+    model.ced_tail = CEDTailState(1, HIDDEN, window=tail_capacity).cuda()
     model.norm = RMSNorm(HIDDEN, 1e-6).cuda().bfloat16()
     global_cache = torch.zeros(
         CAPACITY // 128, 128, 288, device="cuda", dtype=torch.uint8
@@ -163,16 +184,21 @@ def make_model(seed):
     return model
 
 
-def context(start=0):
+def context(start=0, image_span=None):
+    attn_metadata = {"replay_start": start}
+    if image_span is not None:
+        attn_metadata["image_span"] = image_span
     return ForwardContext(
         no_compile_layers={},
-        attn_metadata={"replay_start": start},
+        attn_metadata=attn_metadata,
         slot_mapping={},
         skip_compiled=True,
     )
 
 
-def explicit_replay_reference(model, boundary, pre_mix, positions, replay_start):
+def explicit_replay_reference(
+    model, boundary, pre_mix, input_ids, positions, replay_start, image_span
+):
     """Independent schedule: build all global rows, slice once, run twenty layers."""
     layer = model.layers[20]
     _, _, normalized, _ = mhc_pre_delayed_tilelang(
@@ -193,13 +219,14 @@ def explicit_replay_reference(model, boundary, pre_mix, positions, replay_start)
     layer.attn.ced_global_kv_prebuilt = True
     hidden = boundary[replay_start:].contiguous()
     carried = pre_mix[replay_start:].contiguous()
+    token_ids = input_ids[replay_start:].contiguous()
     query_positions = positions[replay_start:]
     residual = post = res = None
     auxiliary = []
-    with override_forward_context(context(replay_start)):
+    with override_forward_context(context(replay_start, image_span)):
         for idx, layer in enumerate(islice(model.layers, 20, 40), start=20):
             hidden, residual, post, res, carried = layer(
-                hidden, query_positions, query_positions, carried, post, res, residual
+                hidden, query_positions, token_ids, carried, post, res, residual
             )
             if idx + 1 in (37, 38, 39):
                 auxiliary.append(mhc_post_tilelang(hidden, residual, post, res).mean(1))
@@ -208,23 +235,65 @@ def explicit_replay_reference(model, boundary, pre_mix, positions, replay_start)
 
 
 @torch.inference_mode()
+def test_logical_image_slots_expand_only_queries_inside_the_image():
+    image_span = (64, 320)
+    positions = torch.tensor([64, 191, 319, 320, 399], device="cuda")
+
+    slots = logical_swa_slots(positions, replay_start=64, image_span=image_span)
+
+    image_slots = torch.arange(*image_span, device="cuda", dtype=torch.int32)
+    for row in range(3):
+        torch.testing.assert_close(slots[row], image_slots)
+    for row, position in ((3, 320), (4, 399)):
+        expected = torch.arange(
+            position - 127, position + 1, device="cuda", dtype=torch.int32
+        )
+        torch.testing.assert_close(slots[row, :128], expected)
+        assert (slots[row, 128:] == -1).all()
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize(
-    "length,chunk,prefix_hit",
-    [(127, 127, 0), (129, 128, 0), (257, 128, 0), (257, 128, 128)],
+    "length,chunk,prefix_hit,image_span,tail_capacity",
+    [
+        (127, 127, 0, None, 128),
+        (129, 128, 0, None, 128),
+        (257, 128, 0, None, 128),
+        (257, 128, 128, None, 128),
+        (400, 128, 0, (64, 320), 384),
+        (400, 128, 64, (64, 320), 384),
+    ],
 )
 @pytest.mark.parametrize("dspark", [False, True])
 def test_ced_chunked_decoder_matches_independent_bounded_replay(
-    length, chunk, prefix_hit, dspark, default_vllm_config
+    length,
+    chunk,
+    prefix_hit,
+    image_span,
+    tail_capacity,
+    dspark,
+    default_vllm_config,
 ):
     torch.manual_seed(83)
     boundary = torch.randn(length, 4, HIDDEN, device="cuda", dtype=torch.bfloat16)
     pre_mix = torch.softmax(torch.randn(length, 4, device="cuda"), -1)
     positions = torch.arange(length, device="cuda")
-    reference = make_model(14)
+    input_ids = positions.clone()
+    if image_span is not None:
+        image_start, image_end = image_span
+        input_ids[image_start:image_end] = IMAGE_TOKEN_ID
+    replay_start = image_span[0] if image_span is not None else max(0, length - 128)
+    reference = make_model(14, tail_capacity)
     expected, expected_aux = explicit_replay_reference(
-        reference, boundary, pre_mix, positions, max(0, length - 128)
+        reference,
+        boundary,
+        pre_mix,
+        input_ids,
+        positions,
+        replay_start,
+        image_span,
     )
-    actual_model = make_model(14)
+    actual_model = make_model(14, tail_capacity)
     actual_model.aux_hidden_state_layers = (37, 38, 39) if dspark else ()
     if prefix_hit:
         # Only prefix-independent global KV is shared. No decoder SWA or
@@ -235,9 +304,24 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
         actual_model.ced_tail.reset(0, prefix_hit)
     for first in range(prefix_hit, length, chunk):
         end = min(first + chunk, length)
-        plan = plan_ced_step((CEDRequest(0, first, end - first, length, True),))
+        plan = plan_ced_step(
+            (
+                CEDRequest(
+                    0,
+                    first,
+                    end - first,
+                    length,
+                    True,
+                    replay_start=replay_start,
+                ),
+            ),
+            cache_window=tail_capacity,
+        )
         decoder_pos = torch.tensor(plan.positions, device="cuda", dtype=torch.int64)
-        step = CEDStep(plan, {"replay_start": max(0, length - 128)}, decoder_pos)
+        decoder_metadata = {"replay_start": replay_start}
+        if image_span is not None:
+            decoder_metadata["image_span"] = image_span
+        step = CEDStep(plan, decoder_metadata, decoder_pos)
         ctx = context()
         old_metadata, old_slots = ctx.attn_metadata, ctx.slot_mapping
         with override_forward_context(ctx):
@@ -245,7 +329,7 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
                 step,
                 boundary[first:end],
                 pre_mix[first:end],
-                positions[first:end],
+                input_ids[first:end],
                 positions[first:end],
             )
         assert ctx.attn_metadata is old_metadata and ctx.slot_mapping is old_slots
@@ -273,9 +357,19 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
                 check_draft_context(step)
     source = actual_model.layers[20].attn
     torch.testing.assert_close(torch.cat(source.global_writes), positions[prefix_hit:])
+    replay_positions = positions[replay_start:]
+    replay_input_ids = input_ids[replay_start:]
     for layer in islice(actual_model.layers, 20, 40):
         assert len(layer.attn.rows_seen) == 1
-        torch.testing.assert_close(layer.attn.rows_seen[0], positions[-128:])
+        torch.testing.assert_close(layer.attn.rows_seen[0], replay_positions)
+        assert len(layer.ffn.input_ids_seen) == 1
+        torch.testing.assert_close(layer.ffn.input_ids_seen[0], replay_input_ids)
+    assert actual_model.ced_tail.ends == [length]
+    assert actual_model.ced_tail.valid_starts == [replay_start]
+    tail_slots = replay_positions.remainder(tail_capacity)
+    torch.testing.assert_close(
+        actual_model.ced_tail.input_ids[tail_slots], replay_input_ids
+    )
     torch.testing.assert_close(
         source.global_cache, reference.layers[20].attn.global_cache, rtol=0, atol=0
     )
@@ -287,14 +381,16 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
     hidden, carried = next_boundary, next_mix
     residual = post = res = None
     reference.layers[20].attn.ced_global_kv_prebuilt = False
-    with override_forward_context(context()):
+    with override_forward_context(context(image_span=image_span)):
         for layer in islice(reference.layers, 20, 40):
             hidden, residual, post, res, carried = layer(
                 hidden, next_position, next_position, carried, post, res, residual
             )
         hidden = mhc_post_tilelang(hidden, residual, post, res)
         expected_next = reference.norm(hc_collapse_triton(hidden, carried))
-    decode_plan = plan_ced_step((CEDRequest(0, length, 1, length, False),))
+    decode_plan = plan_ced_step(
+        (CEDRequest(0, length, 1, length, False),), cache_window=tail_capacity
+    )
     decode_step = CEDStep(decode_plan, {"replay_start": 0}, next_position)
     with override_forward_context(context()):
         actual_next = actual_model._forward_ced_decoder(
@@ -304,6 +400,8 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
         actual_next, _ = actual_next
         assert len(decode_step.draft_context.aux_hidden_states) == 3
     torch.testing.assert_close(actual_next, expected_next, rtol=0.005, atol=0.005)
+    for layer in islice(actual_model.layers, 20, 40):
+        torch.testing.assert_close(layer.ffn.input_ids_seen[-1], next_position)
 
 
 class ContextProjection(nn.Linear):
@@ -417,7 +515,7 @@ def check_draft_context(step):
         )
 
     run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = run()

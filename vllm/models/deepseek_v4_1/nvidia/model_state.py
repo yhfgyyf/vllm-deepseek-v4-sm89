@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal.utils import get_mm_safe_replay_start
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -84,6 +85,8 @@ class DeepseekV41ModelState(DefaultModelState):
             raise RuntimeError("CED is enabled without its reserved tail state")
         self._ced_request_slots: dict[str, int] = {}
         self._ced_prompt_lens: dict[int, int] = {}
+        self._ced_replay_starts: dict[int, int] = {}
+        self._ced_mm_ranges: dict[int, list[tuple[int, int]]] = {}
         self._ced_attn_groups: list[list[AttentionGroup]] | None = None
 
         depth = model.token_lookback_depth
@@ -104,9 +107,22 @@ class DeepseekV41ModelState(DefaultModelState):
                 raise ValueError("CED does not support prompt log probabilities")
             if new_req_data.prompt_embeds is not None:
                 raise ValueError("CED does not support prompt embeddings")
-            if new_req_data.mm_features:
-                raise ValueError("CED does not support multimodal inputs")
-            if new_req_data.num_computed_tokens > max(0, new_req_data.prompt_len - 128):
+            if any(feature.modality != "image" for feature in new_req_data.mm_features):
+                raise ValueError(
+                    "CED does not support multimodal inputs other than images"
+                )
+            mm_ranges = [
+                span
+                for feature in new_req_data.mm_features
+                for span in feature.mm_position.extract_embeds_range()
+            ]
+            replay_start = get_mm_safe_replay_start(
+                new_req_data.prompt_len, 128, mm_ranges
+            )
+            assert self.ced_tail is not None
+            if new_req_data.prompt_len - replay_start > self.ced_tail.window:
+                raise ValueError("CED image replay exceeds the reserved tail capacity")
+            if new_req_data.num_computed_tokens > replay_start:
                 raise ValueError("CED prefix hit leaves insufficient encoder replay")
 
         super().add_request(req_index, new_req_data)
@@ -115,6 +131,8 @@ class DeepseekV41ModelState(DefaultModelState):
             self.ced_tail.reset(req_index, new_req_data.num_computed_tokens)
             self._ced_request_slots[new_req_data.req_id] = req_index
             self._ced_prompt_lens[req_index] = new_req_data.prompt_len
+            self._ced_replay_starts[req_index] = replay_start
+            self._ced_mm_ranges[req_index] = mm_ranges
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
@@ -123,6 +141,8 @@ class DeepseekV41ModelState(DefaultModelState):
             assert self.ced_tail is not None
             self.ced_tail.reset(slot)
             self._ced_prompt_lens.pop(slot, None)
+            self._ced_replay_starts.pop(slot, None)
+            self._ced_mm_ranges.pop(slot, None)
 
     def _get_ced_attn_groups(
         self, attn_groups: list[list[AttentionGroup]]
@@ -235,10 +255,14 @@ class DeepseekV41ModelState(DefaultModelState):
                 prefill_len=self._ced_prompt_lens[int(input_batch.idx_mapping_np[i])],
                 is_prefilling=(seq_ends[i] - (ends[i] - starts[i]))
                 < self._ced_prompt_lens[int(input_batch.idx_mapping_np[i])],
+                replay_start=self._ced_replay_starts.get(
+                    int(input_batch.idx_mapping_np[i])
+                ),
             )
             for i in range(input_batch.num_reqs)
         )
-        plan = plan_ced_step(requests)
+        assert self.ced_tail is not None
+        plan = plan_ced_step(requests, cache_window=self.ced_tail.window)
         if (
             plan.num_decoder_tokens
             > self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -317,6 +341,10 @@ class DeepseekV41ModelState(DefaultModelState):
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             is_prefilling=is_prefilling,
+            mm_req_doc_ranges={
+                index: self._ced_mm_ranges.get(requests[original].slot, [])
+                for index, original in enumerate(plan.decoder_requests)
+            },
             rswa_prefix_lens=prompt_lens,
         )
         replay_starts = torch.tensor(

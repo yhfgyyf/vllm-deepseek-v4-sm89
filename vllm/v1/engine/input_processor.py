@@ -19,7 +19,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.multimodal.utils import argsort_mm_positions
+from vllm.multimodal.utils import argsort_mm_positions, get_mm_safe_replay_start
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer, renderer_from_config
@@ -218,10 +218,50 @@ class InputProcessor:
             unsupported = "prompt log probabilities"
         elif decoder_input["type"] == "embeds":
             unsupported = "prompt embeddings"
-        elif decoder_input["type"] == "multimodal" and any(
-            decoder_input["mm_placeholders"].values()
-        ):
-            unsupported = "multimodal inputs"
+        elif decoder_input["type"] == "multimodal":
+            placeholders = decoder_input["mm_placeholders"]
+            if any(
+                positions
+                for modality, positions in placeholders.items()
+                if modality != "image"
+            ):
+                unsupported = "multimodal inputs other than images"
+            elif images := placeholders.get("image"):
+                prompt_len = len(decoder_input["prompt_token_ids"])
+                replay_start = get_mm_safe_replay_start(
+                    prompt_len,
+                    128,
+                    (span for image in images for span in image.extract_embeds_range()),
+                )
+                scheduler = self.scheduler_config
+                if prompt_len - replay_start > scheduler.max_num_batched_tokens:
+                    raise VLLMValidationError(
+                        "CED image replay exceeds max_num_batched_tokens. "
+                        "Increase max_num_batched_tokens to at least "
+                        f"{prompt_len - replay_start}.",
+                        parameter="ced_prefill",
+                    )
+                chunk_limit = (
+                    scheduler.max_num_scheduled_tokens
+                    or scheduler.max_num_batched_tokens
+                )
+                spec = self.speculative_config
+                draft_slots = (
+                    spec.max_num_new_slots_for_drafting if spec is not None else 0
+                )
+                chunk_limit = min(
+                    chunk_limit, scheduler.max_num_batched_tokens - draft_slots
+                )
+                if scheduler.long_prefill_token_threshold > 0:
+                    chunk_limit = min(
+                        chunk_limit, scheduler.long_prefill_token_threshold
+                    )
+                if any(image.length > chunk_limit for image in images):
+                    raise VLLMValidationError(
+                        "CED image spans must fit in one prefill chunk. Increase "
+                        "max_num_batched_tokens and long_prefill_token_threshold.",
+                        parameter="ced_prefill",
+                    )
         if unsupported is not None:
             raise VLLMValidationError(
                 f"Experimental CED prefill does not support {unsupported}. "

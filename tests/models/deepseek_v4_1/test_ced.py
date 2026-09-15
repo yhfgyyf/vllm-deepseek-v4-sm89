@@ -43,6 +43,53 @@ def test_chunked_prefill_replays_exactly_the_last_encoder_window(length, chunk):
         assert plan.decoder_output_rows == (length - first - 1,)
 
 
+def test_chunked_prefill_keeps_an_image_that_crosses_the_semantic_tail():
+    state = CEDTailState(2, 8, window=384)
+    prompt_len = 400
+    image_start, image_end = 96, 316
+    actual = None
+
+    for start in range(0, prompt_len, 64):
+        count = min(64, prompt_len - start)
+        hidden, pre_mix, token_ids = boundary(start, count)
+        positions = torch.arange(start, start + count)
+        token_ids[(positions >= image_start) & (positions < image_end)] = 129264
+        plan = plan_ced_step(
+            (
+                CEDRequest(
+                    1,
+                    start,
+                    count,
+                    prompt_len,
+                    True,
+                    replay_start=image_start,
+                ),
+            ),
+            cache_window=state.window,
+        )
+        actual = state.pack(plan, hidden, pre_mix, token_ids)
+
+    assert actual is not None
+    assert plan.positions == tuple(range(image_start, prompt_len))
+    assert actual[2].tolist() == [129264] * (image_end - image_start) + list(
+        range(image_end, prompt_len)
+    )
+
+
+def test_large_physical_cache_keeps_text_replay_bounded_to_semantic_window():
+    state = CEDTailState(2, 8, window=384)
+    request = CEDRequest(1, 0, 400, 400, True)
+    plan = plan_ced_step((request,), cache_window=state.window)
+
+    actual = state.pack(plan, *boundary(0, 400))
+
+    assert plan.positions == tuple(range(272, 400))
+    assert len(plan.store_rows) == 128
+    assert min(plan.store_slots) >= state.window
+    assert max(plan.store_slots) < 2 * state.window
+    assert actual[2].tolist() == list(range(272, 400))
+
+
 def test_mixed_batch_reorders_replay_without_changing_sampling_rows():
     state = CEDTailState(4, 8)
     state.pack(plan_ced_step((CEDRequest(3, 0, 128, 129, True),)), *boundary(0, 128))
@@ -62,6 +109,23 @@ def test_mixed_batch_reorders_replay_without_changing_sampling_rows():
     assert actual[2].tolist() == [20, 0] + list(range(1, 129))
     assert plan.output_rows == (1, 5, 0)
     assert plan.decoder_output_rows == (0, 1, 129)
+
+
+def test_mixed_batch_orders_expanded_prefills_by_actual_replay_length():
+    requests = (
+        CEDRequest(3, 399, 1, 400, True, replay_start=96),
+        CEDRequest(0, 20, 20, 20, False),
+        CEDRequest(2, 0, 3, 100, True),
+        CEDRequest(1, 199, 1, 200, True, replay_start=40),
+    )
+
+    plan = plan_ced_step(requests, cache_window=384)
+
+    assert plan.decoder_requests == (1, 3, 0)
+    assert plan.query_start_loc == (0, 20, 180, 484)
+    assert plan.positions[:20] == tuple(range(20, 40))
+    assert plan.positions[20:180] == tuple(range(40, 200))
+    assert plan.positions[180:] == tuple(range(96, 400))
 
 
 def test_reused_request_slot_cannot_consume_an_old_tail():
@@ -97,6 +161,30 @@ def test_prefix_hit_must_leave_a_full_replay_window_even_with_stale_ring_values(
         state.pack(
             plan_ced_step((CEDRequest(0, 128, 1, 129, True),)), *boundary(128, 1)
         )
+
+
+def test_prefix_hit_must_restore_the_expanded_image_replay_start():
+    state = CEDTailState(1, 8, window=384)
+    state.reset(0, 97)
+    request = CEDRequest(0, 97, 303, 400, True, replay_start=96)
+    plan = plan_ced_step((request,), cache_window=state.window)
+
+    with pytest.raises(ValueError, match="insufficient encoder replay"):
+        state.pack(plan, *boundary(97, 303))
+
+
+def test_expanded_replay_must_fit_the_physical_cache():
+    request = CEDRequest(0, 0, 400, 400, True, replay_start=16)
+
+    with pytest.raises(ValueError, match="cache"):
+        plan_ced_step((request,), cache_window=383)
+
+
+def test_explicit_replay_start_must_include_the_semantic_tail():
+    request = CEDRequest(0, 0, 400, 400, True, replay_start=273)
+
+    with pytest.raises(ValueError, match="replay start"):
+        plan_ced_step((request,), window=128, cache_window=384)
 
 
 def test_generated_history_recovery_does_not_move_the_original_replay_boundary():
@@ -138,6 +226,28 @@ def test_replay_swa_clamp_uses_logical_not_physical_cache_positions():
     assert decode_slots.tolist() == [[900, 5, 20, -1]]
     assert prefill_slots.tolist() == [[[-1, -1, -1, 55]], [[-1, -1, 8, 2]]]
     assert metadata.prefill_swa_lens.tolist() == [1, 2]
+
+
+def test_replay_swa_clamp_uses_image_origin_and_preserves_future_image_keys():
+    image_keys = torch.arange(100, 301, dtype=torch.int32).view(1, 1, -1)
+    metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        decode_swa_indices=None,
+        decode_swa_lens=None,
+        prefill_swa_indices=image_keys,
+        prefill_swa_lens=torch.tensor([201], dtype=torch.int32),
+        mm_prefix_query_ranges=torch.tensor([[100, 300]], dtype=torch.int32),
+    )
+
+    clamp_replay_swa(
+        metadata,
+        positions=torch.tensor([250]),
+        replay_starts=torch.tensor([110]),
+        window=128,
+    )
+
+    assert image_keys.flatten().tolist() == [-1] * 10 + list(range(110, 301))
+    assert metadata.prefill_swa_lens.tolist() == [191]
 
 
 @pytest.mark.parametrize(

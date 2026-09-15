@@ -5609,6 +5609,12 @@ def test_mm_atomic_spans_enabled_only_for_deepseek_v4_vision():
     assert Scheduler._should_enable_mm_atomic_spans(
         model_config("DeepseekV4ForCausalLM", 1)
     )
+    assert Scheduler._should_enable_mm_atomic_spans(
+        model_config("DeepseekV41ForCausalLM", 1)
+    )
+    assert not Scheduler._should_enable_mm_atomic_spans(
+        model_config("DeepseekV41ForCausalLM", 0)
+    )
     assert not Scheduler._should_enable_mm_atomic_spans(
         model_config("DeepseekV4ForCausalLM", 0)
     )
@@ -5720,6 +5726,72 @@ def test_prefix_cache_hit_is_truncated_before_mm_atomic_span():
     assert output.scheduled_new_reqs[0].req_id == request.request_id
     assert output.scheduled_new_reqs[0].num_computed_tokens == block_size
     assert output.num_scheduled_tokens[request.request_id] == block_size * 3
+
+
+@pytest.mark.parametrize("second_is_running", [False, True])
+def test_ced_image_final_chunks_fit_the_decoder_replay_budget(second_is_running):
+    """Short final chunks must not overcommit the expanded image replay."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1024,
+        max_model_len=2048,
+    )
+    scheduler.ced_prefill = True
+    scheduler.enable_mm_atomic_spans = True
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=1025,
+        mm_positions=[
+            [PlaceholderRange(offset=256, length=768)],
+            [PlaceholderRange(offset=256, length=768)],
+        ],
+    )
+    if not second_is_running:
+        requests[1] = create_requests(
+            num_requests=1,
+            num_tokens=769,
+            mm_positions=[[PlaceholderRange(offset=0, length=768)]],
+            req_ids=["waiting-image"],
+        )[0]
+    for index, request in enumerate(requests):
+        if index == 1 and not second_is_running:
+            scheduler.add_request(request)
+            continue
+        assert scheduler.kv_cache_manager.allocate_slots(request, 1024) is not None
+        request.num_computed_tokens = 1024
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[requests[0].request_id] == 1
+    if second_is_running:
+        assert requests[1].request_id not in output.num_scheduled_tokens
+    else:
+        # Intermediate encoder work can still advance, without final replay.
+        assert output.num_scheduled_tokens[requests[1].request_id] == 768
+
+    # A deferred final image request must remain runnable in the next step.
+    if second_is_running:
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[requests[1].request_id] == 1
+
+
+def test_mm_atomic_cache_backoff_cannot_land_inside_an_earlier_image():
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf", block_size=16)
+    scheduler.enable_mm_atomic_spans = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        mm_positions=[
+            [
+                PlaceholderRange(offset=10, length=25),
+                PlaceholderRange(offset=40, length=25),
+            ]
+        ],
+    )[0]
+    # Backing off the second image rounds40 down to32, inside the first image.
+    assert scheduler._get_mm_atomic_boundary(request, 48) == 0
 
 
 def test_free_encoder_inputs_respects_unconfirmed_placeholders():
