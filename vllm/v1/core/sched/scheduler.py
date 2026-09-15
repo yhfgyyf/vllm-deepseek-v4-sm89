@@ -30,7 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.multimodal.utils import get_mm_features_in_window, get_mm_safe_replay_start
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -74,15 +74,47 @@ _CED_PREFIX_REPLAY_WINDOW = 128
 
 
 def _cap_ced_replay_chunk(
-    request: Request, num_computed_tokens: int, num_new_tokens: int
+    request: Request,
+    num_computed_tokens: int,
+    num_new_tokens: int,
+    decoder_budget: int | None = None,
 ) -> int:
     """Keep CED recomputation on one side of the original prompt boundary."""
     prompt_end = request.num_prompt_tokens
     if num_computed_tokens < prompt_end:
-        return min(num_new_tokens, prompt_end - num_computed_tokens)
+        num_new_tokens = min(num_new_tokens, prompt_end - num_computed_tokens)
+        if (
+            decoder_budget is not None
+            and _ced_decoder_token_count(request, num_computed_tokens, num_new_tokens)
+            > decoder_budget
+        ):
+            num_new_tokens = max(0, num_new_tokens - 1)
+        return num_new_tokens
     if num_computed_tokens < request.num_tokens:
-        return min(num_new_tokens, _CED_PREFIX_REPLAY_WINDOW)
+        num_new_tokens = min(num_new_tokens, _CED_PREFIX_REPLAY_WINDOW)
+    if decoder_budget is not None:
+        num_new_tokens = min(num_new_tokens, decoder_budget)
     return num_new_tokens
+
+
+def _ced_decoder_token_count(
+    request: Request, num_computed_tokens: int, num_new_tokens: int
+) -> int:
+    prompt_end = request.num_prompt_tokens
+    if num_computed_tokens >= prompt_end:
+        return num_new_tokens
+    if num_computed_tokens + num_new_tokens < prompt_end:
+        return 0
+    replay_start = get_mm_safe_replay_start(
+        prompt_end,
+        _CED_PREFIX_REPLAY_WINDOW,
+        (
+            span
+            for feature in request.mm_features or ()
+            for span in feature.mm_position.extract_embeds_range()
+        ),
+    )
+    return prompt_end - replay_start
 
 
 class Scheduler(SchedulerInterface):
@@ -100,6 +132,7 @@ class Scheduler(SchedulerInterface):
             & {
                 "DeepseekV4ForCausalLM",
                 "DeepseekV4ForConditionalGeneration",
+                "DeepseekV41ForCausalLM",
             }
         )
 
@@ -121,10 +154,9 @@ class Scheduler(SchedulerInterface):
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.model_uses_xdrope = vllm_config.model_config.uses_xdrope
         hf_config = vllm_config.model_config.hf_config
-        self.ced_prefill = (
-            getattr(hf_config, "model_type", None) == "deepseek_v41"
-            and bool(getattr(hf_config, "ced_prefill", False))
-        )
+        self.ced_prefill = getattr(
+            hf_config, "model_type", None
+        ) == "deepseek_v41" and bool(getattr(hf_config, "ced_prefill", False))
         self.enable_mm_atomic_spans = self._should_enable_mm_atomic_spans(
             vllm_config.model_config
         )
@@ -346,9 +378,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
-            prefix_replay_window=(
-                _CED_PREFIX_REPLAY_WINDOW if self.ced_prefill else 0
-            ),
+            prefix_replay_window=(_CED_PREFIX_REPLAY_WINDOW if self.ced_prefill else 0),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -557,14 +587,16 @@ class Scheduler(SchedulerInterface):
         if not self.enable_mm_atomic_spans or not request.mm_features:
             return boundary
 
-        for mm_feature in request.mm_features:
-            position = mm_feature.mm_position
-            start = position.offset
-            end = start + position.length
-            if start < boundary < end:
-                return start - (start % self.block_size)
-
-        return boundary
+        while True:
+            for mm_feature in request.mm_features:
+                position = mm_feature.mm_position
+                start = position.offset
+                end = start + position.length
+                if start < boundary < end:
+                    boundary = start - (start % self.block_size)
+                    break
+            else:
+                return boundary
 
     def _truncate_mm_atomic_prefix_cache_hit(
         self,
@@ -583,10 +615,21 @@ class Scheduler(SchedulerInterface):
             )
 
         if atomic_boundary <= num_local_computed_tokens:
-            computed_blocks = self.kv_cache_manager.truncate_computed_blocks(
-                computed_blocks, atomic_boundary
-            )
-            return computed_blocks, atomic_boundary, 0
+            # Sparse groups return a tail-only hit. Slicing it would preserve
+            # null blocks at the earlier resume point instead of its SWA state.
+            while True:
+                (
+                    computed_blocks,
+                    num_local_computed_tokens,
+                    request.shared_prefix_boundary,
+                ) = self.kv_cache_manager.get_computed_blocks(
+                    request, max_cache_hit_length=atomic_boundary
+                )
+                atomic_boundary = self._get_mm_atomic_boundary(
+                    request, num_local_computed_tokens
+                )
+                if atomic_boundary == num_local_computed_tokens:
+                    return computed_blocks, num_local_computed_tokens, 0
 
         return (
             computed_blocks,
@@ -611,7 +654,12 @@ class Scheduler(SchedulerInterface):
 
         window_start = num_computed_tokens + shift_computed_tokens
         window_end = window_start + num_new_tokens
-        atomic_span_budget = self.max_num_scheduled_tokens
+        spec = self.vllm_config.speculative_config
+        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        atomic_span_budget = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens - draft_slots,
+        )
         long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
         if 0 < long_prefill_threshold < atomic_span_budget:
             atomic_span_budget = long_prefill_threshold
@@ -667,6 +715,8 @@ class Scheduler(SchedulerInterface):
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+        ced_decoder_budget = self.scheduler_config.max_num_batched_tokens
+        ced_decoder_tokens: dict[str, int] = {}
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -755,7 +805,10 @@ class Scheduler(SchedulerInterface):
 
             if self.ced_prefill:
                 num_new_tokens = _cap_ced_replay_chunk(
-                    request, request.num_computed_tokens, num_new_tokens
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    ced_decoder_budget,
                 )
 
             num_new_tokens = self._trim_mm_atomic_chunk(
@@ -845,6 +898,9 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            ced_decoder_budget += ced_decoder_tokens.pop(
+                                preempted_req_id, 0
+                            )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -883,6 +939,12 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if self.ced_prefill:
+                decoder_tokens = _ced_decoder_token_count(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+                ced_decoder_tokens[request_id] = decoder_tokens
+                ced_decoder_budget -= decoder_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -1204,7 +1266,10 @@ class Scheduler(SchedulerInterface):
 
                     if self.ced_prefill:
                         num_new_tokens = _cap_ced_replay_chunk(
-                            request, num_computed_tokens, num_new_tokens
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            ced_decoder_budget,
                         )
 
                     num_new_tokens = self._trim_mm_atomic_chunk(
@@ -1374,6 +1439,12 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if self.ced_prefill:
+                    decoder_tokens = _ced_decoder_token_count(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    ced_decoder_tokens[request_id] = decoder_tokens
+                    ced_decoder_budget -= decoder_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1415,6 +1486,7 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert ced_decoder_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than

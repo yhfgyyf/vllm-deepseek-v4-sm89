@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 from PIL import Image
 
@@ -14,9 +16,10 @@ from vllm.models.deepseek_v4_1.common.mm_preprocess import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
-    IMAGE_PAD_ID,
+    IMAGE_PLACEHOLDER,
     IMAGE_SENTINEL_BASE_ID,
     IMAGE_START,
+    DeepseekV4VLMultiModalProcessor,
     DeepseekV4VLProcessor,
     image_sentinel_mask,
     image_token_types,
@@ -60,15 +63,48 @@ def test_v41_image_processor_preserves_patch_and_span_layout():
     )
 
 
-def test_v41_image_sentinel_mask_includes_span_and_alignment_pad():
-    token_ids = torch.tensor(
-        [7, IMAGE_SENTINEL_BASE_ID, IMAGE_PAD_ID, IMAGE_SENTINEL_BASE_ID + 2]
-    )
+def test_v41_image_sentinel_mask_only_includes_image_token():
+    token_ids = torch.tensor([7, IMAGE_SENTINEL_BASE_ID, IMAGE_SENTINEL_BASE_ID + 1])
 
     assert torch.equal(
         image_sentinel_mask(token_ids),
-        torch.tensor([False, True, True, False]),
+        torch.tensor([False, True, False]),
     )
+
+
+def test_v41_real_image_prompt_has_no_compressor_alignment_pad():
+    config = _config()
+    image = Image.new("RGB", (20, 20), color=(255, 127, 0))
+    outputs = DeepseekV4VLProcessor(config)(images=[image])
+    assert torch.equal(outputs["llm_grid"], torch.tensor([[5, 5]]))
+    assert outputs["types"].numel() == config.vision_max_n_token
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: (
+            IMAGE_SENTINEL_BASE_ID
+            if token == IMAGE_PLACEHOLDER
+            else IMAGE_SENTINEL_BASE_ID + 1
+        )
+    )
+    processor = DeepseekV4VLMultiModalProcessor.__new__(DeepseekV4VLMultiModalProcessor)
+    processor.info = SimpleNamespace(
+        get_image_placeholder_token_id=lambda: IMAGE_SENTINEL_BASE_ID,
+        get_tokenizer=lambda: tokenizer,
+    )
+    out_mm_kwargs = {"image": [{"types": SimpleNamespace(data=outputs["types"])}]}
+    updates = processor._get_prompt_updates(None, {}, out_mm_kwargs)
+    resolved_updates = {"image": [[updates[0].resolve(0)]]}
+
+    token_ids, _, placeholders = processor._apply_token_matches_with_placeholders(
+        [IMAGE_SENTINEL_BASE_ID, 7], resolved_updates
+    )
+
+    span_len = outputs["types"].numel()
+    assert token_ids == [IMAGE_SENTINEL_BASE_ID] * span_len + [7]
+    placeholder = placeholders["image"][0]
+    assert placeholder.start_idx == 0
+    assert placeholder.tokens == [IMAGE_SENTINEL_BASE_ID] * span_len
+    assert placeholder.is_embed is not None
+    assert placeholder.is_embed.all()
 
 
 def test_v41_image_span_places_shared_vision_rows_and_delimiters():

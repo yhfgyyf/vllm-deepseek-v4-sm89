@@ -92,7 +92,7 @@ def test_deepseek_v41_config_flattens_text_and_vision_fields():
     assert config.vision_downsample_ratio == 2
     assert config.is_mm_prefix_lm is True
     assert config.mm_prefix_clamp_sliding_window is True
-    assert config.mm_prefix_span_leading_pad_modulus == 2
+    assert not hasattr(config, "mm_prefix_span_leading_pad_modulus")
 
 
 def test_deepseek_v41_text_config_does_not_enable_mm_prefix():
@@ -101,7 +101,7 @@ def test_deepseek_v41_text_config_does_not_enable_mm_prefix():
     assert config.vision_n_layers == 0
     assert config.is_mm_prefix_lm is False
     assert config.mm_prefix_clamp_sliding_window is False
-    assert config.mm_prefix_span_leading_pad_modulus == 0
+    assert not hasattr(config, "mm_prefix_span_leading_pad_modulus")
 
 
 def _load_groundtruth(filename: str) -> dict:

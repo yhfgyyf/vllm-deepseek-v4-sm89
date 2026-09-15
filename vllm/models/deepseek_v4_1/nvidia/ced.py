@@ -15,6 +15,16 @@ from torch import nn
 CED_METADATA_KEY = "__deepseek_v41_ced__"
 
 
+def get_ced_replay_capacity(hf_config: Any) -> int:
+    """Return the physical replay capacity required by the model config."""
+    vision_tokens = (
+        hf_config.vision_max_n_token
+        if getattr(hf_config, "vision_n_layers", 0) > 0
+        else 0
+    )
+    return 128 + vision_tokens
+
+
 def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
     """Fail closed for combinations not covered by the bounded-replay prototype."""
     hf = vllm_config.model_config.hf_config
@@ -78,11 +88,15 @@ class CEDRequest:
     query_len: int
     prefill_len: int
     is_prefilling: bool
+    replay_start: int | None = None
 
 
 @dataclass(frozen=True)
 class CEDPlan:
     requests: tuple[CEDRequest, ...]
+    semantic_window: int
+    cache_window: int
+    request_replay_starts: tuple[int, ...]
     decoder_requests: tuple[int, ...]
     query_start_loc: tuple[int, ...]
     positions: tuple[int, ...]
@@ -101,16 +115,27 @@ class CEDPlan:
         return len(self.positions)
 
 
-def plan_ced_step(requests: tuple[CEDRequest, ...], window: int = 128) -> CEDPlan:
+def plan_ced_step(
+    requests: tuple[CEDRequest, ...],
+    window: int = 128,
+    cache_window: int | None = None,
+) -> CEDPlan:
     """Plan on CPU request metadata, including a one-token final prefill."""
     if window < 1:
         raise ValueError("CED replay window must be positive")
+    if cache_window is None:
+        cache_window = window
+    if cache_window < 1:
+        raise ValueError("CED replay cache window must be positive")
     if len({r.slot for r in requests}) != len(requests):
         raise ValueError("CED request slots must be unique within a batch")
     active, query_start = [], [0]
-    positions, replay_starts, store_rows, store_slots = [], [], [], []
+    positions, replay_starts = [], []
+    store_rows: list[int] = []
+    store_slots: list[int] = []
     cache_rows, current_rows, use_cache = [], [], []
     output_rows, decoder_output_rows = [], []
+    request_replay_starts, replay_rows = [], []
     input_offset = 0
     offsets = []
     for batch_index, request in enumerate(requests):
@@ -119,13 +144,24 @@ def plan_ced_step(requests: tuple[CEDRequest, ...], window: int = 128) -> CEDPla
         if slot < 0 or start < 0 or count < 1:
             raise ValueError("CED requires nonnegative slots/positions and real rows")
         end = start + count
+        default_replay_start = max(0, request.prefill_len - window)
+        replay_start = request.replay_start
+        if replay_start is None:
+            replay_start = default_replay_start
+        elif not 0 <= replay_start <= default_replay_start:
+            raise ValueError("Invalid CED replay start for the full prompt")
+        request_replay_starts.append(replay_start)
+        request_replay_rows = request.prefill_len - replay_start
+        if request_replay_rows > cache_window:
+            raise ValueError("CED replay exceeds the physical cache window")
+        replay_rows.append(request_replay_rows)
         if request.is_prefilling:
             if start >= request.prefill_len or end > request.prefill_len:
                 raise ValueError("Invalid CED prefill progress")
-            first_saved = max(start, end - window)
+            first_saved = max(start, end - request_replay_rows)
             store_rows.extend(input_offset + p - start for p in range(first_saved, end))
             store_slots.extend(
-                slot * window + p % window for p in range(first_saved, end)
+                slot * cache_window + p % cache_window for p in range(first_saved, end)
             )
             if end == request.prefill_len:
                 active.append(batch_index)
@@ -139,9 +175,7 @@ def plan_ced_step(requests: tuple[CEDRequest, ...], window: int = 128) -> CEDPla
     # prefill remains a prefill semantically even though its replay is short.
     active.sort(
         key=lambda i: (
-            min(window, requests[i].prefill_len)
-            if requests[i].is_prefilling
-            else requests[i].query_len
+            replay_rows[i] if requests[i].is_prefilling else requests[i].query_len
         )
     )
     for batch_index in active:
@@ -150,11 +184,11 @@ def plan_ced_step(requests: tuple[CEDRequest, ...], window: int = 128) -> CEDPla
         end = start + count
         offset = offsets[batch_index]
         if request.is_prefilling:
-            replay_start = max(0, end - window)
+            replay_start = request_replay_starts[batch_index]
             for pos in range(replay_start, end):
                 positions.append(pos)
                 replay_starts.append(replay_start)
-                cache_rows.append(slot * window + pos % window)
+                cache_rows.append(slot * cache_window + pos % cache_window)
                 current_rows.append(0)
                 use_cache.append(True)
             output_rows.append(offset + count - 1)
@@ -170,19 +204,22 @@ def plan_ced_step(requests: tuple[CEDRequest, ...], window: int = 128) -> CEDPla
                 decoder_output_rows.append(len(positions) - 1)
         query_start.append(len(positions))
     return CEDPlan(
-        requests,
-        tuple(active),
-        tuple(query_start),
-        tuple(positions),
-        tuple(replay_starts),
-        tuple(store_rows),
-        tuple(store_slots),
-        tuple(cache_rows),
-        tuple(current_rows),
-        tuple(use_cache),
-        tuple(output_rows),
-        tuple(decoder_output_rows),
-        input_offset,
+        requests=requests,
+        semantic_window=window,
+        cache_window=cache_window,
+        request_replay_starts=tuple(request_replay_starts),
+        decoder_requests=tuple(active),
+        query_start_loc=tuple(query_start),
+        positions=tuple(positions),
+        replay_starts=tuple(replay_starts),
+        store_rows=tuple(store_rows),
+        store_slots=tuple(store_slots),
+        cache_rows=tuple(cache_rows),
+        current_rows=tuple(current_rows),
+        use_cache=tuple(use_cache),
+        output_rows=tuple(output_rows),
+        decoder_output_rows=tuple(decoder_output_rows),
+        num_input_tokens=input_offset,
     )
 
 
@@ -227,6 +264,8 @@ class CEDTailState(nn.Module):
         pre_mix: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if plan.cache_window != self.window:
+            raise ValueError("CED plan and tail cache windows do not match")
         if hidden.shape != (plan.num_input_tokens, 4, self.hidden.shape[-1]):
             raise ValueError("CED boundary residual shape does not match its plan")
         if pre_mix.shape != (plan.num_input_tokens, 4):
@@ -244,7 +283,9 @@ class CEDTailState(nn.Module):
             raise ValueError(
                 "CED state and boundary tensors must be on the same device"
             )
-        for request in plan.requests:
+        for request, replay_start in zip(
+            plan.requests, plan.request_replay_starts, strict=True
+        ):
             if request.slot >= self.max_requests:
                 raise ValueError("CED request slot exceeds the reserved capacity")
             if request.is_prefilling:
@@ -253,8 +294,9 @@ class CEDTailState(nn.Module):
                 if self.ends[request.slot] != request.start:
                     raise ValueError("CED tail missing: prefix restore requires replay")
                 end = request.start + request.query_len
-                if end == request.prefill_len and self.valid_starts[request.slot] > max(
-                    0, end - self.window
+                if (
+                    end == request.prefill_len
+                    and self.valid_starts[request.slot] > replay_start
                 ):
                     raise ValueError(
                         "CED prefix hit leaves insufficient encoder replay"
@@ -269,12 +311,14 @@ class CEDTailState(nn.Module):
             self.hidden.index_copy_(0, target, hidden.index_select(0, source))
             self.pre_mix.index_copy_(0, target, pre_mix.index_select(0, source))
             self.input_ids.index_copy_(0, target, input_ids[source].to(torch.int64))
-        for request in plan.requests:
+        for request, replay_start in zip(
+            plan.requests, plan.request_replay_starts, strict=True
+        ):
             if request.is_prefilling:
                 self.ends[request.slot] = request.start + request.query_len
                 self.valid_starts[request.slot] = max(
                     self.valid_starts[request.slot],
-                    self.ends[request.slot] - self.window,
+                    self.ends[request.slot] - (request.prefill_len - replay_start),
                 )
         cached, current = indices(plan.cache_rows), indices(plan.current_rows)
         mask = torch.tensor(plan.use_cache, dtype=torch.bool, device=device)
@@ -337,6 +381,7 @@ def clamp_replay_swa(
 ) -> None:
     """Exclude unbuilt SWA keys to the left of a decoder replay window."""
     decode = metadata.num_decode_tokens
+    mm_prefix_query_ranges = getattr(metadata, "mm_prefix_query_ranges", None)
     for slots, lengths, rows in (
         (metadata.decode_swa_indices, metadata.decode_swa_lens, slice(0, decode)),
         (
@@ -350,6 +395,11 @@ def clamp_replay_swa(
         view = slots[:, 0] if slots.ndim == 3 else slots
         pos = positions[rows]
         first = (pos - window + 1).clamp_min(0)
+        if mm_prefix_query_ranges is not None:
+            spans = mm_prefix_query_ranges[rows].to(device=pos.device, dtype=pos.dtype)
+            span_start, span_end = spans.unbind(dim=1)
+            in_span = (span_start >= 0) & (span_start <= pos) & (pos <= span_end)
+            first = torch.where(in_span, torch.minimum(first, span_start), first)
         logical_keys = first[:, None] + torch.arange(view.shape[1], device=pos.device)
         view.masked_fill_(logical_keys < replay_starts[rows, None], -1)
         if lengths is not None:

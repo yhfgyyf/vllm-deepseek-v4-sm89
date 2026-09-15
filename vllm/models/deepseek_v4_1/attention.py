@@ -95,11 +95,16 @@ class DeepseekV41SWACache(DeepseekV4SWACache):
     """V4.1 post-RoPE FP8/group32 SWA cache with 528-byte rows."""
 
     def __init__(
-        self, *args, allow_prefix_caching: bool = True, **kwargs
+        self,
+        *args,
+        allow_prefix_caching: bool = True,
+        extra_retained_tokens: int = 0,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.block_size = 32
         self.allow_prefix_caching = allow_prefix_caching
+        self.extra_retained_tokens = extra_retained_tokens
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return SlidingWindowMLASpec(
@@ -114,6 +119,7 @@ class DeepseekV41SWACache(DeepseekV4SWACache):
             model_version="deepseek_v4_1",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
             allow_prefix_caching=getattr(self, "allow_prefix_caching", True),
+            extra_retained_tokens=getattr(self, "extra_retained_tokens", 0),
         )
 
 
@@ -447,6 +453,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             backend_cls=self.swa_backend_cls,
             allow_prefix_caching=(
                 not getattr(config, "ced_prefill", False) or layer_id < 20
+            ),
+            extra_retained_tokens=(
+                self.max_image_tokens
+                if getattr(config, "ced_prefill", False) and 20 <= layer_id < 40
+                else 0
             ),
         )
 

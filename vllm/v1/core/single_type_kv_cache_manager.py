@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import ClassVar
 
 from vllm.logger import init_logger
+from vllm.multimodal.utils import get_mm_safe_replay_start
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -477,10 +478,18 @@ class SingleTypeKVCacheManager(ABC):
         # ``get_computed_blocks``) and any detected shared-prefix junction.
         reachable_boundaries = [request.num_prompt_tokens - 1]
         if self.prefix_replay_window:
-            replay_boundary = max(
-                0, request.num_prompt_tokens - self.prefix_replay_window
+            replay_boundary = get_mm_safe_replay_start(
+                request.num_prompt_tokens,
+                self.prefix_replay_window,
+                (
+                    (
+                        feature.mm_position.offset,
+                        feature.mm_position.offset + feature.mm_position.length - 1,
+                    )
+                    for feature in request.mm_features
+                ),
+                block_size=self.scheduler_block_size,
             )
-            replay_boundary -= replay_boundary % self.scheduler_block_size
             reachable_boundaries.append(replay_boundary)
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)

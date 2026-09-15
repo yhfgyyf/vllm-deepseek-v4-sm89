@@ -4,7 +4,7 @@
 import bisect
 import mimetypes
 from collections import defaultdict
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from dataclasses import replace
 from itertools import groupby
 from typing import TYPE_CHECKING, Any
@@ -142,6 +142,22 @@ def get_mm_features_in_window(
         key=lambda f: f.mm_position.offset,
     )
     return lo, hi
+
+
+def get_mm_safe_replay_start(
+    prompt_len: int,
+    window: int,
+    mm_ranges: Iterable[tuple[int, int]],
+    *,
+    block_size: int = 1,
+) -> int:
+    """Keep complete bidirectional spans when replaying a prompt suffix."""
+    replay_start = max(0, prompt_len - window)
+    replay_start -= replay_start % block_size
+    for start, end in sorted(mm_ranges, reverse=True):
+        if start < replay_start <= end:
+            replay_start = start - start % block_size
+    return replay_start
 
 
 def argsort_mm_positions(

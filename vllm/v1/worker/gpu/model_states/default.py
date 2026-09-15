@@ -218,6 +218,16 @@ class DefaultModelState(ModelState):
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                mm_prefix_clamp_sliding_window=getattr(
+                    self.model,
+                    "mm_prefix_clamp_sliding_window",
+                    False,
+                )
+                or getattr(
+                    self.model_config.hf_text_config,
+                    "mm_prefix_clamp_sliding_window",
+                    False,
+                ),
                 prompt_token_ids_by_req=self._mm_prefix_prompt_token_ids,
                 start_token_id=getattr(
                     self.model_config.hf_config,
