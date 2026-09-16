@@ -91,6 +91,7 @@ jobs:
           .venv/bin/python -I docker/vision11/run_logged.py evidence/build.log -- \
             docker buildx build --builder default --platform linux/amd64 \
             --target runtime --build-arg UV_NO_CACHE=true --provenance=false \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com/ubuntu \
             --load --tag "$IMAGE" --iidfile evidence/image.iid \
             --metadata-file evidence/build-metadata.json --progress plain \
             "$RUNNER_TEMP/vision11-context"
