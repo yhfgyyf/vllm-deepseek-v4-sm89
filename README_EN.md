@@ -26,6 +26,8 @@ FlashInfer `0.6.18`. Validated configurations include
 
 ### 2026-09-16
 
+- Published the public GHCR `vision11` image with paired FlashInfer `vision2`,
+  adaptive verification, and CED image-input support; see Section 2.2.
 - Updated the current prebuilt-wheel instructions to the `vision11` vLLM
   wheel with adaptive verification and CED image-input support; paired
   FlashInfer `vision2` is unchanged.
@@ -112,10 +114,11 @@ shape is compiled once and then reused from the JIT cache.
 
 ---
 
-## 2. Quick install (prebuilt wheels)
+## 2. Quick install (prebuilt wheels / container)
 
 > **The DSpark and CED commands below require the current `vision11` vLLM
-> wheel or this fork's current `main` source.** This version includes adaptive
+> wheel, the GHCR `vision11` image in Section 2.2, or this fork's current
+> `main` source.** This version includes adaptive
 > verification and CED image-input support. The paired FlashInfer `vision2`
 > wheel does not need replacing.
 
@@ -143,10 +146,10 @@ native binaries. The release tag's source archives were not moved.
 Optionally use `--index-url` for a PyPI mirror; the wheel still downloads
 from the release URL above.
 
-The existing `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
+The older ACR `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
 this adaptive adaptation. It cannot directly use the adaptive-enabled DSpark
-commands below. Use `vision11` or current source; historical Docker
-configurations must keep adaptive disabled.
+commands below. Use the `vision11` wheel, GHCR image, or current source;
+the older ACR `vision7` configuration must keep adaptive disabled.
 
 ### 2.1 Install current main source (alternative to the wheel)
 
@@ -181,6 +184,30 @@ The final path must point to `vllm/__init__.py` in this source checkout, not
 the old wheel's `site-packages/vllm`. Launch with the `vllm` command from this
 `.venv`. For an existing checkout, synchronize this fork's `main` before
 running the installation commands above.
+
+### 2.2 Public GHCR image (alternative to wheels / source installation)
+
+The `linux/amd64` image includes vLLM `vision11`, paired FlashInfer `vision2`,
+adaptive verification, and CED image-input support. It is public and can be
+pulled without signing in:
+
+```bash
+docker pull ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
+
+# Pin the published manifest for reproducible pulls.
+docker pull ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89@sha256:af58a59d32d65fbed1785f265bc9b9969a1010b8e1c6a588087adf796021911e
+```
+
+[GHCR package](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
+· [Build and validation evidence](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/actions/runs/35093489937).
+The image records source commit `678d8f531e5e498e4060b21df254d27467e0cef9`
+and 197 pinned package versions. Checks passed for 11,177 payload files,
+cuRAND header compilation/linking, CPU image/video decoding, and cold SM89 JIT.
+Anonymous manifest/config access, HEAD checks for all 15 layers, and a
+hash-verified download of one small layer passed; a complete image re-download
+was not performed. The cloud image has not had a physical-GPU/full-model run;
+these checks do not establish
+fresh SM89 or SM120 end-to-end serving validation.
 
 ---
 
@@ -244,8 +271,8 @@ doubled relative to CED off, but the gain depends on the prompt, length, and
 runtime configuration. It is not guaranteed to be output-equivalent to the
 non-CED path; validate quality for the target workload.
 
-The current source and `vision11` wheel add a CED image-input path on top of
-the PR #112 frontend guards. It handles every image span in single-image and
+The current source, `vision11` wheel, and GHCR image include a CED image-input
+path on top of PR #112 frontend guards, handling all spans in single-image and
 multi-image requests. When an image overlaps the final 128 query tokens, the
 replay boundary expands to preserve the complete image instead of disabling
 CED; DSpark and prefix caching may remain enabled. Set a limit such as
@@ -266,9 +293,9 @@ was correct.
 
 All DSpark launch examples below explicitly enable adaptive with FULL graphs.
 This is the README example default, not a change to the generic
-`SpeculativeConfig` default. Install `vision11` or current `main` source and
-use a DSpark checkpoint with a confidence head. Retain the model path, TP/EP,
-FP8 KV, Engram, Model Runner V2, and appropriate CUDA toolchain settings.
+`SpeculativeConfig` default. Use the `vision11` wheel, GHCR image, or current
+`main` source and a DSpark checkpoint with a confidence head. Retain the model
+path, TP/EP, FP8 KV, Engram, Model Runner V2, and CUDA toolchain settings.
 
 | Parameter | Previous fixed DSpark 5 | Current adaptive default |
 |---|---|---|
@@ -357,10 +384,10 @@ input, DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
 loading both require sufficient host memory, so do not size host memory from
 the GPU weight footprint alone.
 
-Install the **vision11 wheel** from Section 2 or current `main` source with
-CED image support from Section 2.1. The old Docker image cannot serve this
-example's CED image path. Configure the SM89 toolchain and launch in that
-environment:
+Use the **vision11 wheel** from Section 2, current `main` source from
+Section 2.1, or the GHCR image from Section 2.2. The older ACR `vision7` Docker
+image cannot serve this example's CED image path. Configure the SM89 toolchain
+and launch in that environment:
 
 ```bash
 source /path/to/.venv/bin/activate

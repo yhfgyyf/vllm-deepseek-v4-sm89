@@ -24,6 +24,8 @@
 
 ### 2026-09-16
 
+- 发布公开的 GHCR `vision11` Docker 镜像，支持免登录拉取，包含完整 CUDA JIT
+  开发依赖和 CED 图片支持。
 - 当前安装入口更新为包含 adaptive verification 和 CED 图片支持的 `vision11`
   vLLM wheel，配套 FlashInfer `vision2` 保持不变。
 - 增加 8× RTX 4090 48GB 的 DeepSeek-V4.1-Flash 启动示例：上下文长度 `auto`、
@@ -115,8 +117,9 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
-> **下文命令使用 `vision11` vLLM wheel 或本仓库当前 `main` 源码**，包含
-> adaptive verification 和 CED 图片支持。配套 FlashInfer `vision2` 保持不变。
+> **下文命令使用 `vision11` vLLM wheel、第 2.3 节的 GHCR 镜像，或本仓库当前
+> `main` 源码**，包含 adaptive verification 和 CED 图片支持。
+> 配套 FlashInfer `vision2` 保持不变。
 
 最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，
 当前使用其中的 `vision11` vLLM 资产；配套 FlashInfer `vision2` 和依赖下载地址不变。
@@ -170,11 +173,36 @@ uv pip install --no-build-isolation -e . --torch-backend=cu130
 `site-packages/vllm`。后续启动使用此 `.venv` 中的 `vllm` 命令；更新已有 checkout
 时先同步本仓库 `main`，再执行上述安装。
 
-### 2.3 Docker 镜像（阿里云上海 ACR）
+### 2.3 Docker 镜像（GHCR，公开免登录）
 
-> **注意：** 以下现有 Docker 镜像不包含 DeepSeek-V4.1-Flash 或本次 adaptive
-> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用 `vision11`
-> wheel 或上述源码安装流程；旧镜像的历史配置须关闭 adaptive。
+[GHCR 镜像页面](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
+提供当前 `vision11` 镜像，无需 `docker login` 即可拉取：
+
+```bash
+docker pull \
+  ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
+```
+
+镜像平台为 `linux/amd64`，包含 `vision11` vLLM、配套 FlashInfer `vision2`、
+PyTorch `2.13.0+cu130` 和 CUDA 13.0 JIT 工具链，支持当前 adaptive verification
+和 CED 图片代码路径。入口为 `vllm serve`。
+
+固定此版本时可将上述 `:tag` 替换为 `@sha256:...`，完整 manifest digest 为：
+
+```text
+sha256:af58a59d32d65fbed1785f265bc9b9969a1010b8e1c6a588087adf796021911e
+```
+
+[构建与校验记录](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/actions/runs/35093489937)：
+已核对 11,177 个 vLLM/FlashInfer 文件，并通过 CUDA 头文件与编译链接、
+图片/视频解码、SM89 冷缓存 JIT 检查；远端镜像及所有 15 个层已验证匿名访问。
+这次云端构建未进行真机 GPU 或整模型推理复测。
+
+### 2.4 历史 Docker 镜像（阿里云上海 ACR，vision7）
+
+> **注意：** 以下历史 `vision7` 镜像不包含 DeepSeek-V4.1-Flash 或本次 adaptive
+> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用上面的 GHCR
+> `vision11` 镜像、wheel 或源码安装流程；旧镜像的历史配置须关闭 adaptive。
 
 镜像地址：
 
@@ -284,14 +312,14 @@ chunk，扩展回放也必须满足 batch token 预算。视觉模型每卡预�
 DSpark，完成了单并发 8K / 32K / 128K 的图片与工具调用请求。输出质量仍需按
 实际任务评估，请求完成不等同于所有图片答案正确。
 
-`vision11` wheel 已包含 CED 图片支持，使用图片时可保留
+`vision11` wheel 和 GHCR 镜像已包含 CED 图片支持，使用图片时可保留
 `--hf-overrides '{"ced_prefill":true}'` 和 DSpark/adaptive。
 
 ### 3.1 DSpark 默认开启 adaptive verification
 
 本文所有 DSpark 启动示例均显式开启 adaptive，并配置 FULL；这是 README
-示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。先安装 `vision11`
-wheel 或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
+示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。使用 `vision11`
+wheel、GHCR 镜像或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
 保留模型路径、TP/EP、FP8 KV、Engram、Model Runner V2 和相应 CUDA 工具链设置。
 
 | 参数 | 旧固定 DSpark 5 | 当前默认 adaptive |
@@ -370,7 +398,8 @@ stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接�
 内存，不能只按 GPU 权重大小估算整机内存需求。
 
 先按第 2.1 节安装 **vision11 wheel**，或按第 2.2 节安装包含 CED 图片支持的
-当前 `main` 源码；旧 Docker 镜像不能用于本示例的 CED 图片路径。在该环境中启动：
+当前 `main` 源码，也可使用第 2.3 节的 GHCR `vision11` 镜像；历史 ACR `vision7`
+镜像不能用于本示例的 CED 图片路径。在该环境中启动：
 
 ```bash
 source /path/to/.venv/bin/activate
