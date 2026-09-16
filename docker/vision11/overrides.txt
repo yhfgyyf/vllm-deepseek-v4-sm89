@@ -1,0 +1,1 @@
+flashinfer-python @ file:///wheels/flashinfer_python-0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213-py3-none-any.whl

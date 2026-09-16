@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+name: Publish verified Vision11 image
+
+on:
+  push:
+    branches: [ci/ghcr-vision11-20260916]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vision11-ghcr-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'yhfgyyf/vllm-deepseek-v4-sm89' &&
+      github.actor == 'yhfgyyf' &&
+      github.ref == 'refs/heads/ci/ghcr-vision11-20260916' &&
+      !github.event.deleted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
+      SOURCE_REVISION: 678d8f531e5e498e4060b21df254d27467e0cef9
+      UV_DEFAULT_INDEX: https://mirrors.aliyun.com/pypi/simple
+      UV_NO_CACHE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check dedicated runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          printf 'DOCKER_CONFIG=%s/vision11-registry-auth\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir evidence
+          df -h . /var/lib/docker | tee evidence/disk-before.txt
+          docker version | tee evidence/docker-version.txt
+          docker buildx version | tee evidence/buildx-version.txt
+          docker_root=$(docker info --format '{{.DockerRootDir}}')
+          printf '%s\n' "$docker_root" | tee evidence/docker-root.txt
+          available=$(df -B1 --output=avail "$docker_root" | tail -n 1 | tr -d ' ')
+          if (( available < 40 * 1024 * 1024 * 1024 )); then
+            # Only unused SDKs on this new, dedicated hosted VM are removable.
+            for sdk in /usr/local/lib/android /usr/share/dotnet; do
+              if [[ -d "$sdk" && ! -L "$sdk" ]]; then
+                test "$(readlink -f "$sdk")" = "$sdk"
+                sudo du -sh "$sdk"
+                sudo rm -rf -- "$sdk"
+              fi
+            done
+          fi
+          df -h . /var/lib/docker | tee evidence/disk-after.txt
+          available=$(df -B1 --output=avail "$docker_root" | tail -n 1 | tr -d ' ')
+          if (( available < 35 * 1024 * 1024 * 1024 )); then
+            echo 'At least 35 GiB free is required; refusing an undersized build.'
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: 0.10.7
+          enable-cache: false
+
+      - name: Verify source and stage exact release wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$SOURCE_REVISION"
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python \
+            --constraint docker/vision11/constraints.txt regex pybase64
+          .venv/bin/python -I docker/vision11/stage_context.py \
+            --output "$RUNNER_TEMP/vision11-context" | tee evidence/context.json
+
+      - name: Build complete runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python -I docker/vision11/run_logged.py evidence/build.log -- \
+            docker buildx build --builder default --platform linux/amd64 \
+            --target runtime --build-arg UV_NO_CACHE=true --provenance=false \
+            --load --tag "$IMAGE" --iidfile evidence/image.iid \
+            --metadata-file evidence/build-metadata.json --progress plain \
+            "$RUNNER_TEMP/vision11-context"
+
+      - name: Check final image and cold SM89 compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python -I docker/vision11/verify_ci_image.py --evidence evidence
+
+      - name: Authenticate only for the verified image publication
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$DOCKER_CONFIG"
+          printf '%s' "$GHCR_TOKEN" | \
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish absent tag and check remote identity
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          .venv/bin/python -I docker/vision11/publish_ci_image.py --evidence evidence
+
+      - name: Remove task-scoped registry credentials
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io
+
+      - name: Retain verification evidence only
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vision11-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

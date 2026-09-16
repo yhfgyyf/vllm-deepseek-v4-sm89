@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!.dockerignore
+!LICENSE
+!constraints.txt
+!overrides.txt
+!manifest.json
+!verify_image.py
+!cold_jit_smoke.py
+!wheels/
+!wheels/*.whl
