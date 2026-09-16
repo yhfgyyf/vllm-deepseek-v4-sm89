@@ -176,27 +176,28 @@ uv pip install --no-build-isolation -e . --torch-backend=cu130
 ### 2.3 Docker 镜像（GHCR，公开免登录）
 
 [GHCR 镜像页面](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
-提供当前 `vision11` 镜像，无需 `docker login` 即可拉取：
+
+支持模型：DeepSeek-V4.1-Flash、DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp、
+GLM-5.3-Flash。
+
+拉取镜像（无需登录）：
 
 ```bash
 docker pull \
   ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
 ```
 
-镜像平台为 `linux/amd64`，包含 `vision11` vLLM、配套 FlashInfer `vision2`、
-PyTorch `2.13.0+cu130` 和 CUDA 13.0 JIT 工具链，支持当前 adaptive verification
-和 CED 图片代码路径。入口为 `vllm serve`。
+启动模板：替换本地模型路径，并在末尾追加后文对应模型的启动参数；
+环境变量通过 `docker run -e` 传入，服务地址使用 `--host 0.0.0.0`。
 
-固定此版本时可将上述 `:tag` 替换为 `@sha256:...`，完整 manifest digest 为：
-
-```text
-sha256:af58a59d32d65fbed1785f265bc9b9969a1010b8e1c6a588087adf796021911e
+```bash
+docker run --rm --gpus all --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130 \
+  /models/model-directory \
+  --host 0.0.0.0 --port 8000
 ```
-
-[构建与校验记录](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/actions/runs/35093489937)：
-已核对 11,177 个 vLLM/FlashInfer 文件，并通过 CUDA 头文件与编译链接、
-图片/视频解码、SM89 冷缓存 JIT 检查；远端镜像及所有 15 个层已验证匿名访问。
-这次云端构建未进行真机 GPU 或整模型推理复测。
 
 ### 2.4 历史 Docker 镜像（阿里云上海 ACR，vision7）
 

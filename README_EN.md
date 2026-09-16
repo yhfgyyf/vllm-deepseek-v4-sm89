@@ -185,29 +185,31 @@ the old wheel's `site-packages/vllm`. Launch with the `vllm` command from this
 `.venv`. For an existing checkout, synchronize this fork's `main` before
 running the installation commands above.
 
-### 2.2 Public GHCR image (alternative to wheels / source installation)
+### 2.2 Docker image (GHCR, no login required)
 
-The `linux/amd64` image includes vLLM `vision11`, paired FlashInfer `vision2`,
-adaptive verification, and CED image-input support. It is public and can be
-pulled without signing in:
+[GHCR image](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
+
+Supported models: DeepSeek-V4.1-Flash, DeepSeek-V4-Flash,
+DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash.
+
+Pull the image (no login required):
 
 ```bash
 docker pull ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
-
-# Pin the published manifest for reproducible pulls.
-docker pull ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89@sha256:af58a59d32d65fbed1785f265bc9b9969a1010b8e1c6a588087adf796021911e
 ```
 
-[GHCR package](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
-· [Build and validation evidence](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/actions/runs/35093489937).
-The image records source commit `678d8f531e5e498e4060b21df254d27467e0cef9`
-and 197 pinned package versions. Checks passed for 11,177 payload files,
-cuRAND header compilation/linking, CPU image/video decoding, and cold SM89 JIT.
-Anonymous manifest/config access, HEAD checks for all 15 layers, and a
-hash-verified download of one small layer passed; a complete image re-download
-was not performed. The cloud image has not had a physical-GPU/full-model run;
-these checks do not establish
-fresh SM89 or SM120 end-to-end serving validation.
+Launch template: replace the local model paths and append the corresponding
+model's launch arguments from the sections below. Pass environment variables
+with `docker run -e` and use `--host 0.0.0.0` for the service address.
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130 \
+  /models/model-directory \
+  --host 0.0.0.0 --port 8000
+```
 
 ---
 
