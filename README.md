@@ -22,18 +22,24 @@
 
 ## Changelog
 
+### 2026-09-16
+
+- 当前安装入口更新为包含 adaptive verification 和 CED 图片支持的 `vision11`
+  vLLM wheel，配套 FlashInfer `vision2` 保持不变。
+- 增加 8× RTX 4090 48GB 的 DeepSeek-V4.1-Flash 启动示例：上下文长度 `auto`、
+  最多 4 条序列、显存利用率 `0.98`、batch token 预算 `4096`（可改为 `2048`）。
+
 ### 2026-09-12
 
 - 在当前 `main` 源码中增加 DeepSeek-V4 / V4.1 的 SM89 / SM120 adaptive
   verification 适配，覆盖 device-ragged metadata、padding 和 FULL graph 回放。
-  SM120 已完成算子及 V4.1 整模型验证；SM89 adaptive 实卡验证仍待完成。
-  最新 Release 中的 vLLM wheel 已替换为包含该适配的 `vision10`，DSpark 示例默认开启
+  SM120 已完成算子及 V4.1 整模型验证。
+  当时 Release 中的 vLLM wheel 更新为包含该适配的 `vision10`，DSpark 示例默认开启
   adaptive verification，并显式使用 FULL graph；`vision9` 及更早的 vLLM
   wheel 不包含该适配。配套 FlashInfer `vision2` 保持不变。
 - 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
   支持，发布 SM89+SM120 `vision9` wheel。
-- 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证；SM89 本轮仅完成
-  离线编译验证，未在 SM89 硬件上执行内核数值测试或完整模型服务验证。
+- 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证。
 - 已测长文本 prefill 中，按输入 token 数 / TTFT 估算的 prefill 代理指标相对
   关闭 CED 时约翻倍；实际收益取决于 prompt 和运行配置。
 
@@ -96,7 +102,7 @@
 | Triton | 3.7.1（`ptxas-blackwell` CUDA 13.1） |
 | Transformers | 5.16.1 |
 | FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision10.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision11.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -109,12 +115,11 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
-> **Adaptive verification 需要本次 `vision10` vLLM wheel 或本仓库当前
-> `main` 源码。** `vision9` 及更早的 vLLM whl 包不包含该适配，不能直接使用
-> 下文默认开启 adaptive 的 DSpark 命令。配套 FlashInfer `vision2` 无需更换。
+> **下文命令使用 `vision11` vLLM wheel 或本仓库当前 `main` 源码**，包含
+> adaptive verification 和 CED 图片支持。配套 FlashInfer `vision2` 保持不变。
 
-最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，但其中的
-vLLM 资产已更新为 `vision10`；配套 FlashInfer `vision2` 和依赖下载地址不变。
+最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，
+当前使用其中的 `vision11` vLLM 资产；配套 FlashInfer `vision2` 和依赖下载地址不变。
 在 Python 3.12 虚拟环境中，直接通过下面的确切 wheel URL 安装：
 
 ```bash
@@ -122,14 +127,14 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 uv pip install --torch-backend=cu130 \
-  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision10.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=459a9638502de1cce8a1d1043bbe89e290afaa034a82008da92285bd1c9b72e5' \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision11.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e1c8313e6a8b58ec3feecaffb37fc3fda8e61ba4ecff624853b24216b7eb97ed' \
   'transformers==5.16.1' 'triton==3.7.1'
 ```
 
 `uv` 会校验 URL 中的 SHA256，并自动安装配套 FlashInfer `vision2`，
 无需单独下载或安装 FlashInfer。已激活兼容环境时，只需执行 `uv pip install`。
-该 wheel 基于源码提交 `1cf1104417873d65e4ad353ea904f602d16204f2` 构建，
-复用已审计且未改动的 Vision9 原生二进制；Release tag 对应的源码归档未移动。
+该 wheel 的 Python 源码对应提交 `86d35745c8797c9d2524877fb235084a6a5f5a7d`，
+复用已审计的 SM89 / SM120 原生二进制；Release tag 对应的源码归档未移动。
 
 PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Release URL 下载。
 
@@ -168,7 +173,7 @@ uv pip install --no-build-isolation -e . --torch-backend=cu130
 ### 2.3 Docker 镜像（阿里云上海 ACR）
 
 > **注意：** 以下现有 Docker 镜像不包含 DeepSeek-V4.1-Flash 或本次 adaptive
-> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用 `vision10`
+> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用 `vision11`
 > wheel 或上述源码安装流程；旧镜像的历史配置须关闭 adaptive。
 
 镜像地址：
@@ -209,7 +214,7 @@ docker run --rm --gpus all --ipc=host \
 
 ---
 
-## 3. DeepSeek-V4.1-Flash 启动命令（SM120）
+## 3. DeepSeek-V4.1-Flash 启动命令
 
 以下为 4× RTX PRO 6000 96GB 上验证过的文本服务配置。它使用 TP=4、EP、
 FP8 KV、Engram CPU offload、DSpark 5（adaptive）和实验性 CED prefill；CPU offload
@@ -274,22 +279,18 @@ chunk，扩展回放也必须满足 batch token 预算。视觉模型每卡预�
 `128 + vision_max_n_token` 行回放状态，增加 TP 不会按比例减少这部分显存。
 非图片模态、prompt embeddings 和 prompt logprobs 仍在进入引擎前被拒绝。
 
-图片路径已完成 CPU 回归和 SM120 单卡小型权重的 GPU 数值测试，包括 DSpark
-context 对接与模拟 prefix hit；真实缓存管理器的图片命中和边界回退另有 CPU
-测试。双图的输入和请求状态有 CPU 覆盖，但完整 DSpark 接受/拒绝闭环、多图
-整模型质量及 TP4/TP8 图片推理尚未验证，不能据此承诺图片吞吐或准确率。
+图片路径已有 CPU 回归、SM120 单卡小型权重 GPU 数值测试，以及真实缓存管理器
+的图片命中和边界回退测试。2026-09-16 在 8× RTX 4090 48GB 上，保留 CED 和
+DSpark，完成了单并发 8K / 32K / 128K 的图片与工具调用请求。输出质量仍需按
+实际任务评估，请求完成不等同于所有图片答案正确。
 
-已发布的 vision10 wheel 不包含 PR #112 前端保护或本次 CED 图片支持。继续使用
-该 wheel 处理图片时，请移除 `--hf-overrides '{"ced_prefill":true}'` 或改成
-`'{"ced_prefill":false}'`；无需因此关闭 DSpark/adaptive。
-
-此前 SM120 完整模型服务验证针对既有文本配置；SM89 本轮仅完成离线编译验证，
-未在 SM89 硬件上执行内核数值测试或完整模型服务验证。
+`vision11` wheel 已包含 CED 图片支持，使用图片时可保留
+`--hf-overrides '{"ced_prefill":true}'` 和 DSpark/adaptive。
 
 ### 3.1 DSpark 默认开启 adaptive verification
 
 本文所有 DSpark 启动示例均显式开启 adaptive，并配置 FULL；这是 README
-示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。先安装 `vision10`
+示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。先安装 `vision11`
 wheel 或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
 保留模型路径、TP/EP、FP8 KV、Engram、Model Runner V2 和相应 CUDA 工具链设置。
 
@@ -316,9 +317,9 @@ FULL；显式 FULL 不表示所有 CED prefill 都在 graph 中执行。
 若要恢复固定草稿验证，将 `enable_adaptive_verification` 改为 `false`；可保留
 FULL 配置。各模型原有的草稿数量和采样方式不因开启 adaptive 而改变。
 
-本次在 SM120 上验证了 V4 / V4.1 算子、mixed prefill、padding、零草稿预算和
-FULL 回放，并完成 V4.1 整模型 serving；不将这些结果扩展为 SM89 实卡验证或
-完整模型精度无损保证。
+SM120 已覆盖 V4 / V4.1 算子、mixed prefill、padding、零草稿预算和 FULL 回放，
+并完成 V4.1 整模型 serving；SM89 的 V4.1 图片与工具调用记录见本节和第 8 节。
+这些运行结果不构成完整模型精度无损保证。
 
 ### 3.2 DeepSeek-V4.1-Flash 吞吐参考
 
@@ -333,8 +334,8 @@ TP4/EP、FP8 KV、Engram CPU offload、CED + DSpark5 adaptive、FULL 配置下�
 服务已预热，随机输入、temperature=0、ignore-eos，200/200 请求成功，
 前缀缓存命中为 0。吞吐为完整测试周期的总输出 tokens / 总耗时，包含
 prefill 和 decode，不是单请求或纯 decode 速度。此为一次测量，来自已应用
-本次 adaptive 补丁的 Vision9 / FlashInfer Vision2 环境，非新 Vision10 wheel
-的重新压测；无同负载基线，不据此声称 adaptive 加速比例或质量无损。
+本次 adaptive 补丁的 Vision9 / FlashInfer Vision2 环境，仅作该环境的吞吐参考；
+无同负载基线，不据此声称 adaptive 加速比例或质量无损。
 
 同一已打补丁环境中的**单并发（C1）**结果如下。每种输入长度先预热 1 次，
 再测 4 次正式请求；每次输出均为 512 tokens，12 次正式请求全部成功，
@@ -361,10 +362,70 @@ prefill 和 decode，不是单请求或纯 decode 速度。此为一次测量，
 stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接受率或最终返回
 客户端的 accepted-token 数。随机输入的这些结果不代表质量评估。
 
+### 3.3 SM89：8× RTX 4090 48GB
+
+以下是 **8 张 48GB 版 RTX 4090** 的启动配置，不适用于普通 24GB 版。
+保留 TP8/EP、FP8 KV、Engram CPU offload、CED 图片输入、DSpark 5 adaptive
+和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
+内存，不能只按 GPU 权重大小估算整机内存需求。
+
+先按第 2.1 节安装 **vision11 wheel**，或按第 2.2 节安装包含 CED 图片支持的
+当前 `main` 源码；旧 Docker 镜像不能用于本示例的 CED 图片路径。在该环境中启动：
+
+```bash
+source /path/to/.venv/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export FLASHINFER_CUDA_ARCH_LIST=8.9
+export TORCH_CUDA_ARCH_LIST=8.9
+export VLLM_USE_V2_MODEL_RUNNER=1
+unset TRITON_PTXAS_BLACKWELL_PATH
+
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v4.1-flash \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --kv-cache-dtype fp8 \
+  --block-size 128 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.98 \
+  --enable-prefix-caching \
+  --engram-config '{"cpu_offload":true}' \
+  --load-format safetensors \
+  --safetensors-load-strategy prefetch \
+  --safetensors-prefetch-num-threads 2 \
+  --limit-mm-per-prompt '{"image":2}' \
+  --tokenizer-mode deepseek_v41 \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --hf-overrides '{"ced_prefill":true}' \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
+```
+
+- 若需要降低 prefill 峰值显存，将 `--max-num-batched-tokens 4096` 替换为
+  `--max-num-batched-tokens 2048`，其余参数不变。此调整也会影响工作区、图捕获
+  阶段显存和长输入分块数量，不能假设显存或吞吐按同一比例变化。
+- **不设置显式 KV 字节预算**，由 `gpu-memory-utilization=0.98` 自动分配 KV。
+  当前实现会先扣除常驻占用、临时峰值余量和 CUDA Graph 估算；剩余 2% 不是
+  Graph 专用区，也不是运行时显存硬上限。
+- `max-model-len=auto` 可能因容量不足而下调。若目标是 1M 上下文，确认启动日志
+  最终长度为 `1048576`，且实际输入（含图片 tokens）与输出之和不超过该长度。
+  `max-num-seqs=4` 是调度上限，不保证能同时容纳 4 条各 1M 的请求。
+- 部署时按实际长请求和目标混合并发检查 OOM、KV 抢占重算、时延及输出质量。
+
 ## 4. DeepSeek-V4-Flash 启动命令
 
-以下命令已默认开启 adaptive。V4 本轮验证限于 SM120 算子和 FULL 回放，
-未重新执行 V4 整模型 serving；SM89 adaptive 实卡验证仍待完成。
+以下 DSpark 命令默认开启 adaptive verification，并显式使用 FULL CUDA Graph。
 
 ### 4.1 SM89：4× RTX 4090 48GB
 
@@ -394,8 +455,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --port 8000
 ```
 
-原固定 DSpark 配置曾验证 8K、32K、128K 输入、512 输出及 4 并发 8K 输入；
-这些历史结果不代表新增 adaptive 参数后的 SM89 实卡验证。
+历史固定 DSpark 配置曾验证 8K、32K、128K 输入、512 输出及 4 并发 8K 输入。
 
 ### 4.2 SM120：4× RTX PRO 6000 96GB
 
@@ -428,8 +488,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ## 5. DeepSeek-V4-Flash-Vision-Exp 启动命令
 
-以下 DSpark 示例也默认开启 adaptive；本轮未进行 Vision-Exp 多模态 adaptive
-整模型回归，部署前需验证实际输入，历史多模态结果不作为本次验证证据。
+以下 DSpark 示例默认开启 adaptive verification，并显式使用 FULL CUDA Graph。
 
 4× RTX 4090 48GB 可以运行 DeepSeek-V4-Flash-Vision-Exp，但不建议启用
 DSpark：目标模型和 draft model 会占用大部分显存，剩余空间不足以提供实用的
@@ -490,8 +549,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
-历史 SM89 实机回归使用 4× RTX 4090 48GB，且未启用 DSpark；上述 8 卡
-adaptive 命令不属于已完成的 SM89 实机验证范围。
+历史 SM89 实机回归使用 4× RTX 4090 48GB，且未启用 DSpark。
 
 ## 6. GLM-5.3-Flash 启动命令
 
@@ -609,8 +667,8 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
   与 GLM-5.3-Flash
   在 SM120 上均通过服务启动。
 - DeepSeek-V4.1-Flash 在 SM120 上通过文本服务、工具调用、DSpark 和实验性
-  CED prefill 验证；SM89 本轮仅完成离线编译验证，未在 SM89 硬件上执行
-  内核数值测试或完整模型服务验证。
+  CED prefill 验证；在 8× RTX 4090 48GB（SM89）上完成保留 CED + DSpark 的
+  单并发 8K / 32K / 128K 图片与工具调用请求。图片答案质量按实际任务单独评估。
 - DeepSeek-V4-Flash 与 GLM-5.3-Flash 在 SM120 上通过 8K/32K 输入和
   512 输出测试。
 - DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8

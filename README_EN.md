@@ -24,20 +24,27 @@ FlashInfer `0.6.18`. Validated configurations include
 
 ## Changelog
 
+### 2026-09-16
+
+- Updated the current prebuilt-wheel instructions to the `vision11` vLLM
+  wheel with adaptive verification and CED image-input support; paired
+  FlashInfer `vision2` is unchanged.
+- Added an 8× RTX 4090 48 GB DeepSeek-V4.1-Flash launch configuration with
+  an `auto` context limit, at most 4 sequences, memory utilization `0.98`,
+  and a batch-token budget of `4096` (alternatively `2048`).
+
 ### 2026-09-12
 
 - Added SM89 / SM120 adaptive verification support for DeepSeek-V4 / V4.1 in
   the current `main` source, including device-ragged metadata, padding, and
-  FULL graph replay. SM120 operator and V4.1 full-model validation passed;
-  physical SM89 adaptive validation remains pending. The latest release's vLLM
-  wheel was replaced by `vision10` with this adaptation. DSpark examples enable adaptive
-  verification with explicit FULL graphs by default. `vision9` and earlier
-  vLLM wheels do not contain it. Paired FlashInfer `vision2` is unchanged.
+  FULL graph replay. SM120 operator and V4.1 full-model validation passed.
+  At that time, the release's vLLM wheel was replaced by `vision10` with
+  this adaptation. DSpark examples enable adaptive verification with explicit
+  FULL graphs by default. `vision9` and earlier vLLM wheels do not contain it.
+  Paired FlashInfer `vision2` is unchanged.
 - Added native DeepSeek-V4.1-Flash model, Engram, DSpark, and experimental CED
   prefill support, published as the SM89+SM120 `vision9` wheels.
-- Validated the full model server on 4× RTX PRO 6000 (SM120). SM89 validation
-  was limited to offline compilation; no kernel numerical execution or
-  full-model validation was performed on SM89 hardware.
+- Validated the full model server on 4× RTX PRO 6000 (SM120).
 - For the tested long-text prefill workloads, the prefill proxy (input tokens /
   TTFT) roughly doubled relative to CED off; the gain remains workload-dependent.
 
@@ -96,7 +103,7 @@ Earlier SM89 builds and environments remain available in
 | Triton | 3.7.1 (`ptxas-blackwell` from CUDA 13.1) |
 | Transformers | 5.16.1 |
 | FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision10.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision11.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
@@ -107,13 +114,13 @@ shape is compiled once and then reused from the JIT cache.
 
 ## 2. Quick install (prebuilt wheels)
 
-> **Adaptive verification requires the new `vision10` vLLM wheel or this
-> fork's current `main` source.** `vision9` and earlier vLLM whl packages do
-> not contain this adaptation and cannot use the adaptive-enabled DSpark
-> commands below. The paired FlashInfer `vision2` wheel does not need replacing.
+> **The DSpark and CED commands below require the current `vision11` vLLM
+> wheel or this fork's current `main` source.** This version includes adaptive
+> verification and CED image-input support. The paired FlashInfer `vision2`
+> wheel does not need replacing.
 
 The latest release retains the `v0.28.1rc1-vision9-sm89-sm120-cu130` tag,
-but its vLLM asset is now `vision10`. Paired FlashInfer `vision2` and its
+and the instructions now use its `vision11` vLLM asset. Paired FlashInfer `vision2` and its
 dependency URL are unchanged. Install directly from the exact wheel URL
 below in a Python 3.12 virtual environment:
 
@@ -122,15 +129,15 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 uv pip install --torch-backend=cu130 \
-  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision10.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=459a9638502de1cce8a1d1043bbe89e290afaa034a82008da92285bd1c9b72e5' \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision11.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e1c8313e6a8b58ec3feecaffb37fc3fda8e61ba4ecff624853b24216b7eb97ed' \
   'transformers==5.16.1' 'triton==3.7.1'
 ```
 
 `uv` verifies the SHA256 in the URL and automatically installs paired
 FlashInfer `vision2`; no separate FlashInfer download or install is needed.
 With a compatible environment already activated, run only `uv pip install`.
-The wheel was built from source commit
-`1cf1104417873d65e4ad353ea904f602d16204f2`, reusing audited, unchanged Vision9
+The wheel's Python source corresponds to commit
+`86d35745c8797c9d2524877fb235084a6a5f5a7d`, reusing audited SM89 / SM120
 native binaries. The release tag's source archives were not moved.
 
 Optionally use `--index-url` for a PyPI mirror; the wheel still downloads
@@ -138,7 +145,7 @@ from the release URL above.
 
 The existing `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
 this adaptive adaptation. It cannot directly use the adaptive-enabled DSpark
-commands below. Use `vision10` or current source; historical Docker
+commands below. Use `vision11` or current source; historical Docker
 configurations must keep adaptive disabled.
 
 ### 2.1 Install current main source (alternative to the wheel)
@@ -177,7 +184,7 @@ running the installation commands above.
 
 ---
 
-## 3. DeepSeek-V4.1-Flash launch command (SM120)
+## 3. DeepSeek-V4.1-Flash launch command
 
 The following text-serving configuration was validated on 4× RTX PRO 6000
 96 GB. It uses TP=4, expert parallelism, FP8 KV, Engram CPU offload, DSpark 5 (adaptive),
@@ -235,19 +242,31 @@ CED is currently an experimental approximate text-prefill path. For the tested
 long-text prefill workloads, the prefill proxy (input tokens / TTFT) roughly
 doubled relative to CED off, but the gain depends on the prompt, length, and
 runtime configuration. It is not guaranteed to be output-equivalent to the
-non-CED path; validate quality for the target workload. CED does not support
-multimodal inputs, prompt embeddings, or prompt logprobs, so do not send images
-or other multimodal content while it is enabled.
+non-CED path; validate quality for the target workload.
 
-The full model server was validated on SM120. SM89 validation was limited to
-offline compilation; no kernel numerical execution or full-model validation
-was performed on SM89 hardware.
+The current source and `vision11` wheel add a CED image-input path on top of
+the PR #112 frontend guards. It handles every image span in single-image and
+multi-image requests. When an image overlaps the final 128 query tokens, the
+replay boundary expands to preserve the complete image instead of disabling
+CED; DSpark and prefix caching may remain enabled. Set a limit such as
+`--limit-mm-per-prompt '{"image":2}'` as needed. Each image must fit within one
+prefill chunk, and the expanded replay must fit the batch-token budget. Vision
+models reserve `128 + vision_max_n_token` replay-state rows per GPU, so higher
+TP does not reduce this allocation proportionally. Non-image modalities,
+prompt embeddings, and prompt logprobs are rejected before engine execution.
+
+The image path has CPU regressions, small-weight SM120 GPU numerical tests,
+and real-cache-manager image-hit and boundary-backoff tests. On 2026-09-16,
+8× RTX 4090 48 GB completed single-concurrency 8K / 32K / 128K image and
+tool-calling requests with CED and DSpark retained. Assess output quality
+for the actual task; request completion does not mean every image answer
+was correct.
 
 ### 3.1 DSpark enables adaptive verification by default
 
 All DSpark launch examples below explicitly enable adaptive with FULL graphs.
 This is the README example default, not a change to the generic
-`SpeculativeConfig` default. Install `vision10` or current `main` source and
+`SpeculativeConfig` default. Install `vision11` or current `main` source and
 use a DSpark checkpoint with a confidence head. Retain the model path, TP/EP,
 FP8 KV, Engram, Model Runner V2, and appropriate CUDA toolchain settings.
 
@@ -277,8 +296,9 @@ FULL may remain enabled. Each model's existing draft count and sampling
 method stay unchanged when enabling adaptive.
 
 SM120 validation covers V4 / V4.1 operators, mixed prefill, padding, zero
-draft budgets, FULL replay, and V4.1 full-model serving. This is not evidence
-of physical SM89 validation or full-model accuracy equivalence.
+draft budgets, FULL replay, and V4.1 full-model serving. The SM89 V4.1 image
+and tool-calling runs are described above and in Section 8. These runtime
+results do not establish full-model accuracy equivalence.
 
 ### 3.2 DeepSeek-V4.1-Flash throughput reference
 
@@ -294,9 +314,9 @@ The service was warmed up; random inputs, temperature=0, ignore-eos, all
 200 requests succeeded, and prefix-cache hits were zero. Throughput is total
 output tokens / full-run duration, including prefill and decode, not
 per-request or decode-only speed. This single run used the Vision9 /
-FlashInfer Vision2 environment with this adaptive patch applied, not a new
-benchmark of the Vision10 wheel. There is no same-workload baseline, so it
-does not establish an adaptive speedup percentage or quality equivalence.
+FlashInfer Vision2 environment with this adaptive patch applied and is a
+throughput reference for that environment. There is no same-workload baseline,
+so it does not establish an adaptive speedup percentage or quality equivalence.
 
 **Single-concurrency (C1)** results from the same patched environment follow.
 Each input length had one warmup followed by four measured requests, all
@@ -329,11 +349,82 @@ not the acceptance rate of actual post-trim verification slots or the final
 accepted-token count returned to clients. Random-input results are not a
 quality evaluation.
 
+### 3.3 SM89: 8× RTX 4090 48 GB
+
+The following configuration is for **8× RTX 4090 48 GB**; it is not for
+standard 24 GB cards. It retains TP8/EP, FP8 KV, Engram CPU offload, CED image
+input, DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
+loading both require sufficient host memory, so do not size host memory from
+the GPU weight footprint alone.
+
+Install the **vision11 wheel** from Section 2 or current `main` source with
+CED image support from Section 2.1. The old Docker image cannot serve this
+example's CED image path. Configure the SM89 toolchain and launch in that
+environment:
+
+```bash
+source /path/to/.venv/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export FLASHINFER_CUDA_ARCH_LIST=8.9
+export TORCH_CUDA_ARCH_LIST=8.9
+export VLLM_USE_V2_MODEL_RUNNER=1
+unset TRITON_PTXAS_BLACKWELL_PATH
+
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v4.1-flash \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --moe-backend auto \
+  --kv-cache-dtype fp8 \
+  --block-size 128 \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.98 \
+  --enable-prefix-caching \
+  --engram-config '{"cpu_offload":true}' \
+  --load-format safetensors \
+  --safetensors-load-strategy prefetch \
+  --safetensors-prefetch-num-threads 2 \
+  --limit-mm-per-prompt '{"image":2}' \
+  --tokenizer-mode deepseek_v41 \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --hf-overrides '{"ced_prefill":true}' \
+  --speculative-config \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}'
+```
+
+- To reduce peak prefill memory, replace `--max-num-batched-tokens 4096` with
+  `--max-num-batched-tokens 2048` and leave the other parameters unchanged.
+  This also affects workspace use, graph-capture memory, and the number of
+  chunks for long inputs; do not assume that memory or throughput changes in
+  the same proportion.
+- Do not set an explicit KV-cache byte budget. With
+  `--gpu-memory-utilization 0.98`, vLLM sizes the KV cache automatically after
+  subtracting resident allocations, transient-peak headroom, and its CUDA
+  Graph estimate. The remaining 2% is neither graph-only space nor a hard
+  runtime memory limit.
+- `--max-model-len auto` may resolve to a lower value when capacity is
+  insufficient. If a full 1M-token context is required, confirm that the
+  startup log resolves it to `1048576`; each request's input, including image
+  tokens, plus output must remain within that limit. `--max-num-seqs 4` is a
+  scheduling limit, not a guarantee that four simultaneous 1M-token requests
+  will fit.
+- Check OOMs, KV preemption/recomputation, latency, and output quality using
+  actual long requests and the target mixed concurrency during deployment.
+
 ## 4. DeepSeek-V4-Flash launch commands
 
-These commands now enable adaptive by default. V4 validation in this round
-covers SM120 operators and FULL replay, not a new V4 full-model serving run;
-physical SM89 adaptive validation remains pending.
+These DSpark commands enable adaptive verification with explicit FULL CUDA
+Graphs by default.
 
 ### 4.1 SM89: 4× RTX 4090 48 GB
 
@@ -363,9 +454,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --port 8000
 ```
 
-The previous fixed-DSpark profile was validated with 8K, 32K, and 128K inputs,
-512 output tokens, and four concurrent 8K requests. Those historical results
-do not validate the new adaptive setting on physical SM89 hardware.
+The historical fixed-DSpark configuration was validated with 8K, 32K, and
+128K inputs, 512 output tokens, and four concurrent 8K requests.
 
 ### 4.2 SM120: 4× RTX PRO 6000 96 GB
 
@@ -398,10 +488,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 ## 5. DeepSeek-V4-Flash-Vision-Exp launch commands
 
-These DSpark examples also enable adaptive by default. Vision-Exp multimodal
-adaptive full-model regression was not run in this round; validate actual
-inputs before deployment. Historical multimodal results are not new adaptive
-validation evidence.
+These DSpark examples enable adaptive verification with explicit FULL CUDA
+Graphs by default.
 
 ### 5.1 SM89: 8× RTX 4090 48 GB
 
@@ -436,8 +524,6 @@ draft model and KV cache do not have enough memory headroom. 8× RTX 4090
 `--max-num-batched-tokens` to `4096`.
 
 Historical SM89 runtime regression used 4× RTX 4090 48 GB without DSpark.
-The 8-GPU adaptive command above is outside the completed physical SM89
-validation scope.
 
 ### 5.2 SM120: 4× RTX PRO 6000 96 GB
 
@@ -584,9 +670,9 @@ Repeating the same prompt produced:
 - DeepSeek-V4.1-Flash, DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and
   GLM-5.3-Flash passed server startup on SM120.
 - DeepSeek-V4.1-Flash passed text serving, tool calling, DSpark, and experimental
-  CED prefill validation on SM120. SM89 validation was limited to offline
-  compilation; no kernel numerical execution or full-model validation was
-  performed on SM89 hardware.
+  CED prefill validation on SM120. On 8× RTX 4090 48 GB (SM89), it completed
+  single-concurrency 8K / 32K / 128K image and tool-calling requests with CED
+  and DSpark retained. Assess image-answer quality separately for the task.
 - DeepSeek-V4-Flash and GLM-5.3-Flash passed 8K/32K to 512-token tests on
   SM120.
 - DeepSeek-V4-Flash passed 8K/32K/128K, four-concurrency, tool-calling, and UTF-8
