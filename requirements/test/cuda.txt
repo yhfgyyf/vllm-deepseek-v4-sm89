@@ -32,7 +32,7 @@ annotated-doc==0.0.4
     #   typer
 annotated-types==0.7.0
     # via pydantic
-anthropic==0.112.0
+anthropic==2.3.0
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
