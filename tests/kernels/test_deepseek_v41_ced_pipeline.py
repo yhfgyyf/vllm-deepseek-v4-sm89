@@ -15,6 +15,9 @@ import torch
 from torch import nn
 
 from tests.models.deepseek_v4_1.test_ced_dspark import speculator
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -45,6 +48,24 @@ from vllm.models.deepseek_v4_1.nvidia.model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
 )
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+)
+from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.config import (
+    OffloadingCacheConfig,
+    OffloadingConfig,
+    OffloadingGroupConfig,
+    OffloadingModelConfig,
+    OffloadingParallelConfig,
+)
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 CAPACITY = 512
@@ -234,6 +255,113 @@ def explicit_replay_reference(
         return model.norm(hc_collapse_triton(hidden, carried)), auxiliary
 
 
+def transfer_prefix_block(
+    worker: CPUOffloadingWorker, job_id: int, gpu_to_cpu: bool
+) -> int:
+    gpu_spec = GPULoadStoreSpec([0], group_sizes=(1,), block_indices=(0,))
+    cpu_spec = CPULoadStoreSpec([0])
+    if gpu_to_cpu:
+        assert worker.submit_store(job_id, gpu_spec, cpu_spec)
+    else:
+        assert worker.submit_load(job_id, cpu_spec, gpu_spec)
+    worker.wait({job_id})
+    results = worker.get_finished()
+    assert len(results) == 1
+    assert results[0].job_id == job_id
+    assert results[0].success
+    assert results[0].transfer_size is not None
+    return results[0].transfer_size
+
+
+def make_ced_cpu_connector(model, monkeypatch):
+    source = model.layers[20].attn
+    scratch_before = model.layers[20].attn.cache
+    scratch_after = model.layers[39].attn.cache
+    scratch_spec = CircularBufferSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=264,
+        dtype=torch.uint8,
+    )
+    global_spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=288,
+        dtype=torch.uint8,
+    )
+    scratch_page = scratch_spec.page_size_bytes
+    global_page = global_spec.page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=CAPACITY // 128,
+        kv_cache_tensors=[
+            KVCacheTensor(scratch_before.numel(), ["scratch_before"], 0, scratch_page),
+            KVCacheTensor(global_page * (CAPACITY // 128), ["global"], 0, global_page),
+            KVCacheTensor(scratch_after.numel(), ["scratch_after"], 0, scratch_page),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["scratch_before"], scratch_spec),
+            KVCacheGroupSpec(["global"], global_spec),
+            KVCacheGroupSpec(["scratch_after"], scratch_spec),
+        ],
+    )
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+        world_size=1,
+        rank=0,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel,
+        model_config=SimpleNamespace(get_total_num_kv_heads=lambda: 1),
+    )
+    config = OffloadingConfig(
+        groups=(
+            OffloadingGroupConfig(
+                tokens_per_block=128,
+                layer_names=("global",),
+                group_id=1,
+            ),
+        ),
+        worker_kv_bytes_per_block=global_page,
+        enable_kv_cache_events=False,
+        extra_config={"cpu_bytes_to_use": global_page},
+        engine_id="ced-kernel-offload",
+        model=OffloadingModelConfig(name="deepseek-v4.1-test", dtype="uint8"),
+        cache=OffloadingCacheConfig(tokens_per_hash=128, blocks_per_chunk=1),
+        parallel=OffloadingParallelConfig(
+            rank=0,
+            world_size=1,
+            tp_size=1,
+            pp_size=1,
+            pcp_size=1,
+            dcp_size=1,
+            data_parallel_index=0,
+            data_parallel_size=1,
+            data_parallel_rank_local=None,
+            is_parallelism_agnostic=False,
+        ),
+    )
+    monkeypatch.setattr(CPUOffloadingSpec, "_uses_shared_region", lambda self: False)
+    spec = CPUOffloadingSpec(config)
+    connector = OffloadingConnectorWorker(spec, vllm_config, kv_cache_config)
+    connector.register_kv_caches(
+        {
+            "scratch_before": scratch_before,
+            "global": source.global_cache,
+            "scratch_after": scratch_after,
+        }
+    )
+    assert spec.group_ids == (1,)
+    assert isinstance(connector.worker, CPUOffloadingWorker)
+    assert len(connector.worker._load_handler.layer_refs_per_group) == 1
+    gpu_tensors = connector.worker._store_handler.src_tensors
+    assert len(gpu_tensors) == 1
+    assert gpu_tensors[0].data_ptr() == source.global_cache.data_ptr()
+    return connector
+
+
 @torch.inference_mode()
 def test_logical_image_slots_expand_only_queries_inside_the_image():
     image_span = (64, 320)
@@ -402,6 +530,144 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
     torch.testing.assert_close(actual_next, expected_next, rtol=0.005, atol=0.005)
     for layer in islice(actual_model.layers, 20, 40):
         torch.testing.assert_close(layer.ffn.input_ids_seen[-1], next_position)
+
+
+@torch.inference_mode()
+def test_ced_cpu_offload_restores_prefix_and_rebuilds_private_state(
+    default_vllm_config,
+    monkeypatch,
+):
+    length = 257
+    prefix_hit = 128
+    replay_start = length - 128
+    torch.manual_seed(97)
+    boundary = torch.randn(length, 4, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    pre_mix = torch.softmax(torch.randn(length, 4, device="cuda"), -1)
+    positions = torch.arange(length, device="cuda")
+    input_ids = positions.clone()
+
+    model = make_model(29)
+    model.aux_hidden_state_layers = (37, 38, 39)
+    reference_plan = plan_ced_step(
+        (
+            CEDRequest(
+                0,
+                0,
+                length,
+                length,
+                True,
+                replay_start=replay_start,
+            ),
+        ),
+        cache_window=128,
+    )
+    reference_positions = torch.tensor(
+        reference_plan.positions, device="cuda", dtype=torch.int64
+    )
+    reference_step = CEDStep(
+        reference_plan,
+        {"replay_start": replay_start},
+        reference_positions,
+    )
+    with override_forward_context(context()):
+        reference_output, dense_aux = model._forward_ced_decoder(
+            reference_step, boundary, pre_mix, input_ids, positions
+        )
+    assert dense_aux == []
+    assert reference_step.draft_context is not None
+    reference_aux = [
+        hidden.clone() for hidden in reference_step.draft_context.aux_hidden_states
+    ]
+
+    source = model.layers[20].attn
+    global_cache = source.global_cache
+    full_global_cache = global_cache.clone()
+    page_size_bytes = global_cache[0].numel() * global_cache.element_size()
+    connector = make_ced_cpu_connector(model, monkeypatch)
+    offloader = connector.worker
+    assert isinstance(offloader, CPUOffloadingWorker)
+    try:
+        stored_bytes = transfer_prefix_block(offloader, 1, gpu_to_cpu=True)
+
+        global_cache.zero_()
+        for layer in islice(model.layers, 20, 40):
+            layer.attn.cache.zero_()
+            layer.attn.rows_seen.clear()
+            layer.attn.global_writes.clear()
+            layer.ffn.input_ids_seen.clear()
+        model.ced_tail.hidden.fill_(torch.nan)
+        model.ced_tail.pre_mix.fill_(torch.nan)
+        model.ced_tail.input_ids.fill_(-1)
+        model.ced_tail.reset(0, prefix_hit)
+
+        loaded_bytes = transfer_prefix_block(offloader, 2, gpu_to_cpu=False)
+        torch.testing.assert_close(global_cache[0], full_global_cache[0])
+        assert torch.count_nonzero(global_cache[1:]) == 0
+        for layer in islice(model.layers, 20, 40):
+            assert torch.count_nonzero(layer.attn.cache) == 0
+
+        recovery_plan = plan_ced_step(
+            (
+                CEDRequest(
+                    0,
+                    prefix_hit,
+                    length - prefix_hit,
+                    length,
+                    True,
+                    replay_start=replay_start,
+                ),
+            ),
+            cache_window=128,
+        )
+        recovery_positions = torch.tensor(
+            recovery_plan.positions, device="cuda", dtype=torch.int64
+        )
+        recovery_step = CEDStep(
+            recovery_plan,
+            {"replay_start": replay_start},
+            recovery_positions,
+        )
+        with override_forward_context(context()):
+            recovered_output, dense_aux = model._forward_ced_decoder(
+                recovery_step,
+                boundary[prefix_hit:],
+                pre_mix[prefix_hit:],
+                input_ids[prefix_hit:],
+                positions[prefix_hit:],
+            )
+    finally:
+        connector.shutdown()
+
+    assert stored_bytes == loaded_bytes == page_size_bytes
+    torch.testing.assert_close(
+        recovered_output[-1], reference_output[-1], rtol=0.005, atol=0.005
+    )
+    assert dense_aux == []
+    assert recovery_step.draft_context is not None
+    for recovered_aux, expected_aux in zip(
+        recovery_step.draft_context.aux_hidden_states,
+        reference_aux,
+        strict=True,
+    ):
+        torch.testing.assert_close(recovered_aux, expected_aux, rtol=0.005, atol=0.005)
+    check_draft_context(recovery_step)
+
+    torch.testing.assert_close(global_cache, full_global_cache, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.cat(source.global_writes), positions[prefix_hit:], rtol=0, atol=0
+    )
+    assert model.ced_tail.ends == [length]
+    assert model.ced_tail.valid_starts == [replay_start]
+    tail_slots = positions[replay_start:].remainder(128)
+    assert not torch.isnan(model.ced_tail.hidden[tail_slots]).any()
+    assert not torch.isnan(model.ced_tail.pre_mix[tail_slots]).any()
+    torch.testing.assert_close(
+        model.ced_tail.input_ids[tail_slots], input_ids[replay_start:]
+    )
+    for layer in islice(model.layers, 20, 40):
+        cache = layer.attn.cache.flatten(0, 1)
+        assert torch.count_nonzero(cache[:replay_start]) == 0
+        assert torch.count_nonzero(cache[replay_start:length]) > 0
 
 
 class ContextProjection(nn.Linear):

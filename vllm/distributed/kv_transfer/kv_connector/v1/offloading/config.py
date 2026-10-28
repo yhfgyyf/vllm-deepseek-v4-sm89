@@ -39,6 +39,11 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    selected_groups = tuple(
+        (group_id, group)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+    )
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=(
@@ -50,8 +55,9 @@ def build_offloading_config(
                 )
             ),
             layer_names=tuple(group.layer_names),
+            group_id=group_id,
         )
-        for group in kv_cache_config.kv_cache_groups
+        for group_id, group in selected_groups
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
@@ -102,9 +108,7 @@ def build_offloading_config(
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
 
     single_group_spec = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        if len(kv_cache_config.kv_cache_groups) == 1
-        else None
+        selected_groups[0][1].kv_cache_spec if len(selected_groups) == 1 else None
     )
     replicated_layout = (
         vllm_config.model_config.use_mla
@@ -113,8 +117,7 @@ def build_offloading_config(
         # Page accounting: one MLA page per layer, no packed/mixed rows.
         and worker_kv_bytes_per_block > 0
         and worker_kv_bytes_per_block
-        == single_group_spec.page_size_bytes
-        * len(kv_cache_config.kv_cache_groups[0].layer_names)
+        == single_group_spec.page_size_bytes * len(selected_groups[0][1].layer_names)
         # Safe MVP boundary: TP-only, no other parallel axes.
         and parallel_config.tensor_parallel_size > 1
         and parallel_config.pipeline_parallel_size == 1
@@ -173,7 +176,7 @@ def build_offloading_config(
         # one spec per layer; certify per layer, as the mapping derivation does.
         layer_specs = [
             spec
-            for group in kv_cache_config.kv_cache_groups
+            for _, group in selected_groups
             for spec in iter_layer_specs(group.kv_cache_spec)
         ]
         is_parallelism_agnostic = (

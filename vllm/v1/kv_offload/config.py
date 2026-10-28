@@ -14,6 +14,9 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # Original index in KVCacheConfig.kv_cache_groups. None preserves the
+    # historical dense ordering for external OffloadingSpec implementations.
+    group_id: int | None = None
 
 
 @dataclass(frozen=True)

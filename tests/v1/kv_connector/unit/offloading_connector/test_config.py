@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -322,6 +323,42 @@ def test_zero_blocks_skips_tensor_layout_validation():
     offloading_config = build_offloading_config(_make_vllm_config(), kv_cache_config)
 
     assert offloading_config.worker_kv_bytes_per_block == 0
+
+
+def test_offloading_skips_non_prefix_cacheable_groups():
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.kv_cache_groups.insert(
+        1,
+        KVCacheGroupSpec(
+            ["scratch"],
+            CircularBufferSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.float32,
+            ),
+        ),
+    )
+    page_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    kv_cache_config.kv_cache_tensors = [
+        KVCacheTensor(
+            size=page_size * kv_cache_config.num_blocks,
+            layers=["full_layer", "scratch", "mamba_layer"],
+            layer_stride=0,
+            block_stride=page_size,
+        )
+    ]
+    config = _make_vllm_config()
+    config.speculative_config = None
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0, 2]
+    assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0, 2]
+    assert offloading_config.worker_kv_bytes_per_block == page_size
 
 
 def test_prefill_context_parallelism_does_not_scale_group_blocks():

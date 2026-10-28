@@ -36,6 +36,45 @@ vllm serve <model> \
   }'
 ```
 
+## DeepSeek-V4.1 experimental CED
+
+The native `OffloadingConnector` can retain CED prefill replay when prefix
+caching is enabled. Add these options to an otherwise supported CED launch:
+
+```bash
+--hf-overrides '{"ced_prefill":true}' \
+--enable-prefix-caching \
+--kv-transfer-config '{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "blocks_per_chunk": 1,
+    "cpu_bytes_to_use": 8589934592
+  }
+}'
+```
+
+This example reserves an 8 GiB total CPU budget, not 8 GiB per rank. The
+`SimpleCPUOffloadConnector` options `cpu_bytes_to_use_per_rank` and
+`lazy_offload` do not configure this connector. Use `blocks_per_chunk` for
+V4.1's differently sized cache groups instead of setting one token `block_size`.
+
+An external hit leaves at least the original prompt's last 128 tokens for
+encoder recomputation; image boundaries can require a longer replay. The
+connector finds a common block-aligned checkpoint with both global KV and the
+encoder SWA history needed at that checkpoint. Missing SWA history reduces the
+hit or makes it a miss. Decoder SWA and compressor scratch groups are not
+prefix-cached. CED's request-owned hidden/pre-mix tail is rebuilt locally, then
+the existing decoder replay and optional DSpark context insertion run. Loading
+KV does not restore arbitrary model buffers or resume straight into decode.
+
+Existing CED restrictions remain: Model Runner V2, PP=1, DP=1, no context or
+sequence parallelism, no DBO, and the existing image/DSpark input constraints.
+Other KV connectors, custom connector replacements, and P/D transfer are not
+enabled by this support. CED remains an approximate prefill path; validate
+quality on the intended workload. CPU offloading extends prefix reuse and is
+not demand paging for an active request's entire KV cache.
+
 ## Multi-Tier Setup
 
 Set `spec_name` to `"TieringOffloadingSpec"` and supply a `secondary_tiers` list. Each entry is a dict with a required `type` key plus tier-specific fields (and an optional `module_path` for out-of-tree tiers). The list is ordered: tier 0 is consulted before tier 1, and so on. See [Secondary Tiers](#secondary-tiers) for tier-specific keys.

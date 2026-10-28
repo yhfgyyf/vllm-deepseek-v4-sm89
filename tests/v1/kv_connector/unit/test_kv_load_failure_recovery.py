@@ -5,8 +5,17 @@ from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1 import SupportsHMA
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import FinishReason
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 from vllm.v1.request import Request, RequestStatus
 
 from .utils import (
@@ -32,6 +41,92 @@ def _make_get_num_new_matched_tokens(
 def scheduler():
     vllm_config = create_vllm_config(kv_load_failure_policy="recompute")
     return create_scheduler(vllm_config)
+
+
+def _create_ced_scheduler(*, kv_load_failure_policy: str = "recompute") -> Scheduler:
+    block_size = 32
+    vllm_config = create_vllm_config(
+        max_num_seqs=1,
+        max_num_batched_tokens=256,
+        block_size=block_size,
+        max_model_len=2048,
+        kv_load_failure_policy=kv_load_failure_policy,
+    )
+    global_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        state_content_bytes=288,
+        model_version="deepseek_v4_1",
+    )
+    encoder_swa_spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        state_content_bytes=528,
+        sliding_window=128,
+        model_version="deepseek_v4_1",
+        allow_prefix_caching=True,
+    )
+    decoder_scratch_spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        state_content_bytes=528,
+        sliding_window=128,
+        model_version="deepseek_v4_1",
+        allow_prefix_caching=False,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=256,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["global"], global_spec),
+            KVCacheGroupSpec(["encoder_swa"], encoder_swa_spec),
+            KVCacheGroupSpec(["decoder_scratch"], decoder_scratch_spec),
+        ],
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=kv_cache_config.num_blocks,
+        kv_cache_config=kv_cache_config,
+    )
+    scheduler.ced_prefill = True
+    scheduler.kv_cache_manager.prefix_replay_window = 128
+    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
+        manager.prefix_replay_window = 128
+    assert scheduler.ced_prefill
+    return scheduler
+
+
+class _MockHMAConnector(SupportsHMA):
+    supports_divergent_local_hybrid_hits = False
+    requires_kv_delivery = False
+
+    def __init__(self, matched_tokens: int, async_load: bool):
+        self.get_num_new_matched_tokens = Mock(
+            return_value=(matched_tokens, async_load)
+        )
+        self.on_new_request = Mock()
+        self.update_state_after_alloc = Mock()
+        self.build_connector_meta = Mock(return_value=None)
+        self.update_connector_output = Mock()
+        self.get_kv_connector_stats = Mock(return_value=None)
+        self.take_events = Mock(return_value=())
+
+    def request_finished_all_groups(self, request, block_ids):
+        return False, None
+
+
+def _mock_connector(
+    scheduler: Scheduler, matched_tokens: int, *, async_load: bool
+) -> _MockHMAConnector:
+    connector = _MockHMAConnector(matched_tokens, async_load)
+    scheduler.connector = connector
+    return connector
 
 
 @pytest.mark.parametrize(
@@ -337,3 +432,161 @@ def test_async_progressive_load_failure(
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert scheduler.failed_recving_kv_req_ids == {request.request_id}
         assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
+
+
+def test_ced_async_failure_in_encoder_swa_restarts_from_zero():
+    scheduler = _create_ced_scheduler()
+    connector = _mock_connector(scheduler, 192, async_load=True)
+    connector.get_num_new_matched_tokens.side_effect = [(192, True), (0, False)]
+    request = create_request(num_tokens=321, block_size=scheduler.block_size)
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_prompt_tokens - request.num_computed_tokens >= 128
+    block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert len(block_ids) == 3
+    invalid_block_id = block_ids[1][2]
+    initially_allocated = {
+        block_id for group_block_ids in block_ids for block_id in group_block_ids
+    }
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[], invalid_block_ids={invalid_block_id}, use_eos=False
+        ),
+    )
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == 0
+    assert request.request_id in scheduler.failed_recving_kv_req_ids
+    assert initially_allocated <= {
+        block.block_id
+        for blocks in scheduler.kv_cache_manager.get_blocks(request.request_id).blocks
+        for block in blocks
+    }
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[], finished_recving={request.request_id}, use_eos=False
+        ),
+    )
+    scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == 256
+    assert request.request_id not in scheduler.failed_recving_kv_req_ids
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+    assert request in scheduler.running
+    assert connector.get_num_new_matched_tokens.call_count == 2
+    assert all(
+        block.ref_cnt >= 0
+        for block in scheduler.kv_cache_manager.block_pool.blocks
+        if not block.is_null
+    )
+
+
+def test_ced_async_success_waits_before_replay_admission():
+    scheduler = _create_ced_scheduler()
+    connector = _mock_connector(scheduler, 192, async_load=True)
+    request = create_request(num_tokens=321, block_size=scheduler.block_size)
+    scheduler.add_request(request)
+
+    load_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == 192
+    assert not load_output.scheduled_new_reqs
+
+    scheduler.update_from_output(
+        load_output,
+        create_model_runner_output(
+            reqs=[], finished_recving={request.request_id}, use_eos=False
+        ),
+    )
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    replay_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert len(replay_output.scheduled_new_reqs) == 1
+    admitted = replay_output.scheduled_new_reqs[0]
+    assert admitted.req_id == request.request_id
+    assert admitted.num_computed_tokens == 192
+    assert request.num_prompt_tokens - admitted.num_computed_tokens >= 128
+    assert connector.get_num_new_matched_tokens.call_count == 1
+
+
+def test_ced_sync_failure_preempts_and_drops_stale_output():
+    scheduler = _create_ced_scheduler()
+    _mock_connector(scheduler, 192, async_load=False)
+    request = create_request(num_tokens=321, block_size=scheduler.block_size)
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_in_flight_tokens > 0
+    block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    cached_prefix_ids = {
+        block_id
+        for group_block_ids in block_ids[:2]
+        for block_id in group_block_ids
+        if scheduler.kv_cache_manager.block_pool.blocks[block_id].block_hash is not None
+    }
+    assert cached_prefix_ids
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[request], invalid_block_ids={block_ids[1][2]}, use_eos=False
+        ),
+    )
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.num_in_flight_tokens == 0
+    assert request.num_stale_output_tokens == 0
+    assert request.drop_stale_output
+    assert request.num_output_tokens == 0
+    assert request in scheduler.waiting
+    assert request not in scheduler.running
+    assert request.request_id in scheduler.reset_preempted_req_ids
+    assert all(
+        scheduler.kv_cache_manager.block_pool.blocks[block_id].block_hash is None
+        for block_id in cached_prefix_ids
+    )
+
+
+def test_ced_async_failure_policy_fail_finishes_without_leaking_blocks():
+    scheduler = _create_ced_scheduler(kv_load_failure_policy="fail")
+    _mock_connector(scheduler, 192, async_load=True)
+    request = create_request(num_tokens=321, block_size=scheduler.block_size)
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            reqs=[],
+            finished_recving={request.request_id},
+            invalid_block_ids={block_ids[1][2]},
+            use_eos=False,
+        ),
+    )
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.requests
+    assert request not in scheduler._inflight_prefills
+    assert not any(scheduler.kv_cache_manager.get_block_ids(request.request_id))
+    assert all(
+        block.ref_cnt >= 0
+        for block in scheduler.kv_cache_manager.block_pool.blocks
+        if not block.is_null
+    )
+    assert outputs[request.client_index].outputs[0].finish_reason == FinishReason.ERROR

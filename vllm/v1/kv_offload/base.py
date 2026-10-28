@@ -600,6 +600,10 @@ class OffloadingSpec(ABC):
         )
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
+        self.group_ids = tuple(
+            idx if group.group_id is None else group.group_id
+            for idx, group in enumerate(config.groups)
+        )
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
 

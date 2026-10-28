@@ -29,6 +29,13 @@ def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
     """Fail closed for combinations not covered by the bounded-replay prototype."""
     hf = vllm_config.model_config.hf_config
     parallel = vllm_config.parallel_config
+    transfer = vllm_config.kv_transfer_config
+    native_offloading = (
+        transfer is not None
+        and getattr(transfer, "kv_connector", None) == "OffloadingConnector"
+        and getattr(transfer, "kv_connector_module_path", None) is None
+        and getattr(transfer, "kv_role", None) == "kv_both"
+    )
     unsupported = []
     for condition, name in (
         (not vllm_config.use_v2_model_runner, "model runner v1"),
@@ -38,7 +45,7 @@ def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
         (parallel.prefill_context_parallel_size != 1, "prefill context parallelism"),
         (use_sequence_parallel, "sequence parallelism"),
         (parallel.enable_dbo or parallel.ubatch_size > 1, "microbatching/DBO"),
-        (vllm_config.kv_transfer_config is not None, "KV transfer/restoration"),
+        (transfer is not None and not native_offloading, "KV transfer/restoration"),
         (getattr(vllm_config, "lora_config", None) is not None, "LoRA"),
     ):
         if condition:
@@ -47,6 +54,8 @@ def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
         raise NotImplementedError(
             "Experimental CED does not support " + ", ".join(unsupported)
         )
+    if native_offloading and not vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError("CED KV offloading requires prefix caching for encoder SWA")
     spec = vllm_config.speculative_config
     if spec is not None:
         if not getattr(spec, "use_dspark", lambda: False)():

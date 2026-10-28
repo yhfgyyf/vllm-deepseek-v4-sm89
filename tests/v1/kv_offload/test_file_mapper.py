@@ -26,8 +26,13 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
             OffloadingGroupConfig(
                 tokens_per_block=tokens_per_block,
                 layer_names=(layer_name,),
+                group_id=(kwargs.get("group_ids") or ())[idx]
+                if kwargs.get("group_ids")
+                else None,
             )
-            for tokens_per_block, layer_name in kwargs.get("groups", ())
+            for idx, (tokens_per_block, layer_name) in enumerate(
+                kwargs.get("groups", ())
+            )
         ),
         worker_kv_bytes_per_block=0,
         enable_kv_cache_events=False,
@@ -146,6 +151,27 @@ def test_hybrid_file_identity_uses_resolved_tokens_per_hash():
     assert fm.fields["kv_cache_groups"] == [
         {"tokens_per_block": 12, "layer_names": ["full_layer"]},
         {"tokens_per_block": 16, "layer_names": ["mla_layer"]},
+    ]
+
+
+def test_filtered_group_ids_participate_in_file_identity():
+    fm = make_mapper_from_offloading_spec(
+        groups=((12, "full_layer"), (16, "encoder_swa")),
+        group_ids=(0, 2),
+        tokens_per_hash=4,
+    )
+
+    assert fm.fields["kv_cache_groups"] == [
+        {
+            "tokens_per_block": 12,
+            "layer_names": ["full_layer"],
+            "group_id": 0,
+        },
+        {
+            "tokens_per_block": 16,
+            "layer_names": ["encoder_swa"],
+            "group_id": 2,
+        },
     ]
 
 

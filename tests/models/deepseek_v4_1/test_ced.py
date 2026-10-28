@@ -329,9 +329,16 @@ def test_ced_rejects_unvalidated_state_restoration_or_draft_contracts(field):
         validate_ced_config(config, False)
 
 
-def test_ced_accepts_prefix_cache_and_native_dspark_together():
+@pytest.mark.parametrize("offloading", [False, True])
+def test_ced_accepts_prefix_cache_and_native_dspark_together(offloading):
     config = valid_config()
     config.cache_config.enable_prefix_caching = True
+    if offloading:
+        config.kv_transfer_config = SimpleNamespace(
+            kv_connector="OffloadingConnector",
+            kv_connector_module_path=None,
+            kv_role="kv_both",
+        )
     config.speculative_config = SimpleNamespace(
         use_dspark=lambda: True,
         num_speculative_tokens=5,
@@ -349,4 +356,51 @@ def test_ced_accepts_prefix_cache_and_native_dspark_together():
         19
     ]
     with pytest.raises(NotImplementedError, match="decoder-only"):
+        validate_ced_config(config, False)
+
+
+def test_ced_accepts_builtin_offloading_with_prefix_replay():
+    config = valid_config()
+    config.cache_config.enable_prefix_caching = True
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_connector_module_path=None,
+        kv_role="kv_both",
+    )
+    validate_ced_config(config, False)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kv_connector": "SimpleCPUOffloadConnector"},
+        {"kv_connector": "NixlConnector"},
+        {"kv_connector_module_path": "custom.connector"},
+        {"kv_role": "kv_consumer"},
+        {"kv_role": "kv_producer"},
+    ],
+)
+def test_ced_rejects_connectors_without_the_offload_replay_contract(overrides):
+    config = valid_config()
+    config.cache_config.enable_prefix_caching = True
+    config.kv_transfer_config = SimpleNamespace(
+        **{
+            "kv_connector": "OffloadingConnector",
+            "kv_connector_module_path": None,
+            "kv_role": "kv_both",
+        }
+        | overrides
+    )
+    with pytest.raises(NotImplementedError, match="KV transfer"):
+        validate_ced_config(config, False)
+
+
+def test_ced_offloading_requires_prefix_caching_for_encoder_swa():
+    config = valid_config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_connector_module_path=None,
+        kv_role="kv_both",
+    )
+    with pytest.raises(ValueError, match="prefix caching"):
         validate_ced_config(config, False)
