@@ -712,6 +712,19 @@ prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 
 
 ---
 
+## 微信用户交流群
+
+<details>
+<summary>点击展开微信群二维码</summary>
+
+<p align="center">
+  <img src="docs/assets/wechat-user-group.png" alt="Strata、vLLM、SGLang AI 推理讨论群二维码" width="420">
+</p>
+
+</details>
+
+---
+
 ## 9. License / 来源
 
 代码基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，沿用
