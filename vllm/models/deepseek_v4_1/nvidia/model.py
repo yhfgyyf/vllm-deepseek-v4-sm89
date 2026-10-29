@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_pp_group,
@@ -91,6 +91,86 @@ if typing.TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _eplb_for_layer(
+    layer_idx: int,
+    num_hidden_layers: int,
+    enable_eplb: bool,
+    num_redundant_experts: int,
+) -> tuple[bool, int]:
+    """(enable_eplb, num_redundant_experts) for the MoE of decoder layer
+    ``layer_idx``.
+
+    Only the target's layers (index < num_hidden_layers) are registered with
+    EplbState (DeepseekV41LLMForCausalLM.set_moe_parameters). The DSpark
+    drafter's layers (index >= num_hidden_layers) live in a model that is not a
+    MixtureOfExperts, so they never receive expert_load_view / maps and must
+    run without EPLB and without redundant expert slots.
+    """
+    if layer_idx >= num_hidden_layers:
+        return False, 0
+    return enable_eplb, num_redundant_experts
+
+
+def _moe_parallel_config(
+    parallel_config: ParallelConfig, layer_idx: int, num_hidden_layers: int
+) -> ParallelConfig:
+    """``parallel_config`` itself for target layers; for drafter layers a
+    shallow copy with EPLB off and no redundant experts (the global config is
+    left untouched).
+
+    DeepseekV4MoEBase._init_fused_moe_experts reads enable_eplb and
+    num_redundant_experts from the config it is given. FusedMoEFactory still
+    builds moe_parallel_config from the global config, so a drafter layer's
+    moe_parallel_config.enable_eplb stays True; with the MXFP4 Marlin method
+    (supports_eplb) and the allgather_reducescatter all2all backend that flag
+    has no effect on these layers.
+    """
+    enable_eplb, num_redundant_experts = _eplb_for_layer(
+        layer_idx,
+        num_hidden_layers,
+        parallel_config.enable_eplb,
+        parallel_config.eplb_config.num_redundant_experts,
+    )
+    if (
+        enable_eplb == parallel_config.enable_eplb
+        and num_redundant_experts == parallel_config.eplb_config.num_redundant_experts
+    ):
+        return parallel_config
+    eplb_config = copy.copy(parallel_config.eplb_config)
+    eplb_config.num_redundant_experts = num_redundant_experts
+    adapted = copy.copy(parallel_config)
+    adapted.enable_eplb = enable_eplb
+    adapted.eplb_config = eplb_config
+    return adapted
+
+
+def _eplb_byte_view(weight: torch.Tensor) -> torch.Tensor:
+    """The (local_experts, n) expert tensor ``weight`` as a (local_experts,
+    n * itemsize) uint8 view of the same storage.
+
+    EPLB moves expert rows with dtype-blind copies, a profile-time all_gather
+    on the NCCL EP group and gloo send/recv. NCCL and gloo reject some weight
+    dtypes (the Marlin MXFP4 scales are float8_e8m0fnu), so EPLB is handed raw
+    bytes; the model keeps using the original tensors, which alias them.
+    """
+    if weight.dim() != 2 or not weight.is_contiguous():
+        raise ValueError(
+            "EPLB expert tensors must be contiguous (local_experts, n); got "
+            f"shape {tuple(weight.shape)} stride {weight.stride()}."
+        )
+    itemsize = weight.element_size()
+    raw = weight.view(torch.uint8)
+    if (
+        raw.shape != (weight.shape[0], weight.shape[1] * itemsize)
+        or raw.data_ptr() != weight.data_ptr()
+    ):
+        raise ValueError(
+            f"{weight.dtype} expert tensor of shape {tuple(weight.shape)} does "
+            f"not map onto whole bytes (uint8 view {tuple(raw.shape)})."
+        )
+    return raw
+
+
 class DeepseekV4MoE(DeepseekV4MoEBase):
     def __init__(
         self,
@@ -99,9 +179,10 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         use_sequence_parallel: bool = False,
     ):
         config = vllm_config.model_config.hf_config
+        layer_idx = extract_layer_index(prefix)
         n_routed_experts = config.n_routed_experts
         n_activated_experts = config.num_experts_per_tok
-        if extract_layer_index(prefix) >= config.num_hidden_layers:
+        if layer_idx >= config.num_hidden_layers:
             n_routed_experts = (
                 getattr(config, "dspark_n_routed_experts", 0) or n_routed_experts
             )
@@ -122,6 +203,10 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         adapted_model_config.hf_config = adapted_hf_config
         adapted_vllm_config = copy.copy(vllm_config)
         adapted_vllm_config.model_config = adapted_model_config
+
+        adapted_vllm_config.parallel_config = _moe_parallel_config(
+            vllm_config.parallel_config, layer_idx, config.num_hidden_layers
+        )
 
         super().__init__(
             adapted_vllm_config,
@@ -953,12 +1038,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # With EPLB the physical slots num_experts..num_experts+R-1 hold
+        # replicas of logical experts 0..R-1 (initial map); the mapping must
+        # list them or those slots are never loaded.
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
 
     def finalize_mega_moe_weights(self) -> None:
@@ -1055,6 +1144,21 @@ def _make_deepseek_v4_weights_mapper(
 
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list["DeepseekV4MoE"]
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        super().set_eplb_state(
+            expert_load_view, logical_to_physical_map, logical_replica_count
+        )
+        # Every EPLB transfer (profile all_gather, communicator, async worker,
+        # buffer copies) goes through self.expert_weights.
+        self.expert_weights = [
+            [_eplb_byte_view(w) for w in layer] for layer in self.expert_weights
+        ]
 
     def extract_moe_parameters(self, example_moe: "DeepseekV4MoE | None") -> None:
         if example_moe is None:
