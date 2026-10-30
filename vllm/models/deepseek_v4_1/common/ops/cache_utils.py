@@ -49,7 +49,9 @@ def compute_global_topk_indices_and_lens(
     return global_topk_indices, topk_lens
 
 
-@triton.jit
+# num_reqs is the padded batch's request count: a runtime argument exempt from
+# value specialization (==1, %16), so all batch sizes share one variant.
+@triton.jit(do_not_specialize=["num_reqs"])
 def _compute_global_topk_indices_and_lens_kernel(
     global_topk_indices_ptr,
     global_topk_indices_stride: tl.constexpr,
@@ -60,7 +62,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride: tl.constexpr,
-    num_reqs: tl.constexpr,
+    num_reqs,
     table_width: tl.constexpr,
     block_size: tl.constexpr,
     is_valid_token_ptr,
