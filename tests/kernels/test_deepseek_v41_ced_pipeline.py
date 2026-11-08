@@ -142,6 +142,8 @@ def make_model(seed, tail_capacity=128):
     torch.manual_seed(seed)
     model = DeepseekV4Model.__new__(DeepseekV4Model)
     nn.Module.__init__(model)
+    model.start_layer, model.end_layer = 0, 40
+    model.pp4 = False
     model.config = SimpleNamespace(hidden_size=HIDDEN)
     model.ced_tail = CEDTailState(1, HIDDEN, window=tail_capacity).cuda()
     model.norm = RMSNorm(HIDDEN, 1e-6).cuda().bfloat16()
@@ -273,7 +275,12 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
     tail_capacity,
     dspark,
     default_vllm_config,
+    monkeypatch,
 ):
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4_1.nvidia.model.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
     torch.manual_seed(83)
     boundary = torch.randn(length, 4, HIDDEN, device="cuda", dtype=torch.bfloat16)
     pre_mix = torch.softmax(torch.randn(length, 4, device="cuda"), -1)

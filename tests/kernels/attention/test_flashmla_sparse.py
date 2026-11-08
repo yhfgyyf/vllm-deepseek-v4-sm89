@@ -623,6 +623,88 @@ def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
     assert expected_rows[1] != expected_rows[5]
 
 
+@pytest.mark.parametrize("query_lens", [(6, 100), (1, 4000)])
+@pytest.mark.parametrize("with_images", [False, True])
+def test_v41_vision_uses_causal_swa_in_mixed_and_chunked_batches(
+    query_lens, with_images
+):
+    """V4.1 image spans must not expose future keys or widen text SWA rows."""
+    from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
+        DeepseekV41NativeSWAMetadataBuilder,
+    )
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        ModelArchConfigConvertorBase,
+    )
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    hf = DeepseekV41Config(
+        text_config={"sliding_window": 128, "compress_ratios": [0]},
+        vision_config={"num_hidden_layers": 1, "max_image_tokens": 1024},
+    )
+    total = sum(query_lens)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=hf,
+            max_model_len=4096,
+            is_mm_prefix_lm=ModelArchConfigConvertorBase(hf, hf).is_mm_prefix_lm(),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=total),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5,
+            parallel_drafting=False,
+            enable_adaptive_verification=False,
+            use_dspark=lambda: True,
+        ),
+    )
+    builder = DeepseekV41NativeSWAMetadataBuilder(
+        kv_cache_spec=SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+        layer_names=["model.layers.0.attn.swa_cache"],
+        vllm_config=config,
+        device=torch.device("cuda"),
+    )
+    starts = [0, query_lens[0], total]
+    blocks = [list(range(10, 138)), list(range(200, 328))]
+    to_req = [0] * query_lens[0] + [1] * query_lens[1]
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        query_start_loc_cpu=torch.tensor(starts, dtype=torch.int32),
+        seq_lens=torch.tensor([4000, 4000], dtype=torch.int32, device="cuda"),
+        seq_lens_cpu_upper_bound=torch.tensor([4000, 4000], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=total,
+        max_query_len=max(query_lens),
+        max_seq_len=4000,
+        block_table_tensor=torch.tensor(blocks, dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.arange(total, device="cuda"),
+        mm_req_doc_ranges={1: [(1900, 3947)]} if with_images else {},
+    )
+    metadata = builder.build(0, common)
+    expected, lengths = _golden_swa_rows(
+        seq_lens=[4000, 4000],
+        query_start_loc=starts,
+        block_table=blocks,
+        token_to_req=to_req,
+        block_size=32,
+        window_size=128,
+    )
+    actual = torch.cat((metadata.decode_swa_indices, metadata.prefill_swa_indices))
+    assert actual.shape == (total, 1, 128)
+    assert actual[:, 0].cpu().tolist() == expected
+    assert (
+        torch.cat((metadata.decode_swa_lens, metadata.prefill_swa_lens)).cpu().tolist()
+        == lengths
+    )
+    assert metadata.mm_prefix_query_ranges is None
+
+
 def test_flashinfer_mixed_sparse_indices_use_prefill_image_span():
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         build_flashinfer_mixed_sparse_indices,

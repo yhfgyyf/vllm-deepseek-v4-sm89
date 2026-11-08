@@ -6,9 +6,43 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, post_update
 
 DEVICE = current_platform.device_type
+
+
+def test_deferred_pp_post_update_applies_fresh_drafts_only_to_live_slots():
+    device = torch.device(DEVICE)
+    computed = torch.tensor([10, 20, 30], dtype=torch.int32, device=device)
+    sampled = torch.zeros(3, dtype=torch.int64, device=device)
+    drafts = torch.full((3, 3), -9, dtype=torch.int64, device=device)
+    all_ids = torch.zeros(3, 64, dtype=torch.int32, device=device)
+    lengths = torch.tensor([10, 20, 30], dtype=torch.int32, device=device)
+    post_update(
+        torch.tensor([2, -1, 0], dtype=torch.int64, device=device),
+        computed,
+        sampled,
+        None,
+        torch.tensor(
+            [[11, 12, 0, 0], [99, 0, 0, 0], [31, 0, 0, 0]],
+            dtype=torch.int64,
+            device=device,
+        ),
+        torch.tensor([2, 1, 1], dtype=torch.int32, device=device),
+        torch.tensor([1, 0, 3], dtype=torch.int32, device=device),
+        None,
+        all_ids,
+        lengths,
+        torch.tensor(
+            [[41, 42, 43], [99, 99, 99], [51, 52, 53]], dtype=torch.int64, device=device
+        ),
+        drafts,
+    )
+    assert computed.tolist() == [7, 20, 29]
+    assert sampled.tolist() == [31, 0, 12]
+    assert lengths.tolist() == [11, 20, 32]
+    assert drafts.tolist() == [[51, 52, 53], [-9, -9, -9], [41, 42, 43]]
+    assert all_ids[2, 30:32].tolist() == [11, 12]
 
 
 @pytest.mark.parametrize(

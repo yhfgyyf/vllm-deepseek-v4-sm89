@@ -232,11 +232,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         self.index_topk = config.index_topk
-        # Vision variant: image spans are visible bidirectionally, widening
-        # prefill SWA index rows by up to max_image_tokens columns.
+        # Extra CED retention is only needed for bidirectional image spans.
         self.max_image_tokens = (
             getattr(config, "vision_max_n_token", 0)
-            if getattr(config, "vision_n_layers", 0) > 0
+            if vllm_config.model_config.is_mm_prefix_lm
             else 0
         )
         # ---- v4.1 sparse-attention topology ----
@@ -387,6 +386,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     ".indexer.k_cache"
                 )
                 index_k_cache = self._static_forward_context.get(k_cache_prefix)
+                if (
+                    index_k_cache is None
+                    and vllm_config.parallel_config.pipeline_parallel_size == 4
+                ):
+                    index_k_cache = DeepseekV4IndexerCache(
+                        head_dim=_indexer_k_cache_head_dim(
+                            config.index_head_dim, dsv41_indexer_uses_fp4(vllm_config)
+                        ),
+                        dtype=torch.uint8,
+                        prefix=k_cache_prefix,
+                        cache_config=cache_config,
+                        compress_ratio=self.compress_ratio,
+                    )
                 if index_k_cache is None:
                     raise NotImplementedError(
                         f"Indexer K cache source {k_cache_prefix} not found on "
@@ -489,10 +501,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.is_kv_source
                 and self.compressed_cache_prefix not in self._static_forward_context
             ):
-                raise NotImplementedError(
-                    f"Compressed-KV source {self.compressed_cache_prefix} not "
-                    "found on this rank; PP splits inside a v4.1 kv-sharing "
-                    "group are not supported."
+                if vllm_config.parallel_config.pipeline_parallel_size != 4:
+                    raise NotImplementedError(
+                        f"Compressed-KV source {self.compressed_cache_prefix} not "
+                        "found on this rank; this PP cache-sharing cut is unsupported."
+                    )
+                self.pp_remote_kv = DeepseekV41RemoteKVCache(
+                    head_dim=self.head_dim,
+                    dtype=torch.uint8,
+                    prefix=self.compressed_cache_prefix,
+                    cache_config=cache_config,
+                    compress_ratio=self.compress_ratio,
+                    backend_cls=self.backend_cls,
+                    kv_cache_dtype=self.kv_cache_dtype,
                 )
         else:
             self.compressed_cache_prefix = None
@@ -949,6 +970,24 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV41IndexerBackend
+
+
+class DeepseekV41RemoteKVCache(DeepseekV4IndexerCache):
+    """Stage-local replica populated from the producer's quantized row deltas."""
+
+    def __init__(self, *args, backend_cls, kv_cache_dtype: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backend_cls = backend_cls
+        self.kv_cache_dtype = kv_cache_dtype
+        self.is_kv_source = True
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self.backend_cls
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        spec = DeepseekV4Attention.get_kv_cache_spec(self, vllm_config)
+        assert spec is not None
+        return spec
 
 
 class DeepseekV4Indexer(nn.Module):

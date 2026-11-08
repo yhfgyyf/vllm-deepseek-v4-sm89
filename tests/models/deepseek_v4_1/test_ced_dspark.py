@@ -162,3 +162,107 @@ def test_non_ced_dspark_preserves_normal_dense_auxiliary_context(dummy_run):
             list(range(256, 260)),
             list(range(4)),
         ]
+
+
+@pytest.mark.parametrize("ced", [False, True])
+@pytest.mark.parametrize("column_last_sampled", [False, True])
+def test_cross_stage_draft_relay_preserves_request_order_with_different_slots(
+    ced, column_last_sampled
+):
+    from vllm.v1.worker.gpu.spec_decode.pp_draft import PPDraftGroup
+
+    messages: list[torch.Tensor] = []
+    readers = iter(messages)
+
+    def relay(source):
+        group = object.__new__(PPDraftGroup)
+        group.participates = True
+        group.is_source = source
+        group.hidden_size, group.num_aux = 2, 3
+        group.aux_buffer = torch.empty(256, 6)
+        group.values = torch.zeros(15, dtype=torch.int64)
+        group.temperatures = torch.zeros(3)
+        group.last_sampled = torch.full((3,), -1, dtype=torch.int64)
+        group.next_prefill = torch.full((1, 3), -1, dtype=torch.int64)
+        group.seeds = torch.full((3,), -1, dtype=torch.int64)
+        group.temperature = torch.full((3,), -1.0)
+
+        def broadcast(value, src):
+            assert src == 2
+            if source:
+                messages.append(value.clone())
+            else:
+                value.copy_(next(readers))
+
+        group.tp = SimpleNamespace(broadcast=broadcast)
+        return group
+
+    plan = plan_ced_step(
+        (CEDRequest(2, 512, 1, 513, True), CEDRequest(0, 18, 3, 18, False))
+    )
+    rows = plan.num_decoder_tokens if ced else 4
+    aux = [torch.arange(rows * 2).view(rows, 2).float() + i for i in range(3)]
+    source_step = CEDStep(plan, {}, torch.tensor(plan.positions))
+    source_step.draft_context = CEDDraftContext(
+        source_step.positions, torch.empty(0), plan.decoder_requests, aux
+    )
+    destination_step = CEDStep(plan, {}, torch.tensor(plan.positions))
+    source_batch = SimpleNamespace(
+        num_reqs=2, num_tokens=4, idx_mapping=torch.tensor([2, 0]), has_prefill=ced
+    )
+    destination_batch = SimpleNamespace(
+        num_reqs=2, num_tokens=4, idx_mapping=torch.tensor([1, 2]), has_prefill=ced
+    )
+    producer, receiver = relay(True), relay(False)
+    proposer = SimpleNamespace(hidden_states=torch.zeros(256, 2), propose=Mock())
+    producer.propose(
+        proposer,
+        source_batch,
+        {CED_METADATA_KEY: source_step} if ced else {},
+        {},
+        aux_hidden_states=aux,
+        num_sampled=torch.tensor([1, 2]),
+        num_rejected=torch.tensor([0, 2]),
+        last_sampled=torch.tensor([20, 30, 40]).reshape(3, 1)
+        if column_last_sampled
+        else torch.tensor([20, 30, 40]),
+        next_prefill_tokens=torch.tensor([[50, 60, 70]]),
+        temperature=torch.tensor([0.2, 0.3, 0.4]),
+        seeds=torch.tensor([80, 90, 100]),
+    )
+    receiver.propose(
+        proposer,
+        destination_batch,
+        {CED_METADATA_KEY: destination_step} if ced else {},
+        {},
+    )
+    args = proposer.propose.call_args.args
+    assert args[0] is destination_batch
+    assert args[5].tolist() == [1, 2]
+    assert args[6].tolist() == [0, 2]
+    assert args[7].tolist() == [-1, 40, 20]
+    assert args[8].tolist() == [[-1, 70, 50]]
+    torch.testing.assert_close(args[9], torch.tensor([-1.0, 0.4, 0.2]))
+    assert args[10].tolist() == [-1, 100, 80]
+    for actual, expected in zip(args[4], aux):
+        torch.testing.assert_close(actual, expected)
+    if ced:
+        context = destination_step.draft_context
+        assert context.positions is destination_step.positions
+        assert context.request_indices.tolist() == [1] * 3 + [0] * 128
+        assert context.active_requests == (1, 0)
+        assert rows == 131  # Replay must not be truncated to the four target rows.
+
+
+def test_cross_stage_draft_skips_unfinished_encoder_chunk():
+    from vllm.v1.worker.gpu.spec_decode.pp_draft import PPDraftGroup
+
+    group = object.__new__(PPDraftGroup)
+    group.participates = True
+    group.tp = Mock()
+    plan = plan_ced_step((CEDRequest(0, 0, 128, 512, True),))
+    step = CEDStep(plan, {}, torch.tensor(plan.positions))
+    proposer = SimpleNamespace(draft_tokens=torch.zeros(1, 5), propose=Mock())
+    group.propose(proposer, SimpleNamespace(num_reqs=1), {CED_METADATA_KEY: step}, {})
+    group.tp.broadcast.assert_not_called()
+    proposer.propose.assert_not_called()

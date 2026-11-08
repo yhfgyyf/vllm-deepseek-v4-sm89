@@ -227,6 +227,55 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
     assert runner.profile_cudagraph_memory() == 42
 
 
+def test_capture_memory_excludes_adaptive_calibration_scratch(monkeypatch):
+    """Eager calibration allocations are already covered by activation profiling."""
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    free_bytes = 1000
+
+    def capture(*args, **kwargs):
+        nonlocal free_bytes
+        free_bytes = 800
+
+    def calibrate(**kwargs):
+        nonlocal free_bytes
+        free_bytes = 100
+
+    runner.cudagraph_manager = SimpleNamespace(
+        needs_capture=lambda: True,
+        capture=capture,
+        captured_token_counts=lambda: [1],
+    )
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.lora_config = None
+    runner.pcp_manager = None
+    runner.speculator = None
+    runner.use_aux_hidden_state_outputs = False
+    for name in (
+        "model",
+        "input_buffers",
+        "intermediate_tensors",
+        "block_tables",
+        "attn_groups",
+        "kv_cache_config",
+    ):
+        setattr(runner, name, None)
+    runner.adaptive_verification = SimpleNamespace(
+        batches_to_profile=lambda _: [{}],
+        set_initial_cost_curves=lambda _: None,
+    )
+    runner.step_timing = SimpleNamespace(collect=lambda: contextlib.nullcontext([]))
+    runner._dummy_run = calibrate
+    runner.maybe_setup_dummy_loras = lambda _: contextlib.nullcontext()
+    monkeypatch.setattr(mrv2, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext)
+    monkeypatch.setattr(mrv2.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "get_memory_info", lambda: (free_bytes, 1000)
+    )
+
+    assert runner.capture_model() == 200
+    assert free_bytes == 100  # Calibration still runs before startup completes.
+
+
 def test_extrapolate_full_graph_memory():
     mib = 1 << 20
     # No samples (e.g. no FULL graphs): nothing to add.

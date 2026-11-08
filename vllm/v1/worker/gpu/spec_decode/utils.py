@@ -3,9 +3,51 @@
 import numpy as np
 import torch
 
+from vllm.config import LoadConfig, VllmConfig, replace
+from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
+
+
+def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
+    """Avoid WORLD loader collectives when only the final stage loads a draft."""
+    if get_pp_group().world_size > 1 and load_config.load_format == "fastsafetensors":
+        logger.warning_once(
+            "fastsafetensors uses WORLD collectives, but the draft model is "
+            "loaded only on the final PP stage. Falling back to the auto "
+            "loader for the draft model only; the target loader is unchanged."
+        )
+        return replace(load_config, load_format="auto")
+    return load_config
+
+
+def get_pp_draft_parallel_config(vllm_config: VllmConfig):
+    """Keep existing TP/DP/EP settings while disabling draft PP partitioning."""
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.pipeline_parallel_size == 1:
+        return parallel_config
+    spec = vllm_config.speculative_config
+    assert spec is not None
+    if (
+        spec.draft_parallel_config.tensor_parallel_size
+        != parallel_config.tensor_parallel_size
+    ):
+        if not (
+            spec.method == "dspark"
+            and parallel_config.tensor_parallel_size == 2
+            and parallel_config.pipeline_parallel_size == 4
+            and spec.draft_parallel_config.tensor_parallel_size == 4
+            and spec.draft_model_config.hf_config.model_type == "deepseek_v41"
+        ):
+            raise ValueError("PP drafting requires the target stage's TP size")
+        return replace(
+            parallel_config, pipeline_parallel_size=1, tensor_parallel_size=4
+        )
+    return replace(parallel_config, pipeline_parallel_size=1)
 
 
 class DraftTokensHandler:

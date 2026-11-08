@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_mod
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
+    merge_pp_cost_curves,
 )
 from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
 
@@ -108,6 +109,39 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert draft_budget == 1
     assert valid_drafts == {"low": 2, "high": 2}
     assert num_non_draft_tokens == {"low": 1, "high": 1}
+
+
+def test_pp_follower_uses_owner_budget_despite_different_stale_confidences():
+    manager = make_manager(np.zeros((2, 2), dtype=np.float32), np.ones(7))
+    tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+        pp_num_tokens=5,
+    )
+    assert tokens == 5
+    assert manager._batch_budget[2] == 3
+    with pytest.raises(ValueError, match="outside"):
+        manager.get_num_tokens(
+            {"low": 3, "high": 3},
+            {"low": [1, 2], "high": [3, 4]},
+            pp_num_tokens=7,
+        )
+
+
+def test_pp_costs_include_both_targets_and_only_last_stage_draft():
+    assert merge_pp_cost_curves(
+        [
+            ([(1, 99.0)], [(1, 2.0), (4, 4.0)]),
+            ([(1, 1.5)], [(1, 3.0), (4, 6.0)]),
+        ]
+    ) == ([(1, 1.5)], [(1, 5.0), (4, 10.0)])
+    with pytest.raises(ValueError, match="different target sizes"):
+        merge_pp_cost_curves(
+            [
+                ([(1, 0.0)], [(1, 2.0)]),
+                ([(1, 1.5)], [(2, 3.0)]),
+            ]
+        )
 
 
 def test_profiled_batches_seed_cost_curves_via_consumer():
@@ -315,3 +349,20 @@ def test_device_reallocation_updates_mixed_prefill_and_clears_zero_budget():
         assert starts[4:].tolist() == [6 + budget, 6 + budget]
         assert logits.tolist() == expected_logits.tolist()
         assert manager._batch_draft_capacity[:3].tolist() == expected_capacities
+
+    # A PP follower must preserve the owner's layout even when its confidence
+    # table would rank requests differently. The final row is chunked prefill.
+    manager._batch_budget = (
+        dict(zip(req_ids, [2, 2, 0])),
+        dict(zip(req_ids, [1, 1, 4])),
+        2,
+    )
+    owner_capacities = torch.tensor([2, 0, 0], dtype=torch.int32, device="cuda")
+    logits, starts, _ = manager.reallocate_drafts(
+        req_ids, indices, pp_capacities=owner_capacities
+    )
+    assert starts[:4].tolist() == [0, 3, 4, 8]
+    assert logits.tolist() == [0, 3, 4, 5]
+    send_snapshot = manager.get_pp_capacities(3)
+    manager._batch_draft_capacity.zero_()
+    assert send_snapshot.tolist() == [2, 0, 0]

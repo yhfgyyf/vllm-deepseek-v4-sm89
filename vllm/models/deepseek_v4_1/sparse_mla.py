@@ -59,9 +59,7 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        compress_ratios = getattr(
-            self.vllm_config.model_config.hf_config, "compress_ratios", None
-        ) or [0]
+        compress_ratios = self._get_layer_compress_ratios(default_ratio=0)
         self._layer_types = {
             deepseek_v41_layer_type(int(ratio)) for ratio in compress_ratios
         }

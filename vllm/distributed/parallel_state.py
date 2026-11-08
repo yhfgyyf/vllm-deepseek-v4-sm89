@@ -98,7 +98,7 @@ class _RetainedHandle:
         self._waited = False
 
     def is_completed(self) -> bool:
-        return all(w.is_completed() for w in self._works)
+        return self._waited or all(w.is_completed() for w in self._works)
 
     def wait(self) -> None:
         if self._waited:
@@ -1115,9 +1115,9 @@ class GroupCoordinator:
 
         gloo ``Work.is_completed()`` is unreliable (it can report completion
         before the background copy of the source buffer finishes), so the
-        metadata handle (``handles[0]``, a gloo-backed ``_RetainedHandle``) is
-        never used as the completion gate. Instead we gate on the tensor-send
-        handles (``handles[1:]``), which run on the device backend where
+        metadata and CPU-tensor handles are not used as the completion gate
+        when device tensors are present. Instead we gate on the device-send
+        handles, which run on the device backend where
         ``is_completed()`` is reliable. Once all tensor sends are done the
         peer must already have posted the matching tensor recvs — and since
         the receiver ingests metadata before tensors, the gloo metadata send
@@ -1134,16 +1134,25 @@ class GroupCoordinator:
             # super().__init__ may not have the attribute yet.
             self._pending_isends = pending = deque()
         while pending:
-            handles, _ = pending[0]
+            handles, tensors = pending[0]
             tensor_handles = handles[1:]
             if not tensor_handles:
                 pending.popleft()
                 continue
-            if not all(h.is_completed() for h in tensor_handles):
+            device_handles = [
+                h for h, t in zip(tensor_handles, tensors) if not t.is_cpu
+            ]
+            if not all(h.is_completed() for h in (device_handles or tensor_handles)):
                 # The oldest send is still in flight; FIFO ordering means the
                 # rest are no further along, so stop here.
                 break
             handles[0].wait()
+            # Mixed PP payloads include CPU adaptive budgets. Gloo's completion
+            # query may stay false until wait(); device completion guarantees
+            # the receiver has progressed past the metadata and posted receives.
+            for handle, tensor in zip(tensor_handles, tensors):
+                if tensor.is_cpu:
+                    handle.wait()
             pending.popleft()
 
     def isend_tensor_dict(
@@ -1157,9 +1166,9 @@ class GroupCoordinator:
 
         The returned handles are additionally self-retained in
         ``self._pending_isends`` (together with the sent source tensors) and
-        reaped lazily on subsequent calls, so fire-and-forget callers that
-        drop the handles cannot free or overwrite the send buffers while the
-        sends are still in flight. Callers that do keep the handles may
+        reaped lazily on subsequent calls. CUDA payloads are snapshotted so
+        a later graph replay cannot overwrite an in-flight send; CPU sources
+        must remain unchanged until completion. Callers that keep the handles may
         ``wait()`` them as before; the retention entry is dropped on reap
         either way.
         """
@@ -1207,10 +1216,17 @@ class GroupCoordinator:
             ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
+            if tensor.is_cuda:
+                # Retention prevents deallocation, not graph-buffer reuse.
+                # Copy only this rank's TP slice on the producer stream.
+                tensor = tensor.clone()
+
             comm_group = metadata_group if tensor.is_cpu else group
             handle = torch.distributed.isend(
                 tensor, dst=self.ranks[dst], group=comm_group
             )
+            if tensor.is_cpu:
+                handle = _RetainedHandle([handle], (tensor,))
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
@@ -1585,6 +1601,20 @@ def get_ep_group() -> GroupCoordinator:
         "This function should only be called for MoE models."
     )
     return _EP
+
+
+@contextmanager
+def use_draft_parallel_groups(tp: GroupCoordinator, ep: GroupCoordinator | None = None):
+    """Temporarily select draft groups on a worker's execution thread."""
+    global _TP, _EP
+    old_tp, old_ep = _TP, _EP
+    _TP = tp
+    if ep is not None:
+        _EP = ep
+    try:
+        yield
+    finally:
+        _TP, _EP = old_tp, old_ep
 
 
 _EPLB: GroupCoordinator | None = None

@@ -782,7 +782,9 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         # Workspace/IntermediateCache allocation accounting for output buffer
         # provisioning
-        workspace1 = (M * topk, max(N, K))
+        # Activation storage is dead before the final expert reduction writes
+        # output. The modular allocator separately takes max(workspace1, output).
+        workspace1 = (M * topk, N)
         workspace2 = (M * topk * max(2 * N, K),)
         output = (M, K)
 

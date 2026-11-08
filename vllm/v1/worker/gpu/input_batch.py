@@ -551,12 +551,21 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    broadcast_drafts_ptr,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    NUM_DRAFTS: tl.constexpr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
         # Filter rows with negative index entries.
         return
+
+    if broadcast_drafts_ptr is not None:
+        for i in range(NUM_DRAFTS):
+            token = tl.load(broadcast_drafts_ptr + req_id * NUM_DRAFTS + i)
+            tl.store(draft_tokens_ptr + req_state_idx * draft_tokens_stride + i, token)
 
     total_len = tl.load(total_len_ptr + req_state_idx)
     num_sampled = tl.load(num_sampled_ptr + req_id)
@@ -618,6 +627,8 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    broadcast_drafts: torch.Tensor | None = None,
+    draft_tokens: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_kernel[(num_reqs,)](
@@ -634,6 +645,10 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        broadcast_drafts,
+        draft_tokens,
+        draft_tokens.stride(0) if draft_tokens is not None else 0,
+        broadcast_drafts.shape[1] if broadcast_drafts is not None else 0,
         num_warps=1,
     )
 
