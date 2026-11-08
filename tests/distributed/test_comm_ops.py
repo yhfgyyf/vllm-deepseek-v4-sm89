@@ -521,6 +521,33 @@ def test_isend_tensor_dict_self_retains_for_fire_and_forget(
     assert handles0[0]._retained == ()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("tp_slice", [False, True])
+def test_isend_tensor_dict_preserves_cuda_payload_after_producer_reuse(
+    monkeypatch: pytest.MonkeyPatch, tp_slice: bool
+) -> None:
+    """A later graph replay must not overwrite an in-flight PP send."""
+    posted: list[torch.Tensor] = []
+
+    def delayed_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        if t.is_cuda:
+            posted.append(t)
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "isend", delayed_isend)
+    group = _make_group_for_unit_test()
+    producer = torch.arange(8, dtype=torch.float32, device="cuda")
+    group.isend_tensor_dict(
+        {"hidden_states": producer},
+        dst=1,
+        all_gather_group=_DummyAllGatherGroup(2, 1) if tp_slice else None,
+    )
+    producer.fill_(-1)
+    expected = torch.arange(4 if tp_slice else 0, 8, dtype=torch.float32)
+    assert len(posted) == 1
+    torch.testing.assert_close(posted[0].cpu(), expected)
+
+
 def test_send_tensor_dict_sync_path_does_not_self_retain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -537,6 +564,37 @@ def test_send_tensor_dict_sync_path_does_not_self_retain(
 
     # the sync path waited every handle, so no retention entry may leak.
     assert len(g._pending_isends) == 0
+
+
+@pytest.mark.parametrize("wait_cpu_first", [False, True])
+def test_mixed_pp_send_reclaims_gpu_buffers_with_stale_gloo_completion(
+    monkeypatch: pytest.MonkeyPatch, wait_cpu_first: bool
+) -> None:
+    works: list[_DummyWork] = []
+
+    def fake_isend(t, *args, **kwargs):
+        work = _DummyWork()
+        works.append(work)
+        return work
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+    group = _make_group_for_unit_test()
+    handles = group.isend_tensor_dict(
+        {"hidden": torch.empty(4, device="meta"), "budget": torch.tensor([4])}
+    )
+    # Size, metadata, device tensor, CPU budget. A completed Gloo p2p send
+    # can keep reporting false until wait(), unlike the device Work.
+    cpu_work = works[-1]
+    monkeypatch.setattr(cpu_work, "is_completed", lambda: False)
+    if wait_cpu_first:
+        handles[-1].wait()
+    group._reap_completed_isends()
+    assert len(group._pending_isends) == 1  # GPU transfer is still in flight.
+    works[-2].completed = True
+    group._reap_completed_isends()
+    assert len(group._pending_isends) == 0
+    handles[-1].wait()
+    assert cpu_work.wait_calls == 1  # Re-waiting a Gloo p2p Work can hang.
 
 
 def test_async_intermediate_tensors_lazy_wait() -> None:

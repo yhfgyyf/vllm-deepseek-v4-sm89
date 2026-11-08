@@ -300,12 +300,11 @@ CED 当前是实验性的近似 prefill 路径。在已测长文本 prefill 中�
 长度和运行配置变化。它不保证与非 CED 路径输出等价；部署前应按实际任务验证
 质量，也不能把文本测试的收益推广到图片请求。
 
-本仓库源码在 PR #112 的前端保护基础上增加了 CED 图片输入路径，按请求中的
-全部图片范围处理单图和多图；图片与最后 128 个 query token 相交时，回放边界
-向前扩展以保留完整图片，不会自动关闭 CED。可保留 DSpark 和 prefix caching。
-按需设置 `--limit-mm-per-prompt '{"image":2}'`；每张图片必须能放入一个 prefill
-chunk，扩展回放也必须满足 batch token 预算。视觉模型每卡预留
-`128 + vision_max_n_token` 行回放状态，增加 TP 不会按比例减少这部分显存。
+当前 `main` 保留 CED 单图、多图输入、DSpark 和 prefix caching，并将 V4.1
+语言模型的图片 token 修正为因果 SWA；这项共享语义修复同时适用于 SM89 和 SM120。
+视觉编码器仍然保留，CED 回放保持最后 128 个 query token，不再因图片跨度扩展
+回放窗口。按需设置 `--limit-mm-per-prompt '{"image":2}'`。
+历史 `vision11` wheel / 镜像仍使用此前的图片窗口语义，未包含本次修复。
 非图片模态、prompt embeddings 和 prompt logprobs 仍在进入引擎前被拒绝。
 
 图片路径已有 CPU 回归、SM120 单卡小型权重 GPU 数值测试，以及真实缓存管理器
@@ -391,16 +390,17 @@ prefill 和 decode，不是单请求或纯 decode 速度。此为一次测量，
 stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接受率或最终返回
 客户端的 accepted-token 数。随机输入的这些结果不代表质量评估。
 
-### 3.3 SM89：8× RTX 4090 48GB
+### 3.3 SM89：8×48GB GPU（L20 / RTX 4090 48GB）
 
-以下是 **8 张 48GB 版 RTX 4090** 的启动配置，不适用于普通 24GB 版。
-保留 TP8/EP、FP8 KV、Engram CPU offload、CED 图片输入、DSpark 5 adaptive
-和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
+以下配置面向 **8 张 48GB SM89 GPU**，不适用于普通 24GB 版 RTX 4090。
+默认主模型 TP4×PP2（20/20 层）、DSpark TP4、`max-num-seqs=4`，可选主模型
+TP2×PP4（10/10/10/10 层）。保留 EP、FP8 KV、Engram CPU offload、CED 图片输入、
+DSpark 5 adaptive 和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
 内存，不能只按 GPU 权重大小估算整机内存需求。
 
-先按第 2.1 节安装 **vision11 wheel**，或按第 2.2 节安装包含 CED 图片支持的
-当前 `main` 源码，也可使用第 2.3 节的 GHCR `vision11` 镜像；历史 ACR `vision7`
-镜像不能用于本示例的 CED 图片路径。在该环境中启动：
+本节 PP/DSpark 组合需要按第 2.2 节安装更新后的 **`main` 源码**；已有的
+`vision11` wheel / 镜像未包含本次 PP 更新。两种并行方式已在 8×L20 上验证；
+本节保留原示例其余参数，容量与吞吐仍需按实际 GPU 和负载检查。在该环境中启动：
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -410,13 +410,15 @@ export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
 export VLLM_USE_V2_MODEL_RUNNER=1
 unset TRITON_PTXAS_BLACKWELL_PATH
+unset VLLM_PP_LAYER_PARTITION
 
 vllm serve /path/to/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v4.1-flash \
   --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
-  --tensor-parallel-size 8 \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
@@ -442,6 +444,11 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
+- 可选 **TP2×PP4，DSpark TP4**：启动前设置
+  `export VLLM_PP_LAYER_PARTITION=10,10,10,10`，将并行参数改为
+  `--tensor-parallel-size 2 --pipeline-parallel-size 4`，并在原
+  `--speculative-config` JSON 中增加 `"draft_tensor_parallel_size":4`，其余不变。
+  草稿模型使用后四张卡的独立 TP4/EP4 组。切回默认 TP4×PP2 时清除该层分配环境变量。
 - 若需要降低 prefill 峰值显存，将 `--max-num-batched-tokens 4096` 替换为
   `--max-num-batched-tokens 2048`，其余参数不变。此调整也会影响工作区、图捕获
   阶段显存和长输入分块数量，不能假设显存或吞吐按同一比例变化。

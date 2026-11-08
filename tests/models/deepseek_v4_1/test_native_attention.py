@@ -10,6 +10,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.attention import (
     DeepseekV4IndexerCache,
+    DeepseekV41RemoteKVCache,
     DeepseekV41SWACache,
 )
 from vllm.models.deepseek_v4_1.nvidia import dspark as dspark_module
@@ -21,7 +22,12 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV41NativeSWABackend,
     DeepseekV41NativeSWAMetadataBuilder,
 )
+from vllm.models.deepseek_v4_1.sparse_mla import (
+    DeepseekV41SparseSWAMetadataBuilder,
+    deepseek_v41_layer_type,
+)
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backends.mla import sparse_swa
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
@@ -30,6 +36,91 @@ def test_v41_native_backends_advertise_native_cache_page_sizes():
     assert DeepseekV41NativeSparseBackend.get_supported_kernel_block_sizes() == [128]
     assert DeepseekV41NativeSWABackend.get_supported_kernel_block_sizes() == [32]
     assert DeepseekV41NativeSWABackend.get_preferred_block_size(64) == 32
+
+
+@pytest.mark.parametrize("query_lens", [[1] * 8, [8], [1, 1, 6]])
+def test_swa_mixed_metadata_fits_one_token_capacity(monkeypatch, query_lens):
+    """Decode and prefill must retain separate rows without two full matrices."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=128,
+            is_mm_prefix_lm=False,
+            hf_config=SimpleNamespace(sliding_window=128),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        speculative_config=None,
+    )
+    builder = sparse_swa.DeepseekSparseSWAMetadataBuilder(
+        kv_cache_spec=SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+        layer_names=["model.layers.0.attn.swa_cache"],
+        vllm_config=config,
+        device=torch.device("cpu"),
+    )
+
+    def write_rows(indices, lens, *args, num_tokens, token_offset):
+        indices[:num_tokens] = torch.arange(token_offset, token_offset + num_tokens)[
+            :, None, None
+        ]
+        lens[:num_tokens] = 128
+
+    monkeypatch.setattr(sparse_swa, "_COMPUTE_SWA_INDICES_AND_LENS_KERNEL", write_rows)
+    monkeypatch.setattr(builder, "_build_deepseek_v4_metadata", lambda *args: {})
+    monkeypatch.setattr(builder, "_build_mm_prefix_query_ranges", lambda _: None)
+    monkeypatch.setattr(
+        builder,
+        "build_tile_scheduler",
+        lambda _: dict.fromkeys(["swaonly", "c4a", "c128a", "c1a", "c2a"]),
+    )
+    starts = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(0)
+    common = SimpleNamespace(
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor(query_lens, dtype=torch.int32),
+        num_reqs=len(query_lens),
+        num_actual_tokens=8,
+        max_query_len=max(query_lens),
+        causal=True,
+        block_table_tensor=torch.zeros((len(query_lens), 4), dtype=torch.int32),
+        slot_mapping=torch.arange(8),
+        token_to_req_indices=lambda out: out,
+    )
+    metadata = builder.build(0, common)
+    parts = [metadata.decode_swa_indices, metadata.prefill_swa_indices]
+    rows = torch.cat([part[:, 0, 0] for part in parts if part is not None])
+    torch.testing.assert_close(rows, torch.arange(8, dtype=torch.int32))
+    storages = {
+        part.untyped_storage().data_ptr(): part.untyped_storage().nbytes()
+        for part in (builder.decode_swa_indices, builder.prefill_swa_indices)
+    }
+    assert sum(storages.values()) == 8 * 128 * 4
+
+
+@pytest.mark.parametrize("layers", [[], [0, 1], [2, 8, 14], [20, 24, 36], [40, 41, 42]])
+def test_v41_swa_scheduler_plans_use_only_stage_local_layers(monkeypatch, layers):
+    ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+
+    def fake_base_init(self):
+        self.layer_names = [f"model.layers.{index}.attn.swa_cache" for index in layers]
+        self.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(compress_ratios=ratios)
+            )
+        )
+
+    monkeypatch.setattr(
+        DeepseekV41SparseSWAMetadataBuilder.__bases__[0], "__init__", fake_base_init
+    )
+    builder = DeepseekV41SparseSWAMetadataBuilder()
+    assert builder._layer_types == {
+        deepseek_v41_layer_type(ratios[index]) for index in layers
+    }
 
 
 @pytest.mark.parametrize(
@@ -120,6 +211,85 @@ def test_v41_cache_specs_match_native_row_layouts():
     assert merged_swa.state_content_bytes == 528
     assert merged_global.model_version == "deepseek_v4_1"
     assert merged_global.state_content_bytes == 288
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_pp_remote_cache_keeps_the_native_source_allocation_contract(ratio):
+    remote = DeepseekV41RemoteKVCache.__new__(DeepseekV41RemoteKVCache)
+    remote.is_kv_source = True
+    remote.head_dim = 512
+    remote.compress_ratio = ratio
+    remote.kv_cache_dtype = "fp8_ds_mla"
+    remote.backend_cls = DeepseekV41NativeSparseBackend
+    spec = remote.get_kv_cache_spec(
+        SimpleNamespace(cache_config=SimpleNamespace(block_size=128))
+    )
+    assert spec.tokens_per_state == ratio
+    assert spec.state_content_bytes == 288
+    assert spec.alignment == 32
+    assert remote.get_attn_backend() is DeepseekV41NativeSparseBackend
+
+
+@pytest.mark.parametrize(
+    "heads,tokens",
+    [(8, 7), (16, 1), (16, 7), (16, 128), (32, 1), (32, 7), (32, 128)],
+)
+@pytest.mark.parametrize("global_count", [0, 128])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_tp2_heads_match_float32_attention_with_grouped_inverse_rope(
+    heads, tokens, global_count
+):
+    """Check the native kernel and every output group at TP4/TP2 head counts."""
+    from flashinfer.mla.deepseek_v41 import (
+        _deepseek_v41_mixed_sparse_attention_with_inv_rope,
+    )
+
+    torch.manual_seed(42)
+    device = "cuda"
+    swa_values = torch.randint(-4, 5, (128, 512), device=device).float()
+    swa = torch.empty((4, 32, 528), dtype=torch.uint8, device=device)
+    swa.view(128, 528)[:, :512] = swa_values.to(torch.float8_e4m3fn).view(torch.uint8)
+    swa.view(128, 528)[:, 512:] = 127  # UE8M0 scale 1.
+    codes = torch.randint(0, 16, (128, 512), device=device, dtype=torch.uint8)
+    global_cache = torch.empty((1, 128, 288), dtype=torch.uint8, device=device)
+    global_cache[0, :, :256] = codes[:, ::2] | (codes[:, 1::2] << 4)
+    global_cache[0, :, 256:] = 56  # E4M3 scale 1.
+    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+    global_values = levels[(codes & 7).long()] * torch.where(codes < 8, 1, -1)
+    q = (torch.randn(tokens, heads, 512, device=device) * 0.2).bfloat16()
+    sinks = torch.linspace(-1, 1, heads, device=device)
+    swa_slots = torch.arange(128, dtype=torch.int32, device=device).repeat(tokens, 1)
+    swa_slots[:, 97:] = -1
+    global_slots = swa_slots.clone() if global_count else None
+    values = torch.cat(
+        [swa_values[:97]] + ([global_values[:97]] if global_count else [])
+    )
+    scores = torch.einsum("thd,kd->thk", q.float(), values) / (512**0.5)
+    scores = torch.cat((scores, sinks[None, :, None].expand(tokens, -1, 1)), dim=-1)
+    expected = torch.einsum("thk,kd->thd", scores.softmax(-1)[..., :-1], values)
+    # An identity rotation isolates head grouping and nonzero output offset.
+    cos_sin = torch.cat((torch.ones(tokens, 32), torch.zeros(tokens, 32)), dim=-1).to(
+        device
+    )
+    grouped = torch.full(
+        (heads // 8, tokens + 2, 4096), 17, device=device, dtype=torch.bfloat16
+    )
+    _deepseek_v41_mixed_sparse_attention_with_inv_rope(
+        q,
+        swa,
+        global_cache if global_count else None,
+        swa_slots,
+        global_slots,
+        512**-0.5,
+        sinks,
+        positions=torch.arange(tokens, device=device),
+        cos_sin=cos_sin,
+        grouped_out=grouped,
+        token_offset=1,
+    )
+    actual = grouped[:, 1:-1].transpose(0, 1).reshape(tokens, heads, 512)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
+    assert (grouped[:, 0] == 17).all() and (grouped[:, -1] == 17).all()
 
 
 @pytest.mark.parametrize(
@@ -281,10 +451,17 @@ def test_v41_output_projection_consumes_grouped_epilogue_without_second_rope():
 
 
 @pytest.mark.parametrize(
-    ("max_model_len", "expected_max_swa_slots"), [(2048, 2048), (64, 128)]
+    ("max_model_len", "dspark_tokens", "mm_prefix", "expected_max_swa_slots"),
+    [
+        (1048576, None, False, 128),
+        (64, None, False, 128),
+        (1048576, 5, False, 192),
+        (2048, 127, False, 256),
+        (1048576, 5, True, 2048),
+    ],
 )
-def test_v41_native_attention_constructor_reserves_worst_case_workspace(
-    monkeypatch, max_model_len, expected_max_swa_slots
+def test_v41_native_attention_reserves_local_causal_or_dspark_workspace(
+    monkeypatch, max_model_len, dspark_tokens, mm_prefix, expected_max_swa_slots
 ):
     queries = []
     reservations = []
@@ -338,7 +515,20 @@ def test_v41_native_attention_constructor_reserves_worst_case_workspace(
         lambda: FakeWorkspaceManager(),
     )
 
-    DeepseekV41NativeMixedAttention(None, prefix="model.layers.0.attn")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_mm_prefix_lm=mm_prefix,
+            hf_config=SimpleNamespace(vision_max_n_token=1024),
+        ),
+        speculative_config=(
+            SimpleNamespace(
+                use_dspark=lambda: True, num_speculative_tokens=dspark_tokens
+            )
+            if dspark_tokens is not None
+            else None
+        ),
+    )
+    DeepseekV41NativeMixedAttention(config, prefix="model.layers.0.attn")
 
     assert queries == [(2048, 8, 128, expected_max_swa_slots, 512)]
     assert reservations == [((7000,), torch.uint8)]

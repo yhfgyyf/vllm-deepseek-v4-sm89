@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.warmup.jit_warmup import (
     WarmupIntRange,
 )
@@ -454,9 +455,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Detect which DeepseekV4 layer types this model uses so we only build a
         # FlashMLA tile-scheduler plan for types that will actually be called.
         # Models without compress_ratios (pure SWA) fall back to swaonly.
-        compress_ratios = getattr(hf_config, "compress_ratios", None) or [1]
         self._layer_types: set[str] = set()
-        for ratio in compress_ratios:
+        for ratio in self._get_layer_compress_ratios():
             self._layer_types.add(_layer_type_for(int(ratio)))
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -477,15 +477,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Allocated unconditionally — consumer picks paged-direct vs dequant
-        # at call time.
-        self.prefill_swa_indices = torch.zeros(
-            max_tokens,
-            1,
-            self.swa_index_width,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        # Decode and prefill partition the same token budget. Their metadata
+        # stays live together, so build() assigns disjoint rows of one buffer.
+        self.prefill_swa_indices = self.decode_swa_indices
         self.prefill_swa_lens = torch.zeros(
             max_tokens,
             dtype=torch.int32,
@@ -526,6 +520,18 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
+
+    def _get_layer_compress_ratios(self, default_ratio: int = 1) -> list[int]:
+        compress_ratios = getattr(
+            self.vllm_config.model_config.hf_config, "compress_ratios", None
+        )
+        if not compress_ratios:
+            return [default_ratio] * len(self.layer_names)
+        layer_indices = [extract_layer_index(name) for name in self.layer_names]
+        return [
+            compress_ratios[index] if index < len(compress_ratios) else default_ratio
+            for index in layer_indices
+        ]
 
     def build(
         self,
@@ -625,8 +631,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
+        prefill_swa_indices = None
         if num_prefill_tokens > 0:
-            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+            prefill_swa_indices = self.prefill_swa_indices[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
                 prefill_swa_indices,
@@ -672,11 +681,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             decode_swa_width=decode_swa_width,
-            prefill_swa_indices=(
-                self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
-            ),
+            prefill_swa_indices=prefill_swa_indices,
             prefill_swa_lens=(
                 self.prefill_swa_lens[:num_prefill_tokens]
                 if num_prefill_tokens > 0

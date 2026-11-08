@@ -1495,6 +1495,11 @@ class SpeculativeConfig:
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
                         self.draft_model_config.hf_config,
+                        allow_pp_dspark_tp4=(
+                            self.use_dspark()
+                            and self.draft_model_config.hf_config.model_type
+                            == "deepseek_v41"
+                        ),
                     )
                 )
                 self.draft_model_config.max_model_len = (
@@ -1507,7 +1512,13 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        allow_pp_dspark_tp4=(
+                            self.use_dspark()
+                            and self.draft_model_config.hf_config.model_type
+                            == "deepseek_v41"
+                        ),
                     )
                 )
 
@@ -1645,6 +1656,8 @@ class SpeculativeConfig:
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int | None,
         draft_hf_config: PretrainedConfig,
+        *,
+        allow_pp_dspark_tp4: bool = False,
     ) -> int:
         """
         Verifies and adjusts the tensor parallel size for a draft model
@@ -1665,6 +1678,13 @@ class SpeculativeConfig:
                 speculative_draft_tensor_parallel_size = (
                     target_parallel_config.tensor_parallel_size
                 )
+        elif (
+            allow_pp_dspark_tp4
+            and target_parallel_config.tensor_parallel_size == 2
+            and target_parallel_config.pipeline_parallel_size == 4
+            and speculative_draft_tensor_parallel_size == 4
+        ):
+            pass
         elif speculative_draft_tensor_parallel_size not in (
             1,
             target_parallel_config.tensor_parallel_size,
@@ -1697,13 +1717,27 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        *,
+        allow_pp_dspark_tp4: bool = False,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
+        if (
+            target_parallel_config.pipeline_parallel_size > 1
+            and speculative_draft_tensor_parallel_size
+            != target_parallel_config.tensor_parallel_size
+            and not (
+                allow_pp_dspark_tp4
+                and target_parallel_config.tensor_parallel_size == 2
+                and target_parallel_config.pipeline_parallel_size == 4
+                and speculative_draft_tensor_parallel_size == 4
+            )
+        ):
+            raise ValueError("PP drafting requires the target stage's TP size")
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,

@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.deepseek_v41 import (
@@ -63,7 +64,12 @@ from vllm.models.deepseek_v4.nvidia.model import (
 from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4_1.attention import (
+    DeepseekV4Attention,
+    _indexer_k_cache_head_dim,
+    _replace_layer_index,
+    dsv41_indexer_uses_fp4,
+)
 from vllm.models.deepseek_v4_1.nvidia.ced import (
     CED_METADATA_KEY,
     CEDDraftContext,
@@ -75,6 +81,7 @@ from vllm.models.deepseek_v4_1.nvidia.ced import (
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV41NativeMixedAttention,
 )
+from vllm.models.deepseek_v4_1.nvidia.pp_state import copy_cache_rows, pp_payload_shapes
 from vllm.models.deepseek_v4_1.nvidia.router import DeepseekV41TopKBiasRouter
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -84,6 +91,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..common.mm_preprocess import image_sentinel_mask
+from ..common.pipeline import validate_pipeline_partition
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -387,20 +395,50 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            validate_pipeline_partition(
+                config,
+                [
+                    get_pp_indices(config.num_hidden_layers, rank, pp_size)
+                    for rank in range(pp_size)
+                ],
+            )
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
+        self.pp4 = pp_size == 4
+        self.pp_index_width = (
+            _indexer_k_cache_head_dim(
+                config.index_head_dim, dsv41_indexer_uses_fp4(vllm_config)
+            )
+            if self.pp4
+            else 0
+        )
         self.use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.ced_enabled = bool(getattr(config, "ced_prefill", False))
         self.ced_tail: CEDTailState | None = None
         if self.ced_enabled:
             validate_ced_config(vllm_config, self.use_sequence_parallel)
+        self.ced_decoder_owner = self.ced_enabled and (
+            get_pp_group().rank_in_group == 2
+            if self.pp4
+            else get_pp_group().is_last_rank
+        )
+        self.ced_decoder_stage = self.ced_enabled and (
+            get_pp_group().rank_in_group >= 2
+            if self.pp4
+            else get_pp_group().is_last_rank
+        )
+        if self.ced_decoder_owner:
             self.ced_tail = CEDTailState(
                 vllm_config.scheduler_config.max_num_seqs,
                 config.hidden_size,
@@ -437,7 +475,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mask their scores with it.
         candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
         candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
-        if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
+        if (
+            candidate_source_layer >= 0
+            and candidate_topk_blocks > 0
+            and (
+                get_pp_group().is_last_rank
+                or (self.pp4 and get_pp_group().rank_in_group == 2)
+            )
+        ):
             self.candidate_block_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 candidate_topk_blocks,
@@ -446,7 +491,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        spec_config = vllm_config.speculative_config
+        if get_pp_group().is_first_rank or (
+            get_pp_group().is_last_rank
+            and spec_config is not None
+            and spec_config.use_dspark()
+            and spec_config.draft_tensor_parallel_size
+            == vllm_config.parallel_config.tensor_parallel_size
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -497,7 +549,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
-        spec_config = vllm_config.speculative_config
         needs_mtp_hidden_states = (
             spec_config is not None
             and not spec_config.use_dspark()
@@ -515,6 +566,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        pp_size = self.parallel_config.pipeline_parallel_size
+        last_stage_start = get_pp_indices(40, pp_size - 1, pp_size)[0]
+        if self.parallel_config.pipeline_parallel_size > 1 and any(
+            not last_stage_start < layer <= 40 for layer in layers
+        ):
+            raise NotImplementedError(
+                "V4.1 PP requires decoder-only auxiliary captures on the last stage"
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -527,20 +589,106 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pp4:
+            for key, (shape, field_dtype) in pp_payload_shapes(
+                self.start_layer,
+                self.config.index_topk,
+                self.config.candidate_topk_blocks,
+                self.pp_index_width,
+            ).items():
+                tensors[key] = torch.zeros(
+                    (batch_size, *shape), dtype=field_dtype, device=device
+                )
+        return IntermediateTensors(tensors)
+
+    def _pp_shared_cache(self, source: int, *, index: bool = False):
+        attention = self.layers[self.start_layer].attn
+        prefix = _replace_layer_index(attention.prefix, source)
+        if index:
+            prefix += ".indexer.k_cache"
+        return attention._static_forward_context[prefix]
+
+    def _pp_cache_deltas(self, num_tokens: int) -> dict[str, torch.Tensor]:
+        if not self.pp4 or self.end_layer not in (10, 30, 31, 32):
+            return {}
+        source = 8 if self.end_layer == 10 else 20
+        metadata = get_forward_context().attn_metadata
+        deltas = {}
+        for key, index, width in (
+            ("pp_kv", False, 288),
+            *(([("pp_index_k", True, self.pp_index_width)]) if source == 20 else []),
+        ):
+            owner = self._pp_shared_cache(source, index=index)
+            payload = torch.zeros(
+                (num_tokens, width),
+                dtype=torch.uint8,
+                device=self.topk_indices_buffer.device,
+            )
+            if isinstance(metadata, dict) and owner.kv_cache.numel():
+                copy_cache_rows(
+                    owner.kv_cache,
+                    typing.cast(typing.Any, metadata[owner.prefix]).slot_mapping,
+                    payload,
+                    restore=False,
+                )
+            deltas[key] = payload
+        return deltas
+
+    def _pp_intermediate(
+        self,
+        hidden: torch.Tensor,
+        pre_mix: torch.Tensor,
+        token_ids: torch.Tensor,
+        deltas: dict[str, torch.Tensor] | None = None,
+    ) -> IntermediateTensors:
+        tensors = {"hidden_states": hidden, "pre_mix": pre_mix}
+        if self.pp4 and self.end_layer in (10, 30, 31, 32):
+            rows = hidden.shape[0]
+            tensors.update(self._pp_cache_deltas(rows) if deltas is None else deltas)
+            if self.end_layer in (10, 30, 31):
+                tensors["pp_topk"] = self.topk_indices_buffer[:rows].clone()
+            if self.end_layer in (30, 31, 32):
+                assert self.candidate_block_buffer is not None
+                tensors["pp_candidates"] = self.candidate_block_buffer[:rows].clone()
+                tensors["pp_token_ids"] = token_ids.to(torch.int64)
+        return IntermediateTensors(tensors)
+
+    def _restore_pp_state(self, tensors: IntermediateTensors) -> None:
+        if not self.pp4 or self.start_layer not in (10, 30, 31, 32):
+            return
+        source = 8 if self.start_layer == 10 else 20
+        metadata = get_forward_context().attn_metadata
+        for key, index in (
+            ("pp_kv", False),
+            *(([("pp_index_k", True)]) if source == 20 else []),
+        ):
+            owner = self._pp_shared_cache(source, index=index)
+            if isinstance(metadata, dict) and owner.kv_cache.numel():
+                copy_cache_rows(
+                    owner.kv_cache,
+                    typing.cast(typing.Any, metadata[owner.prefix]).slot_mapping,
+                    tensors[key],
+                    restore=True,
+                )
+        if self.start_layer in (10, 30, 31):
+            topk = tensors["pp_topk"]
+            self.topk_indices_buffer[: topk.shape[0]].copy_(topk)
+        if source == 20:
+            candidates = tensors["pp_candidates"]
+            assert self.candidate_block_buffer is not None
+            self.candidate_block_buffer[: candidates.shape[0]].copy_(candidates)
 
     def forward(
         self,
@@ -557,6 +705,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = self.embed_input_ids(input_ids)
         else:
             assert intermediate_tensors is not None
+            self._restore_pp_state(intermediate_tensors)
             hidden_states = intermediate_tensors["hidden_states"]
 
         if self.use_mega_moe:
@@ -636,12 +785,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             metadata = get_forward_context().attn_metadata
             if isinstance(metadata, dict):
                 ced_step = typing.cast(CEDStep | None, metadata.get(CED_METADATA_KEY))
+        if ced_step is not None and self.start_layer in (30, 31, 32):
+            assert intermediate_tensors is not None
+            return self._forward_ced_decoder(
+                ced_step,
+                hidden_states,
+                pre_mix,
+                input_ids,
+                positions,
+                replay_token_ids=intermediate_tensors["pp_token_ids"],
+            )
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
             if idx == 20 and ced_step is not None:
-                boundary = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+                boundary = (
+                    hidden_states
+                    if self.start_layer == 20
+                    else mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+                )
                 assert pre_mix is not None
                 return self._forward_ced_decoder(
                     ced_step, boundary, pre_mix, input_ids, positions
@@ -677,9 +840,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            return self._pp_intermediate(hidden_states, pre_mix, input_ids)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -710,32 +871,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         pre_mix: torch.Tensor,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        replay_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         """Full-context KV-only preparation followed by request-owned SWA replay."""
-        assert self.ced_tail is not None
-        source = self.layers[20]
-        # Use the identical delayed-collapse/normalization kernel as layer 20.
-        # Its new mix coefficients are only needed later for the replay rows.
-        _, _, normalized, _ = mhc_pre_delayed_tilelang(
-            boundary,
-            source.hc_attn_fn,
-            source.hc_attn_scale,
-            source.hc_attn_base,
-            source.rms_norm_eps,
-            source.hc_eps,
-            source.hc_eps,
-            source.hc_post_alpha,
-            source.hc_sinkhorn_iters,
-            pre_mix=pre_mix,
-            norm_weight=source.attn_norm.weight,
-            norm_eps=source.attn_norm.variance_epsilon,
-        )
-        source.attn.build_ced_global_kv(normalized, positions)
-        rows = step.plan.num_input_tokens
-        hidden, carried, token_ids = self.ced_tail.pack(
-            step.plan, boundary[:rows], pre_mix[:rows], input_ids[:rows]
-        )
-        result = boundary.new_zeros((boundary.shape[0], self.config.hidden_size))
+        source = None
+        deltas = None
+        if self.start_layer <= 20:
+            assert self.ced_tail is not None
+            source = self.layers[20]
+            _, _, normalized, _ = mhc_pre_delayed_tilelang(
+                boundary,
+                source.hc_attn_fn,
+                source.hc_attn_scale,
+                source.hc_attn_base,
+                source.rms_norm_eps,
+                source.hc_eps,
+                source.hc_eps,
+                source.hc_post_alpha,
+                source.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=source.attn_norm.weight,
+                norm_eps=source.attn_norm.variance_epsilon,
+            )
+            source.attn.build_ced_global_kv(normalized, positions)
+            deltas = self._pp_cache_deltas(positions.shape[0])
+            rows = step.plan.num_input_tokens
+            hidden, carried, token_ids = self.ced_tail.pack(
+                step.plan, boundary[:rows], pre_mix[:rows], input_ids[:rows]
+            )
+        else:
+            assert self.start_layer in (30, 31, 32) and replay_token_ids is not None
+            hidden, carried, token_ids = boundary, pre_mix, replay_token_ids
+            assert hidden.shape[0] == token_ids.shape[0] == step.plan.num_decoder_tokens
+        result = boundary.new_zeros((positions.shape[0], self.config.hidden_size))
         aux_layers = tuple(self.aux_hidden_state_layers)
         aux_hidden_states: list[torch.Tensor] = []
         if aux_layers:
@@ -758,21 +926,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_states=aux_hidden_states,
             )
         if step.plan.num_decoder_tokens == 0:
+            if not get_pp_group().is_last_rank:
+                return self._pp_intermediate(hidden, carried, token_ids, deltas)
             return (result, []) if aux_layers else result
 
         ctx = get_forward_context()
         old_metadata, old_slots = ctx.attn_metadata, ctx.slot_mapping
         old_padding, old_descriptor = ctx.is_padding, ctx.batch_descriptor
-        old_prebuilt = source.attn.ced_global_kv_prebuilt
+        old_prebuilt = (
+            source.attn.ced_global_kv_prebuilt if source is not None else False
+        )
         try:
             ctx.attn_metadata = step.decoder_metadata
             if step.decoder_slot_mapping is not None:
                 ctx.slot_mapping = step.decoder_slot_mapping
             ctx.is_padding = None
             ctx.batch_descriptor = None
-            source.attn.ced_global_kv_prebuilt = True
+            if source is not None:
+                source.attn.ced_global_kv_prebuilt = True
             residual = post = res = None
-            for idx, layer in enumerate(islice(self.layers, 20, 40), start=20):
+            start = max(20, self.start_layer)
+            for idx, layer in enumerate(
+                islice(self.layers, start, self.end_layer), start=start
+            ):
                 hidden, residual, post, res, carried = layer(
                     hidden, step.positions, token_ids, carried, post, res, residual
                 )
@@ -781,6 +957,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         mhc_post_tilelang(hidden, residual, post, res).mean(dim=1)
                     )
             hidden = mhc_post_tilelang(hidden, residual, post, res)
+            if not get_pp_group().is_last_rank:
+                return self._pp_intermediate(hidden, carried, token_ids, deltas)
             decoded = self.norm(hc_collapse_triton(hidden, carried))
             target = torch.tensor(step.plan.output_rows, device=result.device)
             source_rows = torch.tensor(
@@ -788,7 +966,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             result.index_copy_(0, target, decoded.index_select(0, source_rows))
         finally:
-            source.attn.ced_global_kv_prebuilt = old_prebuilt
+            if source is not None:
+                source.attn.ced_global_kv_prebuilt = old_prebuilt
             ctx.attn_metadata, ctx.slot_mapping = old_metadata, old_slots
             ctx.is_padding, ctx.batch_descriptor = old_padding, old_descriptor
         return (result, []) if aux_layers else result
@@ -1098,6 +1277,7 @@ class DeepseekV41LLMForCausalLM(
     DeepseekV4MixtureOfExperts,
 ):
     model_cls = DeepseekV4Model
+    requires_raw_input_tokens = True
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".

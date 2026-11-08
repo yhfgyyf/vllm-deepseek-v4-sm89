@@ -85,6 +85,7 @@ def _mm_feature(
 def _request_state() -> DeepseekV41ModelState:
     state = object.__new__(DeepseekV41ModelState)
     state.ced_enabled = True
+    state.ced_decoder_stage = True
     state.ced_tail = Mock()
     state.ced_tail.window = 384
     state._ced_request_slots = {}
@@ -94,7 +95,10 @@ def _request_state() -> DeepseekV41ModelState:
     state.rope_state = None
     state.prompt_embeds_state = None
     state._mm_prefix_prompt_token_ids = {}
-    state.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    state._mm_prefix_features = {}
+    state.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(), is_mm_prefix_lm=True
+    )
     return state
 
 
@@ -446,6 +450,7 @@ def test_ced_prepare_attn_uses_independent_compact_metadata_builders(
 ):
     state = object.__new__(DeepseekV41ModelState)
     state.ced_enabled = True
+    state.ced_decoder_stage = True
     state._ced_attn_groups = None
     state._ced_prompt_lens = {9: 128, 3: 10}
     state._ced_replay_starts = {9: 0, 3: 0}

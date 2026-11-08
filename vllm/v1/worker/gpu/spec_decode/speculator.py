@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 
 
 def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
-    """Whether the target replaces the drafter's input with its HC residual.
+    """Whether native MTP consumes the target's HC residual.
 
     Keyed on the same hook the model runner calls to perform that swap. It is
     resolved from the target model class because speculators are built before
@@ -40,6 +40,11 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
     """
     from vllm.model_executor.model_loader.utils import get_model_cls
 
+    if (
+        vllm_config.speculative_config is None
+        or vllm_config.speculative_config.method != "mtp"
+    ):
+        return False
     target_cls = get_model_cls(vllm_config.model_config)
     return hasattr(target_cls, "get_mtp_target_hidden_states")
 

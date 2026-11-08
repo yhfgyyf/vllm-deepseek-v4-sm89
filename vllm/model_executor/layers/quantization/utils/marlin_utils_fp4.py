@@ -643,16 +643,15 @@ def prepare_moe_mxfp4_layer_for_marlin(
     # WEIGHT SCALES: Permute scales
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
         scales = scales.view(torch.float8_e8m0fnu)
-        scales = scales.to(param_dtype)
 
-        tensor_list = []
+        out: torch.Tensor | None = None
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
             size_n, size_k = k, n
 
         for i in range(e):
-            scale = scales[i].T
+            scale = scales[i].to(param_dtype).T
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
@@ -663,8 +662,15 @@ def prepare_moe_mxfp4_layer_for_marlin(
             marlin_scales = mxfp4_marlin_process_scales(
                 marlin_scales, input_dtype=input_dtype
             )
-            tensor_list.append(marlin_scales)
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            if out is None:
+                out = torch.empty(
+                    (e, *marlin_scales.shape),
+                    dtype=marlin_scales.dtype,
+                    device=marlin_scales.device,
+                )
+            out[i] = marlin_scales
+        assert out is not None
+        return out
 
     w13_scale = permute_scales(w13_scale, "w13")
     w2_scale = permute_scales(w2_scale, "w2")

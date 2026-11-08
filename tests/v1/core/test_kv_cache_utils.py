@@ -1328,6 +1328,55 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+@pytest.mark.parametrize("layout", ["LBNHC", "BLHNC"])
+def test_pp_projected_empty_uniform_group_does_not_allocate_remote_layers(layout):
+    local = new_kv_cache_spec()
+    remote = new_kv_cache_spec(num_kv_heads=4)
+    global_groups = [
+        KVCacheGroupSpec(
+            ["remote"],
+            UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"remote": remote}),
+        ),
+        KVCacheGroupSpec(
+            ["local"],
+            UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"local": local}),
+        ),
+    ]
+    groups = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups, {"local": local}
+    )
+    assert groups[0].layer_names == []
+    # An empty projected group keeps the global spec for scheduler geometry.
+    assert groups[0].kv_cache_spec is global_groups[0].kv_cache_spec
+    cache_config = CacheConfig(prefix_cache_retention_interval=None)
+    cache_config.kv_cache_layout = layout
+    config = SimpleNamespace(cache_config=cache_config)
+    allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available_memory=local.page_size_bytes * 10
+    )
+    assert allocated.num_blocks == 10
+    assert len(allocated.kv_cache_tensors) == 1
+    assert allocated.kv_cache_tensors[0].layers == ["local"]
+    assert allocated.kv_cache_tensors[0].size == local.page_size_bytes * 10
+
+
+def test_uniform_group_allocation_respects_its_local_layer_names():
+    spec = new_kv_cache_spec()
+    group = KVCacheGroupSpec(
+        ["local"],
+        UniformTypeKVCacheSpecs(
+            block_size=16, kv_cache_specs={"local": spec, "remote": spec}
+        ),
+    )
+    cache_config = CacheConfig(prefix_cache_retention_interval=None)
+    cache_config.kv_cache_layout = "LBNHC"
+    config = SimpleNamespace(cache_config=cache_config)
+    allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, [group], available_memory=spec.page_size_bytes * 10
+    )
+    assert [tensor.layers for tensor in allocated.kv_cache_tensors] == [["local"]]
+
+
 def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
     dcp = 8
     full = FullAttentionSpec(

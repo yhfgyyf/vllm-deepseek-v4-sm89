@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -220,6 +220,13 @@ class AdaptiveVerificationManager:
         draft_curve: list[tuple[int, float]],
         verify_curve: list[tuple[int, float]],
     ) -> None:
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            stage_curves = [(draft_curve, verify_curve)] * pp.world_size
+            torch.distributed.all_gather_object(
+                stage_curves, (draft_curve, verify_curve), group=pp.cpu_group
+            )
+            draft_curve, verify_curve = merge_pp_cost_curves(stage_curves)
         draft_curve, verify_curve = get_tp_group().broadcast_object(
             (draft_curve, verify_curve), src=0
         )
@@ -245,7 +252,14 @@ class AdaptiveVerificationManager:
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
-        num_reqs = input_batch.num_reqs
+        self.record_confidences_for_slots(
+            confidence_probs[: input_batch.num_reqs], input_batch.idx_mapping
+        )
+
+    def record_confidences_for_slots(
+        self, confidence_probs: torch.Tensor, slot_indices: torch.Tensor
+    ) -> None:
+        """Accept local drafts or PP drafts after filtering freed request slots."""
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
@@ -256,7 +270,7 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        self._confidence_probs[slot_indices] = confidence_probs
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 
@@ -270,6 +284,8 @@ class AdaptiveVerificationManager:
         self,
         num_tokens_per_req: dict[str, int],
         draft_tokens: dict[str, list[int]],
+        *,
+        pp_num_tokens: int | None = None,
     ) -> int:
         """Token count once the draft budget is trimmed to fit.
 
@@ -328,7 +344,13 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        draft_budget = (
+            int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+            if pp_num_tokens is None
+            else pp_num_tokens - num_non_draft_tokens_total
+        )
+        if not 0 <= draft_budget <= max_draft_budget:
+            raise ValueError("PP adaptive budget is outside the scheduled draft range")
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -377,7 +399,11 @@ class AdaptiveVerificationManager:
         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
 
     def reallocate_drafts(
-        self, req_ids: list[str], idx_mapping: torch.Tensor
+        self,
+        req_ids: list[str],
+        idx_mapping: torch.Tensor,
+        *,
+        pp_capacities: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
@@ -399,7 +425,13 @@ class AdaptiveVerificationManager:
         # capacities enters holding each request's valid draft count (the kernel
         # uses it to bound eligible slots) and leaves holding the admitted count.
         capacities = self._batch_draft_capacity[:num_reqs]
-        if draft_budget == 0:
+        if pp_capacities is not None:
+            if pp_capacities.shape != capacities.shape:
+                raise ValueError(
+                    "PP adaptive capacities do not match the request batch"
+                )
+            capacities.copy_(pp_capacities)
+        elif draft_budget == 0:
             capacities.zero_()
         else:
             async_copy_to_gpu(scheduled_drafts, out=capacities)
@@ -435,6 +467,29 @@ class AdaptiveVerificationManager:
             self.query_start_loc,
             draft_budget,
         )
+
+    def get_pp_capacities(self, num_reqs: int) -> torch.Tensor:
+        # The async PP send may outlive this step's reusable capacity buffer.
+        return self._batch_draft_capacity[:num_reqs].clone()
+
+
+def merge_pp_cost_curves(
+    stage_curves: list[tuple[list[tuple[int, float]], list[tuple[int, float]]]],
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """Sum serial target stages; only the final stage runs the drafter.
+
+    These are compute-cost estimates, excluding PP transfer and scheduling costs.
+    """
+    draft_curve = stage_curves[-1][0]
+    verify_curves = [stage[1] for stage in stage_curves]
+    sizes = [size for size, _ in verify_curves[0]]
+    if any([size for size, _ in curve] != sizes for curve in verify_curves[1:]):
+        raise ValueError("PP adaptive profiling produced different target sizes")
+    verify_curve = [
+        (size, sum(curve[i][1] for curve in verify_curves))
+        for i, size in enumerate(sizes)
+    ]
+    return draft_curve, verify_curve
 
 
 def maybe_create_adaptive_verification_manager(

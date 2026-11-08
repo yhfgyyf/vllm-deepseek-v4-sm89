@@ -28,6 +28,7 @@ from .ced import (
     CEDRequest,
     CEDStep,
     clamp_replay_swa,
+    get_ced_replay_capacity,
     plan_ced_step,
 )
 
@@ -81,7 +82,13 @@ class DeepseekV41ModelState(DefaultModelState):
         inner_model = getattr(model, "language_model", model).model
         self.ced_enabled = bool(getattr(inner_model, "ced_enabled", False))
         self.ced_tail = getattr(inner_model, "ced_tail", None)
-        if self.ced_enabled and self.ced_tail is None:
+        ced_owner = getattr(inner_model, "ced_decoder_owner", self.ced_enabled)
+        self.ced_decoder_stage = getattr(inner_model, "ced_decoder_stage", ced_owner)
+        self.pp4_last_stage = (
+            vllm_config.parallel_config.pipeline_parallel_size == 4
+            and inner_model.start_layer in (30, 31, 32)
+        )
+        if ced_owner and self.ced_tail is None:
             raise RuntimeError("CED is enabled without its reserved tail state")
         self._ced_request_slots: dict[str, int] = {}
         self._ced_prompt_lens: dict[int, int] = {}
@@ -119,16 +126,20 @@ class DeepseekV41ModelState(DefaultModelState):
             replay_start = get_mm_safe_replay_start(
                 new_req_data.prompt_len, 128, mm_ranges
             )
-            assert self.ced_tail is not None
-            if new_req_data.prompt_len - replay_start > self.ced_tail.window:
+            replay_capacity = (
+                self.ced_tail.window
+                if self.ced_tail is not None
+                else get_ced_replay_capacity(self.model_config.hf_config)
+            )
+            if new_req_data.prompt_len - replay_start > replay_capacity:
                 raise ValueError("CED image replay exceeds the reserved tail capacity")
             if new_req_data.num_computed_tokens > replay_start:
                 raise ValueError("CED prefix hit leaves insufficient encoder replay")
 
         super().add_request(req_index, new_req_data)
         if self.ced_enabled:
-            assert self.ced_tail is not None
-            self.ced_tail.reset(req_index, new_req_data.num_computed_tokens)
+            if self.ced_tail is not None:
+                self.ced_tail.reset(req_index, new_req_data.num_computed_tokens)
             self._ced_request_slots[new_req_data.req_id] = req_index
             self._ced_prompt_lens[req_index] = new_req_data.prompt_len
             self._ced_replay_starts[req_index] = replay_start
@@ -138,8 +149,8 @@ class DeepseekV41ModelState(DefaultModelState):
         super().remove_request(req_id)
         slot = self._ced_request_slots.pop(req_id, None)
         if self.ced_enabled and slot is not None:
-            assert self.ced_tail is not None
-            self.ced_tail.reset(slot)
+            if self.ced_tail is not None:
+                self.ced_tail.reset(slot)
             self._ced_prompt_lens.pop(slot, None)
             self._ced_replay_starts.pop(slot, None)
             self._ced_mm_ranges.pop(slot, None)
@@ -205,7 +216,7 @@ class DeepseekV41ModelState(DefaultModelState):
             kernel_block_sizes,
             manager_block_sizes or kernel_block_sizes,
         ):
-            if policy == SlotMappingPolicy.NONE:
+            if policy == SlotMappingPolicy.NONE or 0 in block_table.shape:
                 mappings.append(positions.new_full((num_tokens,), -1))
                 continue
             block_indices = (
@@ -223,7 +234,9 @@ class DeepseekV41ModelState(DefaultModelState):
                     valid, block_numbers * block_size + positions % block_size, -1
                 )
             )
-        return torch.stack(mappings)
+        return (
+            torch.stack(mappings) if mappings else positions.new_empty((0, num_tokens))
+        )
 
     def _build_ced_step(
         self,
@@ -261,8 +274,12 @@ class DeepseekV41ModelState(DefaultModelState):
             )
             for i in range(input_batch.num_reqs)
         )
-        assert self.ced_tail is not None
-        plan = plan_ced_step(requests, cache_window=self.ced_tail.window)
+        replay_capacity = (
+            self.ced_tail.window
+            if self.ced_tail is not None
+            else get_ced_replay_capacity(self.vllm_config.model_config.hf_config)
+        )
+        plan = plan_ced_step(requests, cache_window=replay_capacity)
         if (
             plan.num_decoder_tokens
             > self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -283,12 +300,20 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         ced_groups = self._get_ced_attn_groups(attn_groups)
         kernel_block_sizes = tuple(
-            int(cast(Any, groups[0].get_metadata_builder(0)).kernel_block_size)
-            for groups in ced_groups
+            (
+                int(cast(Any, groups[0].get_metadata_builder(0)).kernel_block_size)
+                if groups
+                else cache_group.kv_cache_spec.block_size
+            )
+            for groups, cache_group in zip(ced_groups, kv_cache_config.kv_cache_groups)
         )
         policies = tuple(
-            group.kv_cache_spec.slot_mapping_policy
-            for group in kv_cache_config.kv_cache_groups
+            (
+                cache_group.kv_cache_spec.slot_mapping_policy
+                if groups
+                else SlotMappingPolicy.NONE
+            )
+            for groups, cache_group in zip(ced_groups, kv_cache_config.kv_cache_groups)
         )
         decoder_slot_mappings = self._ced_slot_mappings(
             decoder_block_tables,
@@ -406,11 +431,44 @@ class DeepseekV41ModelState(DefaultModelState):
             kv_cache_config,
             for_capture,
         )
-        if self.ced_enabled and input_batch.has_prefill and not for_capture:
+        if (
+            self.ced_enabled
+            and self.ced_decoder_stage
+            and input_batch.has_prefill
+            and not for_capture
+        ):
             attn_metadata[CED_METADATA_KEY] = self._build_ced_step(
                 input_batch, block_tables, attn_groups, kv_cache_config
             )
         return attn_metadata
+
+    def prepare_pp_intermediate_tensors(
+        self, destination, received, input_batch, dummy_run: bool
+    ):
+        """Keep compact CED rows distinct from full-context KV update rows."""
+        compact = (
+            self.pp4_last_stage
+            and self.ced_enabled
+            and input_batch.has_prefill
+            and not dummy_run
+        )
+        compact_keys = {
+            "hidden_states",
+            "pre_mix",
+            "pp_topk",
+            "pp_candidates",
+            "pp_token_ids",
+        }
+        result = {}
+        for key, buffer in destination.tensors.items():
+            rows = input_batch.num_tokens_after_padding
+            if compact and key in compact_keys:
+                rows = received[key].shape[0]
+                if rows > buffer.shape[0]:
+                    raise ValueError("CED PP replay exceeds intermediate capacity")
+            view = buffer[:rows]
+            result[key] = view if dummy_run else view.copy_(received[key][:rows])
+        return result
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)

@@ -120,7 +120,7 @@ class _AdaptiveFullTargetHarness:
         )[:, None].repeat(1, 2)
 
         self.v4_swa_builder = DeepseekSparseSWAFlashInferMetadataBuilder(
-            _swa_spec("deepseek_v4"), ["v4_swa"], config, device
+            _swa_spec("deepseek_v4"), ["layers.0.attn", "layers.1.attn"], config, device
         )
         v41_config = SimpleNamespace(**vars(config))
         v41_config.model_config = SimpleNamespace(**vars(config.model_config))
@@ -129,7 +129,10 @@ class _AdaptiveFullTargetHarness:
         )
         v41_config.model_config.hf_config.compress_ratios = [0, 1, 2]
         self.v41_swa_builder = DeepseekV41NativeSWAMetadataBuilder(
-            _swa_spec("deepseek_v4_1"), ["v41_swa"], v41_config, device
+            _swa_spec("deepseek_v4_1"),
+            ["layers.0.attn", "layers.1.attn", "layers.2.attn"],
+            v41_config,
+            device,
         )
         for builder in (self.v4_swa_builder, self.v41_swa_builder):
             builder.build_tile_scheduler = lambda _: {

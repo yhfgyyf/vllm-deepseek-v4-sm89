@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -7,6 +8,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -61,6 +63,7 @@ class DefaultModelState(ModelState):
             self.model_config, model, self.rope_state, encoder_cache
         )
         self._mm_prefix_prompt_token_ids: dict[str, list[int]] = {}
+        self._mm_prefix_features: dict[str, list[MultiModalFeatureSpec]] = {}
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         if self.rope_state is not None:
@@ -78,6 +81,10 @@ class DefaultModelState(ModelState):
             )
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.add_request(req_index, new_req_data)
+        if self.model_config.is_mm_prefix_lm:
+            self._mm_prefix_features[new_req_data.req_id] = [
+                replace(feature, data=None) for feature in new_req_data.mm_features
+            ]
         if self._uses_explicit_mm_prefix_tokens():
             assert new_req_data.prefill_token_ids is not None
             self._mm_prefix_prompt_token_ids[new_req_data.req_id] = (
@@ -88,6 +95,7 @@ class DefaultModelState(ModelState):
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
         self._mm_prefix_prompt_token_ids.pop(req_id, None)
+        self._mm_prefix_features.pop(req_id, None)
 
     def _uses_explicit_mm_prefix_tokens(self) -> bool:
         hf_config = self.model_config.hf_config
@@ -209,14 +217,10 @@ class DefaultModelState(ModelState):
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
         req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
-        if (
-            self.supports_mm_inputs
-            and self.encoder_cache is not None
-            and self.model_config.is_mm_prefix_lm
-        ):
+        if self.model_config.is_mm_prefix_lm:
             req_doc_ranges = compute_mm_prefix_ranges(
                 req_ids=input_batch.req_ids,
-                mm_features=self.encoder_cache.mm_features,
+                mm_features=self._mm_prefix_features,
                 sliding_window=self.model_config.get_sliding_window(),
                 mm_prefix_clamp_sliding_window=getattr(
                     self.model,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import cast
 
+import torch
 import torch.nn as nn
 
 from vllm.config import SpeculativeConfig
@@ -30,6 +31,67 @@ def set_eagle3_aux_hidden_state_layers(
         aux_layers = eagle3_model.get_eagle3_default_aux_hidden_state_layers()
         logger.info("Using Eagle3 auxiliary layers from model: %s", aux_layers)
     eagle3_model.set_aux_hidden_state_layers(aux_layers)
+    reserve_aux_intermediate_tensor_slots(model)
+
+
+def _inner_decoder(model: nn.Module) -> nn.Module | None:
+    parent = model
+    if hasattr(model, "get_language_model"):
+        parent = model.get_language_model()
+    elif hasattr(model, "language_model"):
+        parent = model.language_model
+    return getattr(parent, "model", parent)
+
+
+def verify_supports_aux_hidden_states_over_pp(model: nn.Module, method: str) -> None:
+    if not getattr(_inner_decoder(model), "supports_aux_hidden_states_over_pp", False):
+        raise ValueError(
+            f"{type(model).__name__} does not support {method} "
+            "with pipeline parallelism"
+        )
+
+
+def aux_hidden_state_relay_keys(model: nn.Module) -> tuple[str, ...]:
+    from vllm.distributed.parallel_state import get_pp_group
+
+    pp = get_pp_group()
+    if pp.world_size < 2 or pp.is_first_rank or pp.is_last_rank:
+        return ()
+    inner = _inner_decoder(model)
+    assert inner is not None
+    return tuple(
+        f"{inner.AUX_HIDDEN_STATE_KEY}{i}" for i in range(inner._aux_slot_base_cached)
+    )
+
+
+def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
+    from vllm.distributed.parallel_state import (
+        get_pp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return
+    pp = get_pp_group()
+    if pp.world_size < 2 or pp.is_first_rank:
+        return
+    inner = _inner_decoder(model)
+    if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
+        return
+    total = inner._aux_slot_base_cached
+    if total == 0:
+        return
+    make_empty = model.make_empty_intermediate_tensors
+
+    def make_empty_with_aux(batch_size, dtype, device):
+        tensors = make_empty(batch_size, dtype, device)
+        for i in range(total):
+            tensors[f"{inner.AUX_HIDDEN_STATE_KEY}{i}"] = torch.zeros(
+                (batch_size, inner.config.hidden_size), dtype=dtype, device=device
+            )
+        return tensors
+
+    model.make_empty_intermediate_tensors = make_empty_with_aux
 
 
 def get_eagle3_aux_layers_from_config(

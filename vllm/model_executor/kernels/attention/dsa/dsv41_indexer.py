@@ -25,8 +25,8 @@ SCALES_PER_HEAD = 4
 CANDIDATE_BLOCK_SIZE = 8
 # Tile and pipeline configuration per code path. The FP4 tensor-core path has
 # no per-element decode, so wide tiles amortize the address and page-table work
-# (128 columns, one stage measured best on RTX PRO 6000); the decode path keeps
-# the narrow tiles that hide its integer decode behind the MMA.
+# (128 columns, one stage measured best on RTX PRO 6000). SM89 also benefits
+# from that tile, especially for candidate scoring with a few query rows.
 _LOGITS_BLOCK_N = 16
 _LOGITS_NUM_STAGES = 2
 _LOGITS_BLOCK_N_FP4 = 128
@@ -498,6 +498,8 @@ def _logits_config(device: torch.device) -> tuple[bool, int, int]:
     """(fp4_dot, BLOCK_N, num_stages) for the logits kernel on this device."""
     if _use_fp4_dot(device):
         return True, _LOGITS_BLOCK_N_FP4, _LOGITS_NUM_STAGES_FP4
+    if device.type == "cuda" and torch.cuda.get_device_capability(device) == (8, 9):
+        return False, 128, 1
     return False, _LOGITS_BLOCK_N, _LOGITS_NUM_STAGES
 
 

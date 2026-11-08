@@ -264,8 +264,7 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
-    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # Matching TP layouts share the target's embedding and head.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -274,7 +273,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
-        self.draft_model_config = vllm_config.speculative_config.draft_model_config
+        spec = vllm_config.speculative_config
+        self.draft_model_config = spec.draft_model_config
+        self.has_own_embed_tokens = self.has_own_lm_head = (
+            spec.draft_tensor_parallel_size
+            != spec.target_parallel_config.tensor_parallel_size
+        )
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
@@ -355,8 +359,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        Matching TP layouts alias the target embedding/head. Different TP
+        layouts load their own shards from the target checkpoint.
         """
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
@@ -402,6 +406,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_end = n_local_head * (tp_rank + 1)
 
         for name, loaded_weight in weights:
+            if self.has_own_embed_tokens and name in ("embed.weight", "head.weight"):
+                target = (
+                    "model.embed_tokens.weight"
+                    if name == "embed.weight"
+                    else "lm_head.weight"
+                )
+                param = params_dict[target]
+                param.weight_loader(param, loaded_weight)
+                loaded_params.add(target)
+                continue
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue
@@ -483,6 +497,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
+        if (
+            self.has_own_embed_tokens
+            and not {"model.embed_tokens.weight", "lm_head.weight"} <= loaded_params
+        ):
+            raise ValueError("Cross-TP DSpark requires target embedding/head weights")
         self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params

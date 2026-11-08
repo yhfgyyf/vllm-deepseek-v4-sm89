@@ -2693,14 +2693,12 @@ class VllmConfig:
                 "enforce_eager/cudagraph_mode=none"
             )
 
-        if self.parallel_config.pipeline_parallel_size > 1:
-            # Cost curves and confidences currently only exist on the last PP rank;
-            # earlier ranks would diverge on the trimmed batch shape.
-            # TODO: we should be able to support adaptive verification with PP by
-            # broadcasting the cost curves and confidences to all ranks.
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and not spec_config.use_dspark()
+        ):
             raise ValueError(
-                "Adaptive verification is not currently compatible "
-                "with pipeline parallelism"
+                "Adaptive verification with pipeline parallelism requires DSpark"
             )
 
     def _validate_batch_sharded_sampling(self) -> None:

@@ -23,7 +23,11 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
-from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    _get_mm_prefix_swa_index_width,
+)
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -245,16 +249,31 @@ class DeepseekV41NativeMixedAttention(DeepseekV4Attention):
     backend_cls = DeepseekV41NativeSparseBackend
     swa_backend_cls = DeepseekV41NativeSWABackend
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
+        super().__init__(vllm_config, *args, **kwargs)
         if not is_workspace_manager_initialized():
             return
+        spec = vllm_config.speculative_config
+        max_swa_slots = (
+            _get_mm_prefix_swa_index_width(
+                vllm_config.model_config.hf_config, self.window_size
+            )
+            if vllm_config.model_config.is_mm_prefix_lm
+            else self.window_size
+        )
+        if spec is not None and spec.use_dspark():
+            max_swa_slots = max(
+                max_swa_slots,
+                get_dspark_swa_index_width(
+                    self.window_size, spec.num_speculative_tokens
+                ),
+            )
         max_global_slots = self.index_topk if self.compress_ratio else 0
         workspace_bytes = _native_workspace_size_upper_bound(
             self.max_num_batched_tokens,
             self.n_local_heads,
             self.window_size,
-            max(self.window_size, self.max_model_len),
+            max_swa_slots,
             max_global_slots,
         )
         current_workspace_manager().get_simultaneous(

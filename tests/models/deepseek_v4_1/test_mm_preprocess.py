@@ -51,7 +51,10 @@ def _config() -> DeepseekV41Config:
 def test_v41_image_processor_preserves_patch_and_span_layout():
     image = Image.new("RGB", (6, 4), color=(255, 127, 0))
 
-    outputs = DeepseekV4VLProcessor(_config())(images=[image])
+    config = _config()
+    assert not config.is_mm_prefix_lm
+    assert not config.mm_prefix_clamp_sliding_window
+    outputs = DeepseekV4VLProcessor(config)(images=[image])
 
     assert outputs["patches"].shape == (6, 3, 2, 2)
     assert outputs["patches"].dtype == torch.bfloat16

@@ -295,7 +295,6 @@ def valid_config():
 @pytest.mark.parametrize(
     "field",
     [
-        "pipeline_parallel_size",
         "data_parallel_size",
         "decode_context_parallel_size",
         "prefill_context_parallel_size",
@@ -307,6 +306,17 @@ def test_ced_rejects_unvalidated_parallel_schedules(field):
     validate_ced_config(config, False)
     setattr(config.parallel_config, field, 2)
     with pytest.raises(NotImplementedError):
+        validate_ced_config(config, False)
+
+
+def test_ced_accepts_pp2_and_pp4_but_rejects_other_stage_counts():
+    config = valid_config()
+    config.parallel_config.pipeline_parallel_size = 2
+    validate_ced_config(config, False)
+    config.parallel_config.pipeline_parallel_size = 4
+    validate_ced_config(config, False)
+    config.parallel_config.pipeline_parallel_size = 3
+    with pytest.raises(NotImplementedError, match="pipeline"):
         validate_ced_config(config, False)
 
 

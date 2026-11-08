@@ -13,7 +13,11 @@ from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     deepseek_v41_swiglu_router_weight,
 )
-from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    MarlinExperts,
+    fused_marlin_moe,
+)
+from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4 as marlin_fp4
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_moe_mxfp4_layer_for_marlin,
 )
@@ -24,6 +28,53 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_quantize_dequantize,
 )
 from vllm.scalar_type import scalar_types
+
+
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("input_dtype", [None, torch.float8_e4m3fn])
+@torch.inference_mode()
+def test_streamed_mxfp4_scales_match_original_batched_conversion(
+    monkeypatch, param_dtype, input_dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    monkeypatch.setattr(marlin_fp4, "get_marlin_input_dtype", lambda: input_dtype)
+    experts, hidden, intermediate = 4, 256, 128
+    shapes = [(experts, 2 * intermediate, hidden), (experts, hidden, intermediate)]
+    weights = [
+        torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device="cuda")
+        for e, n, k in shapes
+    ]
+    scales = [
+        torch.randint(120, 134, (e, n, k // 32), dtype=torch.uint8, device="cuda")
+        for e, n, k in shapes
+    ]
+    originals = [value.clone() for value in scales]
+    expected = []
+    for values, (_, n, k) in zip(scales, shapes):
+        batched = values.view(torch.float8_e8m0fnu).to(param_dtype)
+        converted = []
+        for expert in batched:
+            permuted = marlin_fp4.marlin_permute_scales(
+                expert.T,
+                size_k=k,
+                size_n=n,
+                group_size=32,
+                is_a_8bit=input_dtype is not None,
+            )
+            converted.append(
+                marlin_fp4.mxfp4_marlin_process_scales(permuted, input_dtype)
+            )
+        expected.append(torch.stack(converted))
+    result = prepare_moe_mxfp4_layer_for_marlin(
+        SimpleNamespace(params_dtype=param_dtype), *weights, *scales, None, None
+    )
+    for actual, reference in zip(result[2:4], expected):
+        torch.testing.assert_close(
+            actual.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
+        )
+    for actual, original in zip(scales, originals):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
 
 
 def _dequantize_mxfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -160,6 +211,48 @@ def test_deepseek_v41_marlin_moe_matches_full_quantized_reference():
     error = (actual.float() - expected.float()).square().mean().sqrt()
     reference_rms = expected.float().square().mean().sqrt().clamp_min(1e-12)
     assert error / reference_rms < 0.12
+
+    workspace1, workspace2, output_shape = MarlinExperts.workspace_shapes(
+        None,
+        tokens,
+        intermediate,
+        hidden_size,
+        topk,
+        experts,
+        experts,
+        None,
+        MoEActivation.SILU,
+    )
+    common = torch.empty(
+        max(torch.Size(workspace1).numel(), torch.Size(output_shape).numel()),
+        device="cuda",
+        dtype=hidden.dtype,
+    )
+    other = torch.empty(workspace2, device="cuda", dtype=hidden.dtype)
+    shared_output = common[: tokens * hidden_size].view(tokens, hidden_size)
+    compact = fused_marlin_moe(
+        hidden,
+        w1,
+        w2,
+        None,
+        None,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        quant_type_id=scalar_types.float4_e2m1f.id,
+        global_num_experts=experts,
+        activation=MoEActivation.SILU,
+        activation_config=ApplyMoEActivationConfig(clamp_limit=10.0),
+        mxfp8_activation=True,
+        router_weight_before_fc2_quant=True,
+        intermediate_cache13=other,
+        intermediate_cache2=common,
+        output=shared_output,
+    )
+    # FC2 must finish consuming activation storage before the reduction reuses it.
+    torch.testing.assert_close(compact, actual, rtol=0, atol=0)
+    assert common.numel() < tokens * topk * hidden_size
 
 
 @torch.inference_mode()

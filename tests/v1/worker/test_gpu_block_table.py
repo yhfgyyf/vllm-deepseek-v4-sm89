@@ -366,6 +366,48 @@ def test_compute_slot_mappings_pads_cuda_graph_slots_to_minus_one():
     assert torch.equal(actual[2:], torch.full_like(actual[2:], -1))
 
 
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("kernel_block_size", [8, 16])
+def test_slot_mapping_masks_positions_outside_request_row(cp_size, kernel_block_size):
+    """Short PP cache groups must not read a neighbouring request's blocks."""
+    device = torch.device("cuda")
+    positions_list = [-16, -1, 0, 1, 15, 16, 30, 31, 32, 33, 63, 4096]
+    positions = torch.tensor(positions_list, dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor(
+        [0, len(positions_list)], dtype=torch.int32, device=device
+    )
+    table = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[1],
+        device=device,
+        kernel_block_sizes=[kernel_block_size],
+        cp_size=cp_size,
+        cp_rank=0,
+        cp_interleave=1,
+    )
+    table.append_block_ids(0, ([7],), overwrite=True)
+    table.append_block_ids(1, ([99],), overwrite=True)
+    table.apply_staged_writes()
+    actual = table.compute_slot_mappings(
+        torch.zeros(1, dtype=torch.int32, device=device),
+        query_start_loc,
+        positions,
+        num_tokens_padded=16,
+    )[0]
+    expected = []
+    for position in positions_list:
+        virtual_block, offset = divmod(position, 16 * cp_size)
+        local_position = virtual_block * 16 + offset // cp_size
+        if offset % cp_size == 0 and 0 <= local_position < 16:
+            expected.append(7 * 16 + local_position)
+        else:
+            expected.append(-1)
+    expected += [-1] * (16 - len(positions_list))
+    assert actual.cpu().tolist() == expected
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows

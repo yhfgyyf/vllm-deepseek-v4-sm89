@@ -32,7 +32,10 @@ def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
     unsupported = []
     for condition, name in (
         (not vllm_config.use_v2_model_runner, "model runner v1"),
-        (parallel.pipeline_parallel_size != 1, "pipeline parallelism"),
+        (
+            parallel.pipeline_parallel_size not in (1, 2, 4),
+            "pipeline parallelism other than PP1/PP2/PP4",
+        ),
         (parallel.data_parallel_size != 1, "data parallelism"),
         (parallel.decode_context_parallel_size != 1, "decode context parallelism"),
         (parallel.prefill_context_parallel_size != 1, "prefill context parallelism"),

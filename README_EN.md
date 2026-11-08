@@ -273,15 +273,14 @@ doubled relative to CED off, but the gain depends on the prompt, length, and
 runtime configuration. It is not guaranteed to be output-equivalent to the
 non-CED path; validate quality for the target workload.
 
-The current source, `vision11` wheel, and GHCR image include a CED image-input
-path on top of PR #112 frontend guards, handling all spans in single-image and
-multi-image requests. When an image overlaps the final 128 query tokens, the
-replay boundary expands to preserve the complete image instead of disabling
-CED; DSpark and prefix caching may remain enabled. Set a limit such as
-`--limit-mm-per-prompt '{"image":2}'` as needed. Each image must fit within one
-prefill chunk, and the expanded replay must fit the batch-token budget. Vision
-models reserve `128 + vision_max_n_token` replay-state rows per GPU, so higher
-TP does not reduce this allocation proportionally. Non-image modalities,
+Current `main` retains CED single-image and multi-image input, DSpark, and
+prefix caching, and corrects V4.1 language-model image tokens to use causal
+SWA. This shared semantic correction applies to both SM89 and SM120. The
+vision encoder remains enabled; CED replays the final 128 query tokens
+without expanding the replay window for image spans. Set a limit such as
+`--limit-mm-per-prompt '{"image":2}'` as needed. Existing `vision11` wheels
+and images retain the previous image-window behavior and do not contain
+this correction. Non-image modalities,
 prompt embeddings, and prompt logprobs are rejected before engine execution.
 
 The image path has CPU regressions, small-weight SM120 GPU numerical tests,
@@ -378,18 +377,21 @@ not the acceptance rate of actual post-trim verification slots or the final
 accepted-token count returned to clients. Random-input results are not a
 quality evaluation.
 
-### 3.3 SM89: 8× RTX 4090 48 GB
+### 3.3 SM89: 8×48 GB GPUs (L20 / RTX 4090 48 GB)
 
-The following configuration is for **8× RTX 4090 48 GB**; it is not for
-standard 24 GB cards. It retains TP8/EP, FP8 KV, Engram CPU offload, CED image
-input, DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
+The following configuration is for **eight 48 GB SM89 GPUs**, excluding
+standard 24 GB RTX 4090 cards. The default target uses TP4×PP2 (20/20 layers),
+with DSpark TP4 and `max-num-seqs=4`; target TP2×PP4 (10/10/10/10 layers) is
+optional. It retains EP, FP8 KV, Engram CPU offload, CED image input,
+DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
 loading both require sufficient host memory, so do not size host memory from
 the GPU weight footprint alone.
 
-Use the **vision11 wheel** from Section 2, current `main` source from
-Section 2.1, or the GHCR image from Section 2.2. The older ACR `vision7` Docker
-image cannot serve this example's CED image path. Configure the SM89 toolchain
-and launch in that environment:
+These PP/DSpark configurations require the updated **`main` source** from
+Section 2.1; existing `vision11` wheels and images do not contain this PP update.
+Both parallel layouts were validated on 8×L20. The other example parameters
+are retained; check capacity and throughput on your actual GPUs and workload.
+Configure the SM89 toolchain and launch in that environment:
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -399,13 +401,15 @@ export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
 export VLLM_USE_V2_MODEL_RUNNER=1
 unset TRITON_PTXAS_BLACKWELL_PATH
+unset VLLM_PP_LAYER_PARTITION
 
 vllm serve /path/to/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v4.1-flash \
   --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
-  --tensor-parallel-size 8 \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
@@ -431,6 +435,13 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL"}'
 ```
 
+- For optional **target TP2×PP4 with DSpark TP4**, set
+  `export VLLM_PP_LAYER_PARTITION=10,10,10,10`, change the parallel options to
+  `--tensor-parallel-size 2 --pipeline-parallel-size 4`, and add
+  `"draft_tensor_parallel_size":4` to the existing `--speculative-config`
+  JSON. Keep the other parameters. The draft uses an independent TP4/EP4 group
+  on the last four GPUs. Unset the layer-partition variable when returning to
+  the default TP4×PP2 layout.
 - To reduce peak prefill memory, replace `--max-num-batched-tokens 4096` with
   `--max-num-batched-tokens 2048` and leave the other parameters unchanged.
   This also affects workspace use, graph-capture memory, and the number of
