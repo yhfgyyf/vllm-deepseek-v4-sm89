@@ -3263,6 +3263,30 @@ class Scheduler(SchedulerInterface):
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
         blocks_to_evict: set[int] = set()
+        if self.ced_prefill:
+            for request in requests:
+                req_id = request.request_id
+                group_block_ids = self.kv_cache_manager.get_block_ids(req_id)
+                request_block_ids = {
+                    block_id for ids in group_block_ids for block_id in ids
+                }
+                if request_block_ids.isdisjoint(invalid_block_ids):
+                    continue
+
+                req_num_computed_tokens = (
+                    request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+                )
+                # CED's external checkpoint is the combination of global KV
+                # and encoder SWA. A partial group load cannot reconstruct the
+                # private replay tail, so restart from an empty checkpoint.
+                affected_req_ids.add(req_id)
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    blocks_to_evict.update(request_block_ids)
+
+            return affected_req_ids, total_affected_tokens, blocks_to_evict
+
         # If a block is invalid and shared by multiple requests in the batch,
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
@@ -3374,10 +3398,11 @@ class Scheduler(SchedulerInterface):
         if not total_failed_requests:
             return set()
 
-        # evict invalid blocks and downstream dependent blocks from cache
-        # only when not using recompute policy (where blocks will be recomputed
-        # and reused by other requests sharing them)
-        if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+        # CED cannot reuse a partial multi-group checkpoint. In recompute mode
+        # evict its whole affected prefix before preempting the request.
+        if sync_blocks_to_evict and (
+            not self.recompute_kv_load_failures or self.ced_prefill
+        ):
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
 
         if should_fail:
@@ -3400,5 +3425,15 @@ class Scheduler(SchedulerInterface):
 
         # Mark async requests with KV load failures for retry once loading completes
         self.failed_recving_kv_req_ids |= async_failed_req_ids
+        if self.ced_prefill and sync_failed_req_ids:
+            failed_requests = {
+                request
+                for request in self.running
+                if request.request_id in sync_failed_req_ids
+            }
+            self.running = remove_all(self.running, failed_requests)
+            timestamp = time.monotonic()
+            for request in failed_requests:
+                self._preempt_request(request, timestamp, drop_stale_output=True)
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids

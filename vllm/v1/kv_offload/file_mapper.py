@@ -86,12 +86,18 @@ class FileMapper:
     ) -> "FileMapper":
         """Build a FileMapper from an OffloadingSpec."""
         config = offloading_spec.config
+        group_ids = tuple(
+            idx if group.group_id is None else group.group_id
+            for idx, group in enumerate(config.groups)
+        )
+        preserve_group_ids = group_ids != tuple(range(len(config.groups)))
         kv_cache_groups = [
             {
                 "tokens_per_block": group.tokens_per_block,
                 "layer_names": list(group.layer_names),
+                **({"group_id": group_id} if preserve_group_ids else {}),
             }
-            for group in config.groups
+            for group_id, group in zip(group_ids, config.groups)
         ]
         parallel = config.parallel
         canonical_format = None

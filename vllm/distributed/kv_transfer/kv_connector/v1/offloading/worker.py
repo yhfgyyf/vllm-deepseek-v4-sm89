@@ -66,6 +66,11 @@ class OffloadingConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
+        group_ids = self.spec.group_ids
+        assert isinstance(group_ids, tuple)
+        selected_groups = tuple(
+            kv_cache_config.kv_cache_groups[group_id] for group_id in group_ids
+        )
         mappings = derive_canonical_mappings(
             self.vllm_config, kv_cache_config, kv_caches
         )
@@ -76,7 +81,7 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
+        for kv_cache_group in selected_groups:
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -142,10 +147,7 @@ class OffloadingConnectorWorker:
             self._init_worker(
                 CanonicalKVCaches(
                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
-                    [
-                        [CanonicalKVCacheRef(0, block_stride)]
-                        for _ in kv_cache_config.kv_cache_groups
-                    ],
+                    [[CanonicalKVCacheRef(0, block_stride)] for _ in selected_groups],
                 )
             )
             return
@@ -192,7 +194,7 @@ class OffloadingConnectorWorker:
                     )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
+        for kv_cache_group in selected_groups:
             group_refs: list[CanonicalKVCacheRef] = []
             for layer_name in kv_cache_group.layer_names:
                 group_refs += block_data_refs[layer_name]

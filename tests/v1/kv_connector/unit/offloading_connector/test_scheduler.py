@@ -43,7 +43,9 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     SlidingWindowSpec,
 )
@@ -74,6 +76,141 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+def test_ced_lookup_caps_before_group_convergence_and_skips_scratch():
+    vllm_config = _make_vllm_config()
+    vllm_config.cache_config.block_size = 8
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        model_type="deepseek_v41", ced_prefill=True
+    )
+    vllm_config.speculative_config = None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=32,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["decoder_scratch"],
+                CircularBufferSpec(
+                    block_size=8,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["encoder_swa"],
+                SlidingWindowSpec(
+                    block_size=8,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=128,
+                ),
+            ),
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    request = MagicMock()
+    request.request_id = "ced"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = 512
+    request.num_tokens = 512
+    request.mm_features = []
+    request.skip_reading_prefix_cache = False
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(64)]
+    scheduler.on_new_request(request)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+    for prompt_tokens, total_tokens, expected in (
+        (513, 513, 384),
+        (257, 257, 128),
+        (129, 129, 0),
+        (513, 540, 384),
+    ):
+        request.num_prompt_tokens = prompt_tokens
+        request.num_tokens = total_tokens
+        assert scheduler._get_max_cache_hit_length(request) == expected
+    request.num_prompt_tokens = 512
+    request.num_tokens = 512
+
+    request.mm_features = [
+        SimpleNamespace(mm_position=SimpleNamespace(offset=350, length=80))
+    ]
+    assert scheduler._get_max_cache_hit_length(request) == 320
+    request.mm_features = []
+
+    matched, async_load = scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert (matched, async_load) == (384, True)
+    keys = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
+    assert {get_offload_group_idx(key) for key in keys} == {0, 2}
+    assert max(int(get_offload_block_hash(key)[1:]) for key in keys) == 47
+
+    fallback = MagicMock()
+    fallback.request_id = "ced-fallback"
+    fallback.kv_transfer_params = None
+    fallback.num_prompt_tokens = 512
+    fallback.num_tokens = 512
+    fallback.mm_features = []
+    fallback.skip_reading_prefix_cache = False
+    fallback.block_hashes = request.block_hashes
+    scheduler.on_new_request(fallback)
+
+    def miss_latest_encoder_window(key, _req_context):
+        if get_offload_group_idx(key) == 2 and get_offload_block_hash(key) == b"h47":
+            return LookupResult.MISS
+        return LookupResult.HIT
+
+    scheduler.manager.lookup.side_effect = miss_latest_encoder_window
+    assert scheduler.get_num_new_matched_tokens(fallback, 0) == (352, True)
+
+    image_fallback = MagicMock()
+    image_fallback.request_id = "ced-image-fallback"
+    image_fallback.kv_transfer_params = None
+    image_fallback.num_prompt_tokens = 512
+    image_fallback.num_tokens = 512
+    image_fallback.mm_features = [
+        SimpleNamespace(mm_position=SimpleNamespace(offset=330, length=40))
+    ]
+    image_fallback.skip_reading_prefix_cache = False
+    image_fallback.block_hashes = request.block_hashes
+    scheduler.on_new_request(image_fallback)
+
+    def miss_windows_across_image(key, _req_context):
+        return (
+            LookupResult.MISS
+            if get_offload_group_idx(key) == 2
+            and get_offload_block_hash(key) in (b"h47", b"h25")
+            else LookupResult.HIT
+        )
+
+    scheduler.manager.lookup.side_effect = miss_windows_across_image
+    assert scheduler.get_num_new_matched_tokens(image_fallback, 0) == (192, True)
+
+    no_encoder_window = MagicMock()
+    no_encoder_window.request_id = "ced-no-encoder-window"
+    no_encoder_window.kv_transfer_params = None
+    no_encoder_window.num_prompt_tokens = 512
+    no_encoder_window.num_tokens = 512
+    no_encoder_window.mm_features = []
+    no_encoder_window.skip_reading_prefix_cache = False
+    no_encoder_window.block_hashes = request.block_hashes
+    scheduler.on_new_request(no_encoder_window)
+    scheduler.manager.lookup.side_effect = lambda key, _: (
+        LookupResult.MISS if get_offload_group_idx(key) == 2 else LookupResult.HIT
+    )
+    assert scheduler.get_num_new_matched_tokens(no_encoder_window, 0) == (0, False)
 
 
 def _make_partial_tail_request(
@@ -212,6 +349,31 @@ def test_aligned_boundary_store_flushes_before_cow_destination_reuse():
     meta = scheduler.build_connector_meta(output)
 
     assert meta.jobs_to_flush == {job_id}
+
+
+def test_excluded_scratch_allocation_flushes_shared_pending_store():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = MagicMock(spec=OffloadingManager)
+    scheduler._req_status = {"req": MagicMock()}
+    scheduler._sliding_window_groups = ()
+    scheduler._block_id_to_pending_jobs = {99: {7}}
+    scheduler._current_batch_allocated_block_ids = set()
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._current_batch_load_jobs = {}
+    scheduler._build_partial_tail_store_jobs = MagicMock(return_value={})
+    scheduler._build_store_jobs = MagicMock(return_value={})
+
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        SimpleNamespace(req_id="req", block_ids=([11], [99], [22]))
+    ]
+
+    meta = scheduler.build_connector_meta(output)
+
+    assert meta.jobs_to_flush == {7}
+    scheduler._req_status["req"].update_block_id_groups.assert_called_once_with(
+        ([11], [99], [22])
+    )
 
 
 def test_normal_store_excludes_align_mode_mamba_sources():
