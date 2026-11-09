@@ -68,9 +68,9 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 class DeepseekV41SparseMLABackend(AttentionBackend):
     """DeepSeek-V4.1 sparse-MLA backend base.
 
-    Subclasses ``AttentionBackend`` directly (not the V3.2
-    ``FlashMLASparseBackend``): DeepSeek-V4.1 runs its own attention layer
-    (``DeepseekV4Attention``), so it does not reuse the V3.2 builder or impl, and
+    Subclasses `AttentionBackend` directly (not the V3.2
+    `FlashMLASparseBackend`): DeepSeek-V4.1 runs its own attention layer
+    (`DeepseekV4Attention`), so it does not reuse the V3.2 builder or impl, and
     only needs to declare its own metadata builder, KV-cache layout, and the
     sparse-MLA capability flags.
     """
@@ -83,7 +83,7 @@ class DeepseekV41SparseMLABackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [64 if current_platform.is_device_capability_family(90) else 128]
 
     @staticmethod
@@ -192,9 +192,10 @@ class DeepseekV41SparseMLAMetadataBuilder(
         if self.compress_ratio > 1:
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
+                cm.slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
-                cm.block_table_tensor.clamp_(min=0),
+                cm.block_table_tensor,
                 int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,

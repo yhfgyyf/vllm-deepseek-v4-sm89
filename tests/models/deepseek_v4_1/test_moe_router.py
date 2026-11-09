@@ -91,7 +91,7 @@ def _make_vllm_config(*, enable_jit_warmup: bool = False):
 
 
 @pytest.fixture
-def lightweight_moe_construction(monkeypatch):
+def lightweight_moe_construction(monkeypatch, dist_init):
     calls: list[dict] = []
 
     def fake_factory(**kwargs):
@@ -100,8 +100,8 @@ def lightweight_moe_construction(monkeypatch):
             top_k=kwargs["top_k"],
             global_num_experts=kwargs["num_experts"],
             e_score_correction_bias=kwargs["e_score_correction_bias"],
-            e_score_correction_bias_vl=kwargs["e_score_correction_bias_vl"],
-            input_vocab_size=kwargs["input_vocab_size"],
+            bias_vl=kwargs["bias_vl"],
+            image_sentinel_lo=kwargs["image_sentinel_lo"],
             renormalize=kwargs["renormalize"],
             scoring_func=kwargs["scoring_func"],
             routed_scaling_factor=kwargs["routed_scaling_factor"],
@@ -111,9 +111,7 @@ def lightweight_moe_construction(monkeypatch):
 
     monkeypatch.setattr(base_model, "GateLinear", _FakeGate)
     monkeypatch.setattr(base_model, "FusedMoEFactory", fake_factory)
-    monkeypatch.setattr(base_model, "validate_fi_moe_ep_config", lambda config: None)
     monkeypatch.setattr(base_model, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(base_model, "get_tensor_model_parallel_rank", lambda: 0)
     return calls
 
 
@@ -139,7 +137,7 @@ def test_v41_moe_inherited_constructor_adapts_target_and_draft_geometry(
     assert moe.n_activated_experts == topk
     assert moe.gate.weight.shape == (num_experts, original_config.hidden_size)
     assert moe.gate.e_score_correction_bias.shape == (num_experts,)
-    assert moe.gate.e_score_correction_bias_vl.shape == (num_experts,)
+    assert moe.gate.bias_vl.shape == (num_experts,)
     assert moe.gate.tid2eid is None
     assert isinstance(moe.experts.router, DeepseekV41TopKBiasRouter)
     assert moe.experts.router.top_k == topk
@@ -209,7 +207,7 @@ def test_v41_target_weight_mapper_maps_image_router_bias():
 
     assert (
         mapper._map_name("layers.0.ffn.gate.bias_vl")
-        == "model.layers.0.ffn.gate.e_score_correction_bias_vl"
+        == "model.layers.0.ffn.gate.bias_vl"
     )
 
 
@@ -231,9 +229,7 @@ def test_v41_vl_loader_maps_image_router_bias_through_backbone(monkeypatch):
     layer.ffn.gate.e_score_correction_bias = torch.nn.Parameter(
         text_bias.clone(), requires_grad=False
     )
-    layer.ffn.gate.e_score_correction_bias_vl = torch.nn.Parameter(
-        torch.zeros(384), requires_grad=False
-    )
+    layer.ffn.gate.bias_vl = torch.nn.Parameter(torch.zeros(384), requires_grad=False)
     backbone.layers = torch.nn.ModuleList([layer])
 
     language_model = uninitialized(model_module.DeepseekV41LLMForCausalLM)
@@ -248,7 +244,6 @@ def test_v41_vl_loader_maps_image_router_bias_through_backbone(monkeypatch):
         "fp4", "weight_scale"
     )
     monkeypatch.setattr(model_module, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(model_module, "get_tensor_model_parallel_rank", lambda: 0)
 
     image_bias = torch.arange(384, dtype=torch.float32)
     head_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
@@ -260,10 +255,10 @@ def test_v41_vl_loader_maps_image_router_bias_through_backbone(monkeypatch):
     )
 
     assert loaded == {
-        "language_model.model.layers.0.ffn.gate.e_score_correction_bias_vl",
+        "language_model.model.layers.0.ffn.gate.bias_vl",
         "language_model.lm_head.weight",
     }
-    assert torch.equal(layer.ffn.gate.e_score_correction_bias_vl, image_bias)
+    assert torch.equal(layer.ffn.gate.bias_vl, image_bias)
     assert torch.equal(layer.ffn.gate.e_score_correction_bias, text_bias)
     assert torch.equal(language_model.lm_head.weight, head_weight)
 
@@ -287,24 +282,18 @@ def test_v41_dspark_loader_maps_image_router_bias(monkeypatch):
     layer.ffn = torch.nn.Module()
     layer.ffn.use_mega_moe = False
     layer.ffn.gate = torch.nn.Module()
-    layer.ffn.gate.e_score_correction_bias_vl = torch.nn.Parameter(
-        torch.zeros(128), requires_grad=False
-    )
+    layer.ffn.gate.bias_vl = torch.nn.Parameter(torch.zeros(128), requires_grad=False)
     draft.model.layers = torch.nn.ModuleList([layer])
     draft.process_weights_after_loading = lambda: None
-    monkeypatch.setattr(
-        dspark_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(dspark_module, "get_tensor_model_parallel_rank", lambda: 0)
 
     loaded = draft.load_weights(
         [("mtp.0.ffn.gate.bias_vl", torch.arange(128, dtype=torch.float32))]
     )
 
-    name = "model.layers.0.ffn.gate.e_score_correction_bias_vl"
+    name = "model.layers.0.ffn.gate.bias_vl"
     assert loaded == {name}
     assert torch.equal(
-        layer.ffn.gate.e_score_correction_bias_vl,
+        layer.ffn.gate.bias_vl,
         torch.arange(128, dtype=torch.float32),
     )
 

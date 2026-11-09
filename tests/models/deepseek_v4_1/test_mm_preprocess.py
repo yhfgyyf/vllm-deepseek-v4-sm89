@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
-from vllm.models.deepseek_v4.vision import (
+from vllm.models.deepseek_v4.common.vision import (
     DeepseekV4Aligner as SharedDeepseekV4Aligner,
 )
-from vllm.models.deepseek_v4.vision import (
-    DeepseekV4VisionTransformer as SharedDeepseekV4VisionTransformer,
+from vllm.models.deepseek_v4.common.vision import (
+    DeepseekV4ViT as SharedDeepseekV4ViT,
 )
 from vllm.models.deepseek_v4_1.common.mm_preprocess import (
     IMAGE,
@@ -26,7 +26,7 @@ from vllm.models.deepseek_v4_1.common.mm_preprocess import (
 )
 from vllm.models.deepseek_v4_1.nvidia.vl_model import (
     DeepseekV4Aligner,
-    DeepseekV4VisionTransformer,
+    DeepseekV4ViT,
     DeepseekV41ForCausalLM,
 )
 from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
@@ -52,8 +52,8 @@ def test_v41_image_processor_preserves_patch_and_span_layout():
     image = Image.new("RGB", (6, 4), color=(255, 127, 0))
 
     config = _config()
-    assert not config.is_mm_prefix_lm
-    assert not config.mm_prefix_clamp_sliding_window
+    assert not getattr(config, "is_mm_prefix_lm", False)
+    assert not getattr(config, "mm_prefix_clamp_sliding_window", False)
     outputs = DeepseekV4VLProcessor(config)(images=[image])
 
     assert outputs["patches"].shape == (6, 3, 2, 2)
@@ -93,7 +93,9 @@ def test_v41_real_image_prompt_has_no_compressor_alignment_pad():
         get_image_placeholder_token_id=lambda: IMAGE_SENTINEL_BASE_ID,
         get_tokenizer=lambda: tokenizer,
     )
-    out_mm_kwargs = {"image": [{"types": SimpleNamespace(data=outputs["types"])}]}
+    out_mm_kwargs = {
+        "image": [{"llm_grid": SimpleNamespace(data=outputs["llm_grid"][0])}]
+    }
     updates = processor._get_prompt_updates(None, {}, out_mm_kwargs)
     resolved_updates = {"image": [[updates[0].resolve(0)]]}
 
@@ -111,7 +113,7 @@ def test_v41_real_image_prompt_has_no_compressor_alignment_pad():
 
 
 def test_v41_image_span_places_shared_vision_rows_and_delimiters():
-    assert DeepseekV4VisionTransformer is SharedDeepseekV4VisionTransformer
+    assert DeepseekV4ViT is SharedDeepseekV4ViT
     assert DeepseekV4Aligner is SharedDeepseekV4Aligner
 
     model = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)

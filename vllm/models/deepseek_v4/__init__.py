@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 model — hardware-isolated entry point.
 
-The actual implementation lives under ``nvidia/`` and ``amd/``; this module
+The actual implementation lives under `nvidia/` and `amd/`; this module
 picks the right one for the current platform and re-exports the public
 classes used by the model registry and quantization config lookup.
 """
@@ -29,11 +29,27 @@ if current_platform.is_rocm():
     )
     from .amd.model import DeepseekV4ForCausalLM
     from .amd.mtp import DeepSeekV4MTP
+    from .common.vl_model import (  # type: ignore[assignment]
+        DeepseekV4ForConditionalGeneration,
+    )
 elif current_platform.is_xpu():
+    from .vl_stub import (  # type: ignore[assignment]
+        DeepseekV4ForConditionalGeneration,
+    )
     from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+elif current_platform.is_cpu():
+    from .cpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
+    from .cpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+    from .cpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    from .vl_stub import (  # type: ignore[assignment]
+        DeepseekV4ForConditionalGeneration,
+    )
 else:
+    from .common.vl_model import (  # type: ignore[assignment]
+        DeepseekV4ForConditionalGeneration,
+    )
     from .nvidia.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,
     )

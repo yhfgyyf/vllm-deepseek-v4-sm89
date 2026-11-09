@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -8,17 +11,23 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import TokenizersBackend
 
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs.engine import embeds_input, mm_input, tokens_input
+from vllm.models.deepseek_v4_1.common.mm_preprocess import IMAGE_PLACEHOLDER
 from vllm.models.deepseek_v4_1.nvidia.ced import CED_METADATA_KEY, CEDRequest
 from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
+from vllm.v1.attention.backend import AttentionBackend, AttentionMetadataBuilder
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -30,7 +39,7 @@ from vllm.v1.worker.gpu.model_runner import _requires_ced_eager
 from vllm.v1.worker.utils import AttentionGroup
 
 
-class _FakeMetadataBuilder:
+class _FakeMetadataBuilder(AttentionMetadataBuilder):
     requires_block_table_width = False
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -51,7 +60,7 @@ class _FakeMetadataBuilder:
         return self.build(0, common_attn_metadata)
 
 
-class _FakeBackend:
+class _FakeBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls():
         return _FakeMetadataBuilder
@@ -105,37 +114,65 @@ def _request_state() -> DeepseekV41ModelState:
 def _input_processor(
     ced_enabled=True, model_type="deepseek_v41", max_num_batched_tokens=512
 ):
-    processor = InputProcessor.__new__(InputProcessor)
-    processor.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type=model_type, ced_prefill=ced_enabled),
-        max_model_len=512,
-        runner_type="generate",
-        max_logprobs=20,
-        get_vocab_size=lambda: 130000,
-        logits_processors=None,
-        is_diffusion=False,
-        return_sampling_mask=False,
-    )
-    processor.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False
-        ),
-        reasoning_config=None,
-    )
-    processor.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: None)
-    processor.speculative_config = None
-    processor.structured_outputs_config = None
-    processor.lora_config = None
-    processor.generation_config_fields = {}
-    processor.supports_mm_inputs = True
-    processor.mm_encoder_cache_size = 512
-    processor.skip_prompt_length_check = False
-    processor.scheduler_config = SimpleNamespace(
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_scheduled_tokens=None,
-        long_prefill_token_threshold=0,
-    )
-    return processor
+    # Admission needs the real renderer/config initialization, but no weights.
+    with TemporaryDirectory() as path:
+        config = {
+            "model_type": "deepseek_v41",
+            "architectures": ["DeepseekV41ForCausalLM"],
+            "text_config": {
+                "hidden_size": 128,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "max_position_embeddings": 512,
+                "vocab_size": 130000,
+                "qk_nope_head_dim": 64,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+                "kv_lora_rank": 512,
+                "rms_norm_eps": 1e-6,
+                "compress_ratios": [1, 1],
+            },
+            "vision_config": {
+                "num_hidden_layers": 1,
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "intermediate_size": 16,
+                "patch_size": 2,
+                "downsample_ratio": 2,
+                "max_image_tokens": 512,
+                "min_pixels": 1,
+            },
+        }
+        Path(path, "config.json").write_text(json.dumps(config))
+        vocab = {str(i): i for i in range(130000)}
+        del vocab["129264"]
+        vocab[IMAGE_PLACEHOLDER] = 129264
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="0")),
+            unk_token="0",
+        ).save_pretrained(path)
+        model_config = ModelConfig(
+            model=path,
+            tokenizer_mode="hf",
+            dtype="bfloat16",
+            max_model_len=512,
+            enable_prompt_embeds=True,
+            limit_mm_per_prompt={"image": 2},
+            hf_overrides={"ced_prefill": ced_enabled, "model_type": model_type},
+        )
+        return InputProcessor(
+            VllmConfig(
+                model_config=model_config,
+                cache_config=CacheConfig(cache_dtype="fp8_ds_mla"),
+                scheduler_config=SchedulerConfig(
+                    max_model_len=512,
+                    is_encoder_decoder=False,
+                    max_num_seqs=4,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                ),
+            )
+        )
 
 
 def _image_input(modality="image", *, prompt_len=3, offset=1, length=1):
@@ -457,9 +494,8 @@ def test_ced_prepare_attn_uses_independent_compact_metadata_builders(
     state._ced_mm_ranges = {9: [(4, 123)], 3: []}
     state.ced_tail = SimpleNamespace(window=384)
     state.supports_mm_inputs = False
-    state.max_model_len = 256
     state.device = torch.device("cpu")
-    state.model_config = SimpleNamespace(is_mm_prefix_lm=False)
+    state.model_config = SimpleNamespace(is_mm_prefix_lm=False, max_model_len=256)
     state.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=256),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
@@ -498,6 +534,8 @@ def test_ced_prepare_attn_uses_independent_compact_metadata_builders(
         dcp_local_seq_lens=None,
         max_query_len=56,
         prompt_lens=None,
+        pcp=None,
+        fast_prefill=None,
     )
     block_tables = (
         torch.stack(

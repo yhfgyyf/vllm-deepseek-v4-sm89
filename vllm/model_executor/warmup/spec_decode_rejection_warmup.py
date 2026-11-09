@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warm up spec-decode rejection-sampler Triton kernels.
 
-The rejection sampler kernels (``_compute_local_logits_stats_kernel``,
-``_rejection_kernel``, ``_resample_kernel``) are JIT-compiled by Triton on
+The rejection sampler kernels (`_compute_local_logits_stats_kernel`,
+`_rejection_kernel`, `_resample_kernel`) are JIT-compiled by Triton on
 first use. Without warmup, the first spec-decode request pays a multi-second
 compilation cost. This pre-compiles them with dummy data matching the
 server's vocab size and speculative config.
@@ -29,6 +29,7 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
     if spec_config is None:
         return
 
+    from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         rejection_sample,
     )
@@ -73,8 +74,8 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
         target_logits = torch.zeros(
             (num_logits, vocab_size), dtype=tgt_dtype, device=device
         )
-        draft_logits = torch.zeros(
-            (num_reqs, num_spec, vocab_size), dtype=draft_dtype, device=device
+        draft_logits_cache = DraftLogitsCache(
+            num_reqs, num_spec, vocab_size, dtype=draft_dtype, fill=0.0, device=device
         )
         synthetic_rates = (
             torch.full((num_spec,), 0.5, dtype=torch.float32, device=device)
@@ -84,7 +85,7 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
         try:
             rejection_sample(
                 target_logits=target_logits,
-                draft_logits=draft_logits,
+                draft_logits_cache=draft_logits_cache,
                 draft_sampled=torch.zeros(num_logits, dtype=torch.int64, device=device),
                 cu_num_logits=torch.tensor(
                     [0, num_logits], dtype=torch.int32, device=device

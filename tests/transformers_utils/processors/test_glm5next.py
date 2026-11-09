@@ -329,8 +329,8 @@ def test_sample_frames_fps_interval(video_processor):
 
 
 def test_defaults_mirror_checkpoint_config():
-    """Bare instantiation matches the checkpoint's ``processor_config.json``
-    token-budget style defaults; ``size`` carries no budget."""
+    """Bare instantiation matches the checkpoint's `processor_config.json`
+    token-budget style defaults; `size` carries no budget."""
     image_processor = Glm5NextImageProcessor()
     assert image_processor.patch_expand_factor == 1
     assert image_processor.min_image_tokens == 16

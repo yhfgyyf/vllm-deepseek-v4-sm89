@@ -12,10 +12,7 @@ from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
-from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
-    compute_fp8_einsum_recipe,
-    deep_gemm_fp8_o_proj,
-)
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
@@ -25,7 +22,6 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
     DeepseekSparseSWAMetadataBuilder,
-    _get_mm_prefix_swa_index_width,
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -60,12 +56,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return deep_gemm_fp8_o_proj(
+        z = self.wo_a.grouped_forward(
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
-            self.wo_a,
-            self.wo_b,
             n_groups=self.n_local_groups,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
@@ -74,6 +68,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             einsum_recipe=self._einsum_recipe,
             tma_aligned_scales=self._tma_aligned_scales,
         )
+        return self.wo_b(z.flatten(1))
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -120,14 +115,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             else:
                 assert self.topk_indices_buffer is not None
                 top_k = self.topk_indices_buffer.shape[-1]
-            model_config = self.vllm_config.model_config
-            hf_config = model_config.hf_config
-            swa_index_width = (
-                _get_mm_prefix_swa_index_width(hf_config, self.window_size)
-                if model_config.is_mm_prefix_lm
-                else self.window_size
+            combined_topk = round_up(
+                top_k + self.window_size + self.max_image_tokens, 128
             )
-            combined_topk = round_up(top_k + swa_index_width, 128)
             current_workspace_manager().get_simultaneous(
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
@@ -319,8 +309,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
-        swa_index_width = swa_metadata.decode_swa_width or self.window_size
-        combined_topk = round_up(top_k + swa_index_width, 128)
+        combined_topk = round_up(top_k + self.window_size + self.max_image_tokens, 128)
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             chunk_size = chunk_end - chunk_start
             workspace = workspace_manager.get_simultaneous(
@@ -378,14 +367,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_M,
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
-                mm_prefix_query_ranges=(
-                    None
-                    if swa_metadata.mm_prefix_query_ranges is None
-                    else swa_metadata.mm_prefix_query_ranges[
+                left_visible=(
+                    swa_metadata.prefill_left_visible[
                         num_decode_tokens + query_start : num_decode_tokens + query_end
                     ]
+                    if swa_metadata.prefill_left_visible is not None
+                    else None
                 ),
-                swa_index_width=swa_index_width,
+                right_visible=(
+                    swa_metadata.prefill_right_visible[
+                        num_decode_tokens + query_start : num_decode_tokens + query_end
+                    ]
+                    if swa_metadata.prefill_right_visible is not None
+                    else None
+                ),
+                max_image_tokens=self.max_image_tokens,
             )
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],

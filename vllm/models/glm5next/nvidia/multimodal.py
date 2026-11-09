@@ -614,14 +614,14 @@ class Glm5NextVisionTransformer(nn.Module):
 class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     """Wires up the vLLM-native processor for the multimodal checkpoint.
 
-    The checkpoint's ``processor_config.json`` declares a custom ``processor_class``
+    The checkpoint's `processor_config.json` declares a custom `processor_class`
     and stores its image/video processor configs inline (no standalone
-    ``preprocessor_config.json``), so ``AutoProcessor`` cannot resolve the
-    config. We bypass it and build our own ``Glm5NextProcessor``
-    (``vllm/transformers_utils/processors/glm5next.py``), a port of the
+    `preprocessor_config.json`), so `AutoProcessor` cannot resolve the
+    config. We bypass it and build our own `Glm5NextProcessor`
+    (`vllm/transformers_utils/processors/glm5next.py`), a port of the
     training-side pipeline that no longer imports transformers' GLM processor
-    classes. The port applies ``patch_expand_factor`` (checkpoint ships 1)
-    inside ``smart_resize``'s spatial factor.
+    classes. The port applies `patch_expand_factor` (checkpoint ships 1)
+    inside `smart_resize`'s spatial factor.
     """
 
     @cached_property
@@ -668,10 +668,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         """GLM-5.3-Flash canvas geometry for token budgeting and dummy inputs.
 
         The inherited Glm4v path resolves the pixel budget from
-        ``size.longest_edge`` and resizes with GLM-4V's ``smart_resize``. This
-        checkpoint's ``processor_config.json`` ships the token-budget style
-        (``min_image_tokens`` / ``max_image_tokens``) with no ``size`` key, and
-        the alignment factor carries ``patch_expand_factor`` — resolve both
+        `size.longest_edge` and resizes with GLM-4V's `smart_resize`. This
+        checkpoint's `processor_config.json` ships the token-budget style
+        (`min_image_tokens` / `max_image_tokens`) with no `size` key, and
+        the alignment factor carries `patch_expand_factor` — resolve both
         from the vLLM-native processor so profiling matches runtime geometry.
         """
         from vllm.transformers_utils.processors.glm5next import smart_resize
@@ -715,10 +715,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
 
 
 class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
-    """The vLLM-native ``Glm5NextProcessor`` extracts image/video features
+    """The vLLM-native `Glm5NextProcessor` extracts image/video features
     only and passes the prompt text through unchanged, so prompt expansion
     (image token repeat, video frame/timestamp structure) is owned by vLLM's
-    prompt-update machinery — the inherited ``_get_prompt_updates`` builds
+    prompt-update machinery — the inherited `_get_prompt_updates` builds
     the replacement content and the placeholder scan validates against
     exactly that."""
 

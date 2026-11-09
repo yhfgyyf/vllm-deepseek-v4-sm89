@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
-from vllm.config import CUDAGraphMode
+from vllm.config import AttentionConfig, CompilationConfig, CUDAGraphMode
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _dsv41_expand_decode_seq_lens,
     _dsv41_rows_per_chunk,
@@ -19,8 +19,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     DeepseekV4IndexerMetadataBuilder,
     DeepseekV32IndexerMetadataBuilder,
-    DeepseekV41IndexerBackend,
-    DeepseekV41IndexerMetadataBuilder,
+    DeepseekV41NativeIndexerBackend,
+    DeepseekV41NativeIndexerMetadataBuilder,
     _dsv41_decode_max_indexer_kv_len,
     dsv41_indexer_uses_fp4,
 )
@@ -28,16 +28,8 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.workspace import WorkspaceManager
 
 
-class _AttentionConfig:
-    def __init__(self, dtype: str):
-        self.dtype = dtype
-
-    def resolve_indexer_kv_dtype(self, default: str) -> str:
-        return default if self.dtype == "auto" else self.dtype
-
-
 def _config(dtype: str = "auto"):
-    return SimpleNamespace(attention_config=_AttentionConfig(dtype))
+    return SimpleNamespace(attention_config=AttentionConfig(indexer_kv_dtype=dtype))
 
 
 def _builder_config(
@@ -55,8 +47,10 @@ def _builder_config(
             num_speculative_tokens=num_speculative_tokens,
         )
     return SimpleNamespace(
-        attention_config=_AttentionConfig("auto"),
-        model_config=SimpleNamespace(max_model_len=max_model_len),
+        attention_config=AttentionConfig(
+            sparse_mla_prefill_workspace_factor=5 if max_model_len <= 256 * 1024 else 2
+        ),
+        model_config=SimpleNamespace(max_model_len=max_model_len, hf_text_config=None),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=4,
@@ -66,7 +60,7 @@ def _builder_config(
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        compilation_config=SimpleNamespace(
+        compilation_config=CompilationConfig(
             cudagraph_mode=cudagraph_mode,
             max_cudagraph_capture_size=max_num_batched_tokens,
         ),
@@ -152,11 +146,12 @@ def test_v41_backend_isolated_interface() -> None:
     assert (
         DeepseekV4IndexerBackend.get_builder_cls() is DeepseekV4IndexerMetadataBuilder
     )
-    assert DeepseekV41IndexerBackend.get_name() == "DEEPSEEK_V41_INDEXER"
-    assert not DeepseekV41IndexerBackend.supports_pcp()
-    assert DeepseekV41IndexerBackend.get_supported_kernel_block_sizes() == [128]
+    assert DeepseekV41NativeIndexerBackend.get_name() == "DEEPSEEK_V41_NATIVE_INDEXER"
+    assert not DeepseekV41NativeIndexerBackend.supports_pcp()
+    assert DeepseekV41NativeIndexerBackend.get_supported_kernel_block_sizes() == [128]
     assert (
-        DeepseekV41IndexerBackend.get_builder_cls() is DeepseekV41IndexerMetadataBuilder
+        DeepseekV41NativeIndexerBackend.get_builder_cls()
+        is DeepseekV41NativeIndexerMetadataBuilder
     )
 
 
@@ -189,16 +184,16 @@ def test_v41_backend_isolated_interface() -> None:
         (
             (8, 9),
             False,
-            DeepseekV41IndexerBackend,
-            DeepseekV41IndexerMetadataBuilder,
+            DeepseekV41NativeIndexerBackend,
+            DeepseekV41NativeIndexerMetadataBuilder,
             True,
             False,
         ),
         (
             (12, 0),
             True,
-            DeepseekV41IndexerBackend,
-            DeepseekV41IndexerMetadataBuilder,
+            DeepseekV41NativeIndexerBackend,
+            DeepseekV41NativeIndexerMetadataBuilder,
             True,
             False,
         ),
@@ -228,8 +223,8 @@ def test_adaptive_model_specific_metadata_capabilities(
         ((8, 9), False, DeepseekV32IndexerMetadataBuilder),
         ((8, 9), False, DeepseekV4IndexerMetadataBuilder),
         ((12, 0), True, DeepseekV4IndexerMetadataBuilder),
-        ((8, 9), False, DeepseekV41IndexerMetadataBuilder),
-        ((12, 0), True, DeepseekV41IndexerMetadataBuilder),
+        ((8, 9), False, DeepseekV41NativeIndexerMetadataBuilder),
+        ((12, 0), True, DeepseekV41NativeIndexerMetadataBuilder),
     ],
 )
 def test_nonadaptive_k1_metadata_paths_remain_uniform_batch(
@@ -312,23 +307,23 @@ def test_v4_adaptive_builds_flattened_device_metadata(
             cudagraph_mode=CUDAGraphMode.FULL,
             max_num_batched_tokens=16,
         ),
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
         block_table_width=2,
     )
     capture_common = CommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device="cuda"),
         query_start_loc_cpu=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
-        seq_lens=torch.tensor([40, 44, 52, 80], dtype=torch.int32),
+        seq_lens=torch.tensor([40, 44, 52, 80], dtype=torch.int32, device="cuda"),
         num_reqs=4,
         num_actual_tokens=9,
         max_query_len=1,
         max_seq_len=80,
         block_table_tensor=torch.tensor(
-            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32
+            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32, device="cuda"
         ),
-        slot_mapping=torch.zeros(9, dtype=torch.int64),
+        slot_mapping=torch.zeros(9, dtype=torch.int64, device="cuda"),
         seq_lens_cpu_upper_bound=torch.tensor([40, 44, 52, 80], dtype=torch.int32),
-        is_prefilling=torch.zeros(4, dtype=torch.bool),
+        is_prefilling=torch.zeros(4, dtype=torch.bool, device="cuda"),
     )
     capture_metadata = builder.build_for_cudagraph_capture(capture_common)
     assert capture_metadata.decode is not None
@@ -350,19 +345,19 @@ def test_v4_adaptive_builds_flattened_device_metadata(
     else:
         assert capture_metadata.decode.indices is None
     common = CommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 3, 4, 4, 9], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3, 4, 4, 9], dtype=torch.int32, device="cuda"),
         query_start_loc_cpu=torch.tensor([0, 2, 4, 4, 9], dtype=torch.int32),
-        seq_lens=torch.tensor([40, 44, 0, 80], dtype=torch.int32),
+        seq_lens=torch.tensor([40, 44, 0, 80], dtype=torch.int32, device="cuda"),
         num_reqs=4,
         num_actual_tokens=9,
         max_query_len=5,
         max_seq_len=80,
         block_table_tensor=torch.tensor(
-            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32
+            [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int32, device="cuda"
         ),
-        slot_mapping=torch.zeros(9, dtype=torch.int64),
+        slot_mapping=torch.zeros(9, dtype=torch.int64, device="cuda"),
         seq_lens_cpu_upper_bound=torch.tensor([40, 44, 0, 80], dtype=torch.int32),
-        is_prefilling=torch.tensor([False, False, False, True]),
+        is_prefilling=torch.tensor([False, False, False, True], device="cuda"),
     )
 
     metadata = builder.build(0, common)
@@ -455,7 +450,7 @@ def test_v4_adaptive_prefill_outside_capture_uses_bounded_chunks(
         ),
         layer_names=["model.layers.20.attn.indexer.k_cache"],
         vllm_config=config,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
         block_table_width=1,
     )
     device_lens = [3, 1, *prefill_lens]
@@ -467,21 +462,23 @@ def test_v4_adaptive_prefill_outside_capture_uses_bounded_chunks(
         dtype=torch.int32,
     )
     common = CommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, *device_lens], dtype=torch.int32).cumsum(
-            0, dtype=torch.int32
-        ),
+        query_start_loc=torch.tensor(
+            [0, *device_lens], dtype=torch.int32, device="cuda"
+        ).cumsum(0, dtype=torch.int32),
         query_start_loc_cpu=torch.tensor([0, *cpu_lens], dtype=torch.int32).cumsum(
             0, dtype=torch.int32
         ),
-        seq_lens=seq_lens,
+        seq_lens=seq_lens.cuda(),
         seq_lens_cpu_upper_bound=seq_lens.clone(),
         num_reqs=num_reqs,
         num_actual_tokens=num_tokens,
         max_query_len=max(cpu_lens),
         max_seq_len=config.model_config.max_model_len,
-        block_table_tensor=torch.ones((num_reqs, 1), dtype=torch.int32),
-        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
-        is_prefilling=torch.tensor([False, False, *([True] * len(prefill_lens))]),
+        block_table_tensor=torch.ones((num_reqs, 1), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device="cuda"),
+        is_prefilling=torch.tensor(
+            [False, False, *([True] * len(prefill_lens))], device="cuda"
+        ),
     )
 
     metadata = builder.build(0, common)
@@ -546,7 +543,7 @@ def test_v41_adaptive_flattens_device_lens_with_padding_and_prefill(
         alignment=128,
         model_version="deepseek_v4_1",
     )
-    builder = DeepseekV41IndexerMetadataBuilder(
+    builder = DeepseekV41NativeIndexerMetadataBuilder(
         kv_cache_spec=spec,
         layer_names=["model.layers.20.attn.indexer.k_cache"],
         vllm_config=_builder_config(
@@ -630,7 +627,7 @@ def test_v41_builder_skips_deep_gemm_scheduler_metadata(monkeypatch) -> None:
     )
 
     builder, metadata = _build_single_decode(
-        DeepseekV41IndexerMetadataBuilder, monkeypatch
+        DeepseekV41NativeIndexerMetadataBuilder, monkeypatch
     )
 
     assert metadata.decode is not None
@@ -651,14 +648,14 @@ def test_v41_builder_uses_active_width_but_capture_uses_configured_max(
     expected_capture: int,
 ) -> None:
     _, active = _build_single_decode(
-        DeepseekV41IndexerMetadataBuilder,
+        DeepseekV41NativeIndexerMetadataBuilder,
         monkeypatch,
         compress_ratio=compress_ratio,
         seq_len=257,
         max_model_len=1024,
     )
     _, capture = _build_single_decode(
-        DeepseekV41IndexerMetadataBuilder,
+        DeepseekV41NativeIndexerMetadataBuilder,
         monkeypatch,
         compress_ratio=compress_ratio,
         seq_len=257,
@@ -868,6 +865,7 @@ def test_v41_profile_reserves_runtime_workspace_without_legacy_dummy(
         1024 * 1024,
         topk,
         True,
+        False,
         False,
         "",
         use_fp4_cache=True,

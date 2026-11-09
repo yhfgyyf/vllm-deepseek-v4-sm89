@@ -3,8 +3,63 @@
 
 import contextlib
 import os
+from typing import Any
 
 from PIL import Image, ImageOps
+
+# Formats accepted by Image.open for untrusted multimodal media.
+#
+# Audited against Pillow's registered open plugins (python -m PIL / Image.OPEN):
+# Allowed: native still-image / raster readers that decode in-process.
+# Denied:
+#   EPS — may invoke Ghostscript on untrusted PostScript
+#   WMF — Windows GDI / stub-handler path
+#   BUFR / GRIB / HDF5 — stub drivers requiring external handlers
+#   MPEG — identify-only; not a decodable still image
+ALLOWED_IMAGE_FORMATS: tuple[str, ...] = (
+    "AVIF",
+    "BLP",
+    "BMP",
+    "CUR",
+    "DCX",
+    "DDS",
+    "DIB",
+    "FITS",
+    "FLI",
+    "FTEX",
+    "GBR",
+    "GIF",
+    "ICNS",
+    "ICO",
+    "IM",
+    "IMT",
+    "IPTC",
+    "JPEG",
+    "JPEG2000",
+    "MCIDAS",
+    "MSP",
+    "PCD",
+    "PCX",
+    "PIXAR",
+    "PNG",
+    "PPM",
+    "PSD",
+    "QOI",
+    "SGI",
+    "SPIDER",
+    "SUN",
+    "TGA",
+    "TIFF",
+    "WEBP",
+    "XBM",
+    "XPM",
+    "XVTHUMB",
+)
+
+
+def open_image(fp: Any) -> Image.Image:
+    """Open image bytes/files with the serving format allowlist."""
+    return Image.open(fp, formats=ALLOWED_IMAGE_FORMATS)
 
 
 def rescale_image_size(
@@ -82,9 +137,6 @@ def convert_image_mode(
     to_mode: str,
     background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
 ) -> Image.Image:
-    if image.mode == to_mode:
-        return image
-
     if to_mode == "RGB" and _has_transparency(image):
         if image.mode != "RGBA":
             image = image.convert("RGBA")
@@ -95,5 +147,8 @@ def convert_image_mode(
         if os.environ.get("VLLM_SMART_IMAGE_RGB") == "1":
             background_color = _smart_background_color(image)
         return rgba_to_rgb(image, background_color)
+
+    if image.mode == to_mode:
+        return image
 
     return image.convert(to_mode)

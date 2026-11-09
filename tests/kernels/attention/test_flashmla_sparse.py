@@ -6,12 +6,6 @@ import pytest
 import torch
 
 
-def test_deepseek_v4_swa_backend_supports_mm_prefix():
-    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
-
-    assert DeepseekSparseSWABackend.supports_mm_prefix()
-
-
 @pytest.mark.parametrize("sm120", [False, True])
 def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride(
     monkeypatch: pytest.MonkeyPatch,
@@ -86,28 +80,6 @@ def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride(
     assert torch.all(prefill_buffer[:, 128:] == -99)
 
 
-def test_dsv4_vision_warmup_covers_fixed_width_and_mm_prefix_variants():
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        CombineTopkSwaIndicesKernel,
-    )
-
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
-        model_config=SimpleNamespace(
-            is_mm_prefix_lm=True,
-            hf_config=SimpleNamespace(
-                sliding_window=128,
-                vision_max_n_token=384,
-            ),
-        ),
-    )
-
-    keys = CombineTopkSwaIndicesKernel().get_warmup_keys(config)
-
-    assert {key.SWA_INDEX_WIDTH for key in keys} == {512}
-    assert {key.HAS_MM_PREFIX for key in keys} == {False, True}
-
-
 def test_sparse_flashmla_metadata_smoke():
     import vllm.v1.attention.ops.flashmla as fm
 
@@ -139,8 +111,9 @@ def test_sparse_flashmla_metadata_smoke():
     assert num_splits is None
 
 
-def test_sparse_flashmla_decode_smoke():
+def test_sparse_flashmla_decode_matches_cache_writer_scales():
     import vllm.v1.attention.ops.flashmla as fm
+    from vllm import _custom_ops as ops
 
     ok, reason = fm.is_flashmla_sparse_supported()
     if not ok:
@@ -160,7 +133,7 @@ def test_sparse_flashmla_decode_smoke():
     # Metadata
     q_seq_per_hk = seqlen_q * num_heads_q // num_heads_k
     # q_heads_per_hk = num_heads_q // num_heads_k
-    cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    cache_seqlens = torch.ones(batch_size, dtype=torch.int32, device=device)
     tile_md, num_splits = fm.get_mla_metadata(
         cache_seqlens,
         q_seq_per_hk,
@@ -176,14 +149,33 @@ def test_sparse_flashmla_decode_smoke():
         dtype=torch.bfloat16,
         device=device,
     )
-    k_cache = torch.zeros(
-        (1, page_block_size, num_heads_k, bytes_per_token),
-        dtype=torch.uint8,
-        device=device,
+    cache_rows = torch.zeros(
+        (1, page_block_size, bytes_per_token), dtype=torch.uint8, device=device
     )
-    indices = torch.zeros(
-        (batch_size, seqlen_q, topk), dtype=torch.int32, device=device
+    # 336 / 448 = 0.75 distinguishes arbitrary FP32 from power-of-two scales.
+    kv_c = torch.full((1, 512), 336.0, dtype=torch.bfloat16, device=device)
+    kv_c[:, -128:] = 0
+    ops.concat_and_cache_mla(
+        kv_c,
+        torch.zeros((1, 64), dtype=torch.bfloat16, device=device),
+        cache_rows,
+        torch.zeros(1, dtype=torch.int64, device=device),
+        "fp8_ds_mla",
+        torch.ones(1, dtype=torch.float32, device=device),
     )
+    scales = cache_rows[0, 0].view(torch.float32)[128:132]
+    expected_scales = torch.tensor([1.0, 1.0, 1.0, 2**-13], device=device)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    cached_nope = cache_rows[0, 0, :512].view(torch.float8_e4m3fn).float()
+    expected = (cached_nope * scales.repeat_interleave(128)).to(torch.bfloat16)
+
+    k_cache = cache_rows.unsqueeze(2)
+    indices = torch.full(
+        (batch_size, seqlen_q, topk), -1, dtype=torch.int32, device=device
+    )
+    indices[..., 0] = 0
+    # SM90 sparse decode only supports a fixed top-k width. Padding with -1
+    # exercises the same cache data on SM90 and SM100 without topk_length.
 
     block_table = torch.zeros((batch_size, 128), dtype=torch.int32, device=device)
     out, lse = fm.flash_mla_with_kvcache(
@@ -200,6 +192,9 @@ def test_sparse_flashmla_decode_smoke():
     assert out.shape[0] == batch_size
     assert out.shape[-1] == head_dim_v
     assert lse.shape[0] == batch_size
+    torch.testing.assert_close(
+        out, expected.view(1, 1, 1, 512).expand_as(out), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("h_q", [64, 128])
@@ -232,6 +227,79 @@ def test_sparse_flashmla_prefill_smoke(h_q: int):
     assert actual[0].shape == (s_q, h_q, d_v)
 
 
+@pytest.mark.parametrize(
+    ("layout_name", "num_layers", "num_blocks"),
+    [
+        # Unpadded, layer 1 would start 104 KiB below a granule boundary.
+        ("LBNHC", 2, 27),
+        # Block 0 alone would leave the last layer's view 104 KiB or 96 KiB.
+        ("BLNHC", 28, 8),
+        ("BLNHC", 85, 8),
+    ],
+)
+def test_sparse_flashmla_prefill_on_the_kv_cache_at_allocation(
+    layout_name: str, num_layers: int, num_blocks: int
+):
+    """On SM100, a TMA gather with an out-of-bounds index reads up to 128 KiB past
+    the start of the KV view. Autotuning runs this before warmup commits more than
+    the extensible cache's first blocks, which an illegal access would crash."""
+    import vllm.v1.attention.ops.flashmla as fm
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.utils.extensible_tensor import granule_size
+    from vllm.utils.vmm_driver import vmm_unavailable_reason
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MLAAttentionSpec
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.extensible_kv_cache import (
+        ExtensibleKVCache,
+        pad_kv_cache_segments,
+    )
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+    if (reason := vmm_unavailable_reason()) is not None:
+        pytest.skip(f"VMM unavailable: {reason}")
+
+    device = torch.device("cuda")
+    block_size, d_qk, h_q, s_q, topk = 64, 576, 64, 128, 2048
+    layout = KVCacheLayout[layout_name]
+    spec = MLAAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=d_qk, dtype=torch.bfloat16
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = layout.name
+    layers = [f"layer.{i}" for i in range(num_layers)]
+    config = get_kv_cache_config_from_groups(
+        vllm_config,
+        [KVCacheGroupSpec(layers, spec)],
+        available_memory=num_layers * spec.page_size_bytes * num_blocks,
+    )
+    assert config.num_blocks == num_blocks
+    config = pad_kv_cache_segments(
+        config, layout, granule_size(torch.accelerator.current_device_index())
+    )
+    kv_cache = ExtensibleKVCache(config, device, layout)
+    try:
+        views = allocate_kv_cache(config, device, layout, allocate=kv_cache.allocate)
+        q = torch.randn((s_q, h_q, d_qk), dtype=torch.bfloat16, device=device)
+        # The farthest reach: one valid slot in an int4 group of invalid ones, on
+        # the last row of a 64-row page.
+        indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32, device=device)
+        indices[..., 0] = block_size - 1
+        topk_length = torch.ones(s_q, dtype=torch.int32, device=device)
+        for layer in layers:
+            rows, _ = flat_kv_row_view(views[layer].squeeze(1), block_size)
+            fm.flash_mla_sparse_fwd(
+                q, rows.unsqueeze(1), indices, d_qk**-0.5, topk_length=topk_length
+            )
+        torch.accelerator.synchronize()
+    finally:
+        kv_cache.free()
+
+
 def test_deepseek_v4_prefill_chunk_planning_expands_for_short_sequences():
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
@@ -259,12 +327,10 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
     builder_calls = 0
-    captured_mm_prefix_ranges = []
 
     def fake_build(*args, **kwargs):
         nonlocal builder_calls
         builder_calls += 1
-        captured_mm_prefix_ranges.append(kwargs.get("mm_prefix_query_ranges"))
         return (
             torch.tensor([[builder_calls]], dtype=torch.int32),
             torch.tensor([builder_calls], dtype=torch.int32),
@@ -300,9 +366,6 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
             num_prefills=1,
             num_decode_tokens=1,
             num_prefill_tokens=2,
-            mm_prefix_query_ranges=torch.tensor(
-                [[-1, -1], [1, 2], [1, 2]], dtype=torch.int32
-            ),
         )
 
     def make_flashmla_metadata():
@@ -402,7 +465,6 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
     )
 
     assert builder_calls == 4
-    assert all(ranges is not None for ranges in captured_mm_prefix_ranges)
     assert sparse_indices_third is not sparse_indices_fourth
     assert sparse_lens_third is not sparse_lens_fourth
 
@@ -524,6 +586,432 @@ def test_flashinfer_mixed_sparse_indices_separates_window_and_padded_width():
     assert sparse_lens.cpu().tolist() == [padded_width]
 
 
+def test_flashinfer_mixed_sparse_indices_noncausal_rows_have_no_active_gaps():
+    """A DSpark non-causal row keeps -1 out of the kernel's active ranges.
+
+    Each draft token's causal window holds its first visible entries, the rest
+    of the block starts at column `window`, and the compressed entries follow
+    directly; `sparse_topk_lens` ends right after them.
+    """
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        build_flashinfer_mixed_sparse_indices,
+    )
+
+    device = torch.device("cuda")
+    window, width = 4, 8
+    # One request: 1 context token, a 2-token draft block, slots 0..2 visible.
+    decode_swa = torch.full((2, width), -1, dtype=torch.int32, device=device)
+    decode_swa[:, :3] = torch.arange(3, dtype=torch.int32, device=device)
+    compressed = torch.tensor(
+        [[100, 101, -1, -1]] * 2, dtype=torch.int32, device=device
+    )
+    sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
+        decode_swa_indices=decode_swa,
+        decode_compressed_indices=compressed,
+        decode_compressed_topk_lens=torch.tensor(
+            [2, 2], dtype=torch.int32, device=device
+        ),
+        prefill_topk_indices=torch.empty((0, 4), dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([3], dtype=torch.int32, device=device),
+        token_to_req_indices=torch.tensor([0, 0], dtype=torch.int32, device=device),
+        swa_block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        swa_block_size=64,
+        compressed_block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        compressed_block_size=64,
+        window_size=window,
+        compress_ratio=128,
+        topk=0,
+    )
+
+    assert sparse_indices.cpu().tolist() == [
+        # pos 1: window [0, 1]; slot 2 spills to column 4; compressed after it.
+        [0, 1, -1, -1, 2, 100, 101, -1, -1, -1, -1, -1],
+        # pos 2: window [0, 1, 2]; nothing spills; compressed at column 4.
+        [0, 1, 2, -1, 100, 101, -1, -1, -1, -1, -1, -1],
+    ]
+    assert sparse_lens.cpu().tolist() == [7, 6]
+
+
+def test_flashinfer_mixed_sparse_indices_noncausal_pad_rows_keep_min_length():
+    """A CUDA-graph pad token of the DSpark graph (a zero-length request) gets
+    a causal pad row's shape instead of negative spill arithmetic."""
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        build_flashinfer_mixed_sparse_indices,
+    )
+
+    device = torch.device("cuda")
+    window, width = 128, 192
+    decode_swa = torch.full((3, width), -1, dtype=torch.int32, device=device)
+    decode_swa[:2, :3] = torch.arange(3, dtype=torch.int32, device=device)
+    sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
+        decode_swa_indices=decode_swa,
+        decode_compressed_indices=None,
+        decode_compressed_topk_lens=None,
+        prefill_topk_indices=torch.empty((0, 0), dtype=torch.int32, device=device),
+        # Request 1 is the padding: no query tokens, seq_len 0.
+        query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([3, 0], dtype=torch.int32, device=device),
+        token_to_req_indices=torch.tensor([0, 0, 1], dtype=torch.int32, device=device),
+        swa_block_table=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        swa_block_size=64,
+        compressed_block_table=None,
+        compressed_block_size=64,
+        window_size=window,
+        compress_ratio=1,
+        topk=0,
+    )
+
+    assert sparse_lens.cpu().tolist() == [129, 128, 128]
+    assert (sparse_indices[2] == -1).all()
+
+
+@pytest.mark.parametrize("model", ["deepseek_v4", "deepseek_v41"])
+@pytest.mark.parametrize("page_padding", [0, 64])
+def test_flashinfer_sparse_forward_reads_packed_kv_rows(model, page_padding):
+    """Decode and prefill must read storage rows after vLLM remaps packed pages."""
+    import importlib
+
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("Requires FlashInfer TRTLLM sparse MLA on SM100/SM103")
+    mod = importlib.import_module(f"vllm.models.{model}.nvidia.flashinfer_sparse")
+    device = "cuda"
+    block_size = 64
+    storage = torch.full(
+        (3, block_size + page_padding, 512), 99, dtype=torch.bfloat16, device=device
+    )
+    cache = storage[:, :block_size]
+    cache[1].fill_(2)
+    cache[2].fill_(3)
+    attn = object.__new__(mod.DeepseekV4FlashInferMLAAttention)
+    attn.compress_ratio = 1
+    attn.window_size = 128
+    attn.scale = 512**-0.5
+    attn.kv_cache_torch_dtype = torch.bfloat16
+    attn.attn_sink = torch.full((64,), -float("inf"), device=device)
+    attn.topk_indices_buffer = torch.empty((3, 0), dtype=torch.int32, device=device)
+    decode_indices = torch.full((1, 128), -1, dtype=torch.int32, device=device)
+    decode_indices[0, :4] = torch.arange(64, 68, dtype=torch.int32, device=device)
+    query_start = torch.tensor([0, 1, 3], dtype=torch.int32)
+    metadata = DeepseekSparseSWAMetadata(
+        block_table=torch.tensor([[1], [2]], dtype=torch.int32, device=device),
+        slot_mapping=torch.tensor([67, 130, 131], device=device),
+        block_size=block_size,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32, device=device),
+        query_start_loc=query_start.to(device),
+        query_start_loc_cpu=query_start,
+        token_to_req_indices=torch.tensor([0, 1, 1], dtype=torch.int32, device=device),
+        decode_swa_indices=decode_indices,
+        decode_swa_lens=torch.tensor([4], dtype=torch.int32, device=device),
+        decode_swa_width=128,
+        is_valid_token=torch.ones(3, dtype=torch.bool, device=device),
+        replay_start=torch.zeros(2, dtype=torch.int32, device=device),
+        num_decodes=1,
+        num_prefills=1,
+        num_decode_tokens=1,
+        num_prefill_tokens=2,
+        max_decode_query_len=1,
+    )
+    query = torch.zeros((3, 64, 512), dtype=torch.bfloat16, device=device)
+    output = torch.empty_like(query)
+    attn._forward(query, None, cache, metadata, None, True, output)
+    expected = torch.tensor([2, 3, 3], dtype=output.dtype, device=device)
+    torch.testing.assert_close(output, expected[:, None, None].expand_as(output))
+
+
+def _make_rope_quant_attn(mod, num_rows: int, device: str):
+    """A bare DSv4 FlashInfer layer set up for RopeQuant: 128 heads, fp8 KV."""
+    from types import SimpleNamespace
+
+    heads, groups, rank = 128, 16, 256
+    angles = torch.arange(2048, device=device, dtype=torch.float32)[:, None] * 0.05
+    angles = angles + torch.arange(32, device=device)[None] * 0.1
+    attn = object.__new__(mod.DeepseekV4FlashInferMLAAttention)
+    attn.compress_ratio = 1
+    attn.window_size = 128
+    attn.scale = 512**-0.5
+    attn.kv_cache_torch_dtype = torch.float8_e4m3fn
+    attn._flashinfer_fp8_bmm1_scale = attn.scale
+    attn._flashinfer_fp8_bmm2_scale = 1.0
+    attn.attn_sink = torch.linspace(-1, 1, heads, device=device)
+    attn.padded_heads = heads
+    attn.topk_indices_buffer = torch.empty(
+        (num_rows, 0), dtype=torch.int32, device=device
+    )
+    attn.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+    )
+    attn.n_local_heads, attn.n_local_groups, attn.o_lora_rank = heads, groups, rank
+    attn.nope_head_dim, attn.rope_head_dim = 448, 64
+    attn._einsum_recipe, attn._tma_aligned_scales = (1, 1, 128), True
+    attn.wo_a = SimpleNamespace(
+        weight=(torch.randn((groups, rank, 4096), device=device) * 0.05).to(
+            torch.float8_e4m3fn
+        ),
+        weight_scale=torch.ones((groups, rank, 32), device=device),
+    )
+    attn.wo_b = lambda z: z
+    return attn
+
+
+def _rope_quant_vs_unfused(attn, q, cache, metadata, positions, num_tokens):
+    """Run `_forward` unfused and fused; return (bf16 attention, z_unfused, z_fused)."""
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import rope_quant_attn_out
+
+    heads, groups = attn.n_local_heads, attn.n_local_groups
+    unfused = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    attn._forward(q, None, cache, metadata, None, True, unfused)
+    fused = rope_quant_attn_out(q.shape[0], q.device)
+    metadata.flashinfer_sparse_index_cache.clear()
+    attn._forward(q, None, cache, metadata, None, True, fused)
+    z_unfused = attn._o_proj(unfused[:num_tokens, :heads], positions)
+    z_fused = attn._o_proj(fused, positions)[:num_tokens]
+    return unfused[:num_tokens], z_unfused, z_fused.view(num_tokens, groups, -1)
+
+
+def _assert_projects_alike(z_unfused, z_fused):
+    z_unfused = z_unfused.float().view_as(z_fused)
+    rel = (z_fused.float() - z_unfused).norm() / z_unfused.norm()
+    assert rel < 2e-2, rel
+
+
+def _skip_unless_rope_quant():
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("Requires FlashInfer TRTLLM sparse MLA on SM100/SM103")
+
+
+def test_flashinfer_rope_quant_matches_unfused_o_proj():
+    """RopeQuant's fused output must project like the bf16 + inv-RoPE/quant path.
+
+    One mixed step (two decodes, a three-token prefill) plus CUDA-graph pad rows,
+    so both calls run over the full buffer with un-rebased cum_seq_lens_q.
+    """
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as mod
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+    _skip_unless_rope_quant()
+    torch.manual_seed(0)
+    device = "cuda"
+    block_size = 64
+    q_lens, seq_lens = [1, 1, 3], [5, 9, 70]
+    num_tokens, num_rows = sum(q_lens), sum(q_lens) + 3
+    cache = torch.randn((3, block_size, 512), device=device).to(torch.float8_e4m3fn)
+    attn = _make_rope_quant_attn(mod, num_rows, device)
+
+    decode_indices = torch.full((2, 128), -1, dtype=torch.int32, device=device)
+    for i, seq_len in enumerate(seq_lens[:2]):
+        decode_indices[i, :seq_len] = torch.arange(
+            i * block_size, i * block_size + seq_len, device=device
+        )
+    query_start = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
+    metadata = DeepseekSparseSWAMetadata(
+        block_table=torch.tensor([[0], [1], [2]], dtype=torch.int32, device=device),
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+        block_size=block_size,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        query_start_loc=query_start.to(device),
+        query_start_loc_cpu=query_start,
+        token_to_req_indices=torch.tensor(
+            [0, 1, 2, 2, 2], dtype=torch.int32, device=device
+        ),
+        decode_swa_indices=decode_indices,
+        decode_swa_lens=torch.tensor(seq_lens[:2], dtype=torch.int32, device=device),
+        decode_swa_width=128,
+        is_valid_token=torch.ones(num_tokens, dtype=torch.bool, device=device),
+        num_decodes=2,
+        num_prefills=1,
+        num_decode_tokens=2,
+        num_prefill_tokens=3,
+        max_decode_query_len=1,
+    )
+    positions = torch.tensor([4, 8, 67, 68, 69], device=device)
+    q = torch.randn((num_rows, 128, 512), device=device).to(torch.float8_e4m3fn)
+    _, z_unfused, z_fused = _rope_quant_vs_unfused(
+        attn, q, cache, metadata, positions, num_tokens
+    )
+    _assert_projects_alike(z_unfused, z_fused)
+
+
+@pytest.mark.parametrize("context_len", [0, 20, 127, 900])
+def test_flashinfer_dspark_noncausal_block_sees_future_tokens(context_len):
+    """Every DSpark draft token attends to the whole block, fused or not.
+
+    The kernel counts every entry of its active index ranges as a key, so the
+    builder must place the block around each query's causal window without -1
+    gaps, down to an empty context.
+    """
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as mod
+    from vllm.v1.attention.backends.mla.compressor_utils import (
+        get_dspark_swa_index_width,
+    )
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+    _skip_unless_rope_quant()
+    torch.manual_seed(0)
+    device = "cuda"
+    block_size, window, draft = 64, 128, 4
+    width = get_dspark_swa_index_width(window, draft)
+    contexts = [context_len, context_len + 37]
+    num_reqs, num_tokens = len(contexts), len(contexts) * draft
+    num_rows = num_tokens + 2
+    pages = -(-(max(contexts) + draft) // block_size)
+    cache = torch.randn((num_reqs * pages, block_size, 512), device=device)
+    cache = cache.clamp_(-1, 1).to(torch.float8_e4m3fn)
+    attn = _make_rope_quant_attn(mod, num_rows, device)
+    attn.attn_sink = torch.full((128,), -float("inf"), device=device)
+
+    # As the DSpark SWA builder lays them out: the trailing window of context
+    # and the whole block, contiguous from column 0.
+    decode_indices = torch.full((num_tokens, width), -1, dtype=torch.int32)
+    visible, positions = [], []
+    for r, ctx in enumerate(contexts):
+        slots = torch.arange(max(ctx - window, 0), ctx + draft) + r * pages * block_size
+        for k in range(draft):
+            decode_indices[r * draft + k, : slots.numel()] = slots.to(torch.int32)
+            visible.append(slots)
+            positions.append(ctx + k)
+    query_start = torch.arange(0, num_tokens + 1, draft, dtype=torch.int32)
+    seq_lens = torch.tensor([c + draft for c in contexts], dtype=torch.int32)
+    metadata = DeepseekSparseSWAMetadata(
+        block_table=torch.arange(
+            num_reqs * pages, dtype=torch.int32, device=device
+        ).view(num_reqs, pages),
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+        block_size=block_size,
+        seq_lens=seq_lens.to(device),
+        query_start_loc=query_start.to(device),
+        query_start_loc_cpu=query_start,
+        token_to_req_indices=torch.arange(
+            num_reqs, dtype=torch.int32, device=device
+        ).repeat_interleave(draft),
+        decode_swa_indices=decode_indices.to(device),
+        decode_swa_lens=torch.tensor(
+            [v.numel() for v in visible], dtype=torch.int32, device=device
+        ),
+        decode_swa_width=width,
+        is_valid_token=torch.ones(num_tokens, dtype=torch.bool, device=device),
+        num_decodes=num_reqs,
+        num_prefills=0,
+        num_decode_tokens=num_tokens,
+        num_prefill_tokens=0,
+        max_decode_query_len=draft,
+    )
+    q = torch.randn((num_rows, 128, 512), device=device).clamp_(-1, 1)
+    q = q.to(torch.float8_e4m3fn)
+    attention, z_unfused, z_fused = _rope_quant_vs_unfused(
+        attn, q, cache, metadata, torch.tensor(positions, device=device), num_tokens
+    )
+
+    keys_all = cache.flatten(0, 1).float()
+    for token, slots in enumerate(visible):
+        keys = keys_all[slots.to(device)]
+        weights = torch.softmax(q[token].float() @ keys.T * attn.scale, -1)
+        torch.testing.assert_close(
+            attention[token].float(), weights @ keys, atol=0.05, rtol=0.05
+        )
+    _assert_projects_alike(z_unfused, z_fused)
+
+
+def test_deepseek_v4_swa_backend_supports_mm_prefix():
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+
+    assert DeepseekSparseSWABackend.supports_mm_prefix()
+
+
+def test_dsv4_vision_warmup_covers_fixed_width_and_mm_prefix_variants():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        CombineTopkSwaIndicesKernel,
+    )
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        model_config=SimpleNamespace(
+            is_mm_prefix_lm=True,
+            max_model_len=4096,
+            hf_config=SimpleNamespace(
+                sliding_window=128,
+                vision_max_n_token=384,
+                vision_n_layers=1,
+                index_topk=512,
+                compress_ratios=[1, 4, 128],
+            ),
+        ),
+    )
+
+    keys = CombineTopkSwaIndicesKernel().get_warmup_keys(config)
+
+    assert {key.WINDOW_SIZE for key in keys} == {128}
+    assert {key.IMAGE_WIDTH for key in keys} == {0, 384}
+
+
+def test_sparse_flashmla_decode_smoke():
+    import vllm.v1.attention.ops.flashmla as fm
+
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    batch_size = 1
+    seqlen_q = 1
+    num_heads_q = 64
+    head_dim_k = 576
+    head_dim_v = 512
+    num_heads_k = 1
+    page_block_size = 64
+    bytes_per_token = 656
+    topk = 128
+
+    # Metadata
+    q_seq_per_hk = seqlen_q * num_heads_q // num_heads_k
+    # q_heads_per_hk = num_heads_q // num_heads_k
+    cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    tile_md, num_splits = fm.get_mla_metadata(
+        cache_seqlens,
+        q_seq_per_hk,
+        num_heads_k,
+        num_heads_q=num_heads_q,
+        topk=topk,
+        is_fp8_kvcache=True,
+    )
+
+    # Inputs
+    q = torch.zeros(
+        (batch_size, seqlen_q, num_heads_q, head_dim_k),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_cache = torch.zeros(
+        (1, page_block_size, num_heads_k, bytes_per_token),
+        dtype=torch.uint8,
+        device=device,
+    )
+    indices = torch.zeros(
+        (batch_size, seqlen_q, topk), dtype=torch.int32, device=device
+    )
+
+    block_table = torch.zeros((batch_size, 128), dtype=torch.int32, device=device)
+    out, lse = fm.flash_mla_with_kvcache(
+        q,
+        k_cache,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+        tile_md,
+        num_splits,
+        indices=indices,
+        is_fp8_kvcache=True,
+    )
+    assert out.shape[0] == batch_size
+    assert out.shape[-1] == head_dim_v
+    assert lse.shape[0] == batch_size
+
+
 def _golden_swa_rows(
     *,
     seq_lens: list[int],
@@ -592,14 +1080,16 @@ def test_dsv4_swa_indices_use_bidirectional_image_span_golden():
         swa_lens,
         window_size,
         index_width,
+        torch.tensor([0, 0, 1, 2, 0, 0, 1, 0], dtype=torch.int32, device=device),
+        torch.tensor([0, 2, 1, 0, 0, 1, 0, 0], dtype=torch.int32, device=device),
         torch.tensor(query_start_loc, dtype=torch.int32, device=device),
         torch.tensor(seq_lens, dtype=torch.int32, device=device),
         torch.tensor(token_to_req, dtype=torch.int32, device=device),
         torch.ones((8,), dtype=torch.bool, device=device),
         torch.tensor(block_table, dtype=torch.int32, device=device),
         block_size,
-        torch.tensor(mm_ranges, dtype=torch.int32, device=device),
-        True,
+        torch.zeros(2, dtype=torch.int32, device=device),
+        has_image=True,
         num_tokens=8,
         token_offset=0,
     )
@@ -629,6 +1119,7 @@ def test_v41_vision_uses_causal_swa_in_mixed_and_chunked_batches(
     query_lens, with_images
 ):
     """V4.1 image spans must not expose future keys or widen text SWA rows."""
+    from vllm.config import ParallelConfig
     from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
         DeepseekV41NativeSWAMetadataBuilder,
     )
@@ -650,9 +1141,11 @@ def test_v41_vision_uses_causal_swa_in_mixed_and_chunked_batches(
             max_model_len=4096,
             is_mm_prefix_lm=ModelArchConfigConvertorBase(hf, hf).is_mm_prefix_lm(),
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=total),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=total, max_num_seqs=2),
+        parallel_config=ParallelConfig(),
         speculative_config=SimpleNamespace(
             num_speculative_tokens=5,
+            max_num_new_slots_for_drafting=0,
             parallel_drafting=False,
             enable_adaptive_verification=False,
             use_dspark=lambda: True,
@@ -702,7 +1195,8 @@ def test_v41_vision_uses_causal_swa_in_mixed_and_chunked_batches(
         torch.cat((metadata.decode_swa_lens, metadata.prefill_swa_lens)).cpu().tolist()
         == lengths
     )
-    assert metadata.mm_prefix_query_ranges is None
+    assert metadata.prefill_left_visible is None
+    assert metadata.prefill_right_visible is None
 
 
 def test_flashinfer_mixed_sparse_indices_use_prefill_image_span():
@@ -712,7 +1206,7 @@ def test_flashinfer_mixed_sparse_indices_use_prefill_image_span():
 
     device = torch.device("cuda")
     sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
-        decode_swa_indices=torch.empty((0, 8), dtype=torch.int32, device=device),
+        decode_swa_indices=torch.empty((0, 4), dtype=torch.int32, device=device),
         decode_compressed_indices=None,
         decode_compressed_topk_lens=None,
         prefill_topk_indices=torch.empty((5, 0), dtype=torch.int32, device=device),
@@ -726,11 +1220,13 @@ def test_flashinfer_mixed_sparse_indices_use_prefill_image_span():
         window_size=4,
         compress_ratio=1,
         topk=0,
-        mm_prefix_query_ranges=torch.tensor(
-            [(-1, -1), (1, 3), (1, 3), (1, 3), (-1, -1)],
-            dtype=torch.int32,
-            device=device,
+        prefill_left_visible=torch.tensor(
+            [0, 0, 1, 2, 0], dtype=torch.int32, device=device
         ),
+        prefill_right_visible=torch.tensor(
+            [0, 2, 1, 0, 0], dtype=torch.int32, device=device
+        ),
+        max_image_tokens=4,
     )
 
     assert sparse_indices.cpu().tolist() == [
@@ -750,7 +1246,7 @@ def test_flashinfer_mixed_sparse_indices_keep_past_window_and_future_image():
 
     device = torch.device("cuda")
     sparse_indices, sparse_lens = build_flashinfer_mixed_sparse_indices(
-        decode_swa_indices=torch.empty((0, 8), dtype=torch.int32, device=device),
+        decode_swa_indices=torch.empty((0, 4), dtype=torch.int32, device=device),
         decode_compressed_indices=None,
         decode_compressed_topk_lens=None,
         prefill_topk_indices=torch.empty((8, 0), dtype=torch.int32, device=device),
@@ -764,11 +1260,13 @@ def test_flashinfer_mixed_sparse_indices_keep_past_window_and_future_image():
         window_size=4,
         compress_ratio=1,
         topk=0,
-        mm_prefix_query_ranges=torch.tensor(
-            [(-1, -1), (-1, -1), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (-1, -1)],
-            dtype=torch.int32,
-            device=device,
+        prefill_left_visible=torch.tensor(
+            [0, 0, 0, 1, 2, 3, 4, 0], dtype=torch.int32, device=device
         ),
+        prefill_right_visible=torch.tensor(
+            [0, 0, 4, 3, 2, 1, 0, 0], dtype=torch.int32, device=device
+        ),
+        max_image_tokens=4,
     )
 
     assert sparse_indices[2].cpu().tolist() == [0, 1, 2, 3, 4, 5, 6, -1]
@@ -789,12 +1287,9 @@ def test_flashmla_combine_topk_swa_indices_use_prefill_image_span():
         topk=0,
         M=5,
         N=0,
-        mm_prefix_query_ranges=torch.tensor(
-            [(-1, -1), (1, 3), (1, 3), (1, 3), (-1, -1)],
-            dtype=torch.int32,
-            device=device,
-        ),
-        swa_index_width=8,
+        left_visible=torch.tensor([0, 0, 1, 2, 0], dtype=torch.int32, device=device),
+        right_visible=torch.tensor([0, 2, 1, 0, 0], dtype=torch.int32, device=device),
+        max_image_tokens=4,
     )
 
     assert combined_indices[:, :8].cpu().tolist() == [
@@ -821,12 +1316,13 @@ def test_flashmla_combine_keeps_past_window_and_future_image():
         topk=0,
         M=8,
         N=0,
-        mm_prefix_query_ranges=torch.tensor(
-            [(-1, -1), (-1, -1), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (-1, -1)],
-            dtype=torch.int32,
-            device=device,
+        left_visible=torch.tensor(
+            [0, 0, 0, 1, 2, 3, 4, 0], dtype=torch.int32, device=device
         ),
-        swa_index_width=8,
+        right_visible=torch.tensor(
+            [0, 0, 4, 3, 2, 1, 0, 0], dtype=torch.int32, device=device
+        ),
+        max_image_tokens=4,
     )
 
     assert combined_indices[2, :8].cpu().tolist() == [0, 1, 2, 3, 4, 5, 6, -1]

@@ -46,7 +46,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with multiple replicated output shards.
 
-    Extends K3's ``_KimiGDNMergedColumnParallelLinear`` to support two
+    Extends K3's `_KimiGDNMergedColumnParallelLinear` to support two
     replicated shards (f_a, g_a) instead of one. Pre-multiplies each
     replicated entry's output_size by tp_size so the per-rank shard
     divides back to the full size, and forces tp_rank=0 during weight

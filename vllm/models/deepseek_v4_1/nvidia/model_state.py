@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -37,7 +38,8 @@ from .ced import (
 def _gather_lookback_kernel(
     lookback_ptr,
     idx_mapping_ptr,
-    num_computed_tokens_ptr,
+    query_start_loc_ptr,
+    positions_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
     num_reqs,
@@ -48,13 +50,16 @@ def _gather_lookback_kernel(
     batch_idx = tl.program_id(0)
     in_batch = batch_idx < num_reqs
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx, mask=in_batch, other=0)
-    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+    begin = tl.load(query_start_loc_ptr + batch_idx, mask=in_batch, other=0)
+    end = tl.load(query_start_loc_ptr + batch_idx + 1, mask=in_batch, other=0)
+    in_batch = in_batch & (end > begin)
+    num_computed = tl.load(positions_ptr + begin, mask=in_batch, other=0)
 
     offs = tl.arange(0, BLOCK_DEPTH)
     pos = num_computed - 1 - offs
     valid = in_batch & (offs < DEPTH) & (pos >= 0)
     ids = tl.load(
-        all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
+        all_token_ids_ptr + req_state_idx.to(tl.int64) * all_token_ids_stride + pos,
         mask=valid,
         other=-1,
     )
@@ -64,8 +69,8 @@ def _gather_lookback_kernel(
 class DeepseekV41ModelState(DefaultModelState):
     """DeepSeek V4.1 runner state for engram lookback and opt-in CED replay.
 
-    The engram n-gram hash needs the ids of the ``depth`` tokens preceding
-    each request's chunk start (see ``common/engram.py``). The runner keeps
+    The engram n-gram hash needs the ids of the `depth` tokens preceding
+    each request's chunk start (see `common/engram.py`). The runner keeps
     the full token history on device, so the window is gathered there every
     step: exact for prompt and generated tokens alike, whatever instance
     produced their KV.
@@ -183,6 +188,7 @@ class DeepseekV41ModelState(DefaultModelState):
                     self.device,
                     kernel_block_size=kernel_block_size,
                 )
+                clone.kernel_block_stride = group.kernel_block_stride
                 cloned_cache_group.append(clone)
             cloned_groups.append(cloned_cache_group)
         self._ced_attn_groups = cloned_groups
@@ -300,12 +306,7 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         ced_groups = self._get_ced_attn_groups(attn_groups)
         kernel_block_sizes = tuple(
-            (
-                int(cast(Any, groups[0].get_metadata_builder(0)).kernel_block_size)
-                if groups
-                else cache_group.kv_cache_spec.block_size
-            )
-            for groups, cache_group in zip(ced_groups, kv_cache_config.kv_cache_groups)
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         )
         policies = tuple(
             (
@@ -402,7 +403,8 @@ class DeepseekV41ModelState(DefaultModelState):
         _gather_lookback_kernel[(window.shape[0],)](
             window,
             input_batch.idx_mapping,
-            req_states.num_computed_tokens.gpu,
+            input_batch.query_start_loc,
+            input_batch.positions,
             all_token_ids,
             all_token_ids.stride(0),
             input_batch.idx_mapping.shape[0],
@@ -421,6 +423,8 @@ class DeepseekV41ModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         attn_metadata = super().prepare_attn(
             input_batch,
@@ -430,6 +434,8 @@ class DeepseekV41ModelState(DefaultModelState):
             attn_groups,
             kv_cache_config,
             for_capture,
+            ubatch_idx,
+            model_specific_attn_metadata,
         )
         if (
             self.ced_enabled

@@ -37,7 +37,7 @@ class CompressorBackend(AttentionBackend):
         return "CompressorBackend"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [MultipleOf(1)]
 
     @classmethod
@@ -57,7 +57,7 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor  # [num_tokens]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "num_actual_tokens", "num_tokens"])
 def _ring_slot_mapping_kernel(
     slot_mapping_ptr,
     source_slot_mapping_ptr,
@@ -78,7 +78,9 @@ def _ring_slot_mapping_kernel(
     pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
     slot = block.to(tl.int64) * CAPACITY + pos % CAPACITY
     tl.store(
-        slot_mapping_ptr + offsets, tl.where(valid, slot, -1), mask=offsets < num_tokens
+        slot_mapping_ptr + offsets,
+        tl.where(valid & (block != 0), slot, -1),
+        mask=offsets < num_tokens,
     )
 
 
@@ -174,7 +176,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 class DeepseekCompressor(nn.Module):
     """DeepSeek V4.1 KV/score compressor.
 
-    Pools ``compress_ratio`` consecutive tokens into one KV latent with a
+    Pools `compress_ratio` consecutive tokens into one KV latent with a
     learned softmax gate (ratio 1 has no gate and no pooling). Owns the
     linear, norm and state cache. State saving, compression and RMSNorm share
     one Triton kernel. The emitted latent feeds independent main-cache and

@@ -13,13 +13,10 @@ logger = init_logger(__name__)
 
 
 def set_eagle3_aux_hidden_state_layers(
-    model: nn.Module,
-    spec_config: SpeculativeConfig,
+    model: nn.Module, spec_config: SpeculativeConfig, use_pp: bool = False
 ) -> None:
     if not supports_eagle3(model):
         raise RuntimeError("Model does not support EAGLE3 interface")
-    # mypy may infer the class-level overload for supports_eagle3.
-    # Narrow explicitly to the runtime protocol instance.
     if isinstance(model, type):
         raise RuntimeError("Expected model instance for EAGLE3 configuration")
     eagle3_model = cast(SupportsEagle3, model)
@@ -33,21 +30,26 @@ def set_eagle3_aux_hidden_state_layers(
     eagle3_model.set_aux_hidden_state_layers(aux_layers)
     reserve_aux_intermediate_tensor_slots(model)
 
+    if use_pp:
+        assert spec_config.method is not None
+        verify_supports_aux_hidden_states_over_pp(model, spec_config.method)
+
 
 def _inner_decoder(model: nn.Module) -> nn.Module | None:
-    parent = model
+    parent_ref = model
     if hasattr(model, "get_language_model"):
-        parent = model.get_language_model()
+        parent_ref = model.get_language_model()
     elif hasattr(model, "language_model"):
-        parent = model.language_model
-    return getattr(parent, "model", parent)
+        parent_ref = model.language_model
+    return getattr(parent_ref, "model", parent_ref)
 
 
 def verify_supports_aux_hidden_states_over_pp(model: nn.Module, method: str) -> None:
-    if not getattr(_inner_decoder(model), "supports_aux_hidden_states_over_pp", False):
+    inner = _inner_decoder(model)
+    if not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         raise ValueError(
-            f"{type(model).__name__} does not support {method} "
-            "with pipeline parallelism"
+            f"{type(model).__name__} does not support {method} with "
+            "pipeline parallelism"
         )
 
 
@@ -78,16 +80,20 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     inner = _inner_decoder(model)
     if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return
-    total = inner._aux_slot_base_cached
-    if total == 0:
+
+    num_aux_states = inner._aux_slot_base_cached
+    if num_aux_states == 0:
         return
+
+    key = inner.AUX_HIDDEN_STATE_KEY
+    hidden_size = inner.config.hidden_size
     make_empty = model.make_empty_intermediate_tensors
 
     def make_empty_with_aux(batch_size, dtype, device):
         tensors = make_empty(batch_size, dtype, device)
-        for i in range(total):
-            tensors[f"{inner.AUX_HIDDEN_STATE_KEY}{i}"] = torch.zeros(
-                (batch_size, inner.config.hidden_size), dtype=dtype, device=device
+        for i in range(num_aux_states):
+            tensors[f"{key}{i}"] = torch.zeros(
+                (batch_size, hidden_size), dtype=dtype, device=device
             )
         return tensors
 
@@ -110,6 +116,10 @@ def get_eagle3_aux_layers_from_config(
         dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
         if dspark_layer_ids:
             if getattr(hf_config, "model_type", None) == "deepseek_v41":
+                # v4.1 reads the attention *inputs* of its target layers, and
+                # the target model captures the entry stream of layer L when
+                # idx+1 == L, so the ids are used as-is. (v4's ids are in
+                # capture-after semantics and keep the +1.)
                 layer_ids = list(dspark_layer_ids)
             else:
                 layer_ids = [i + 1 for i in dspark_layer_ids]

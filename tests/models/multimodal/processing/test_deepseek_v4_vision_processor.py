@@ -151,10 +151,10 @@ class _Context:
         raise AssertionError("DeepSeek-V4 Vision processor must not call HF offsets")
 
 
-def _make_processor(ctx=None, cache=None):
+def _make_processor(ctx=None):
     info = DeepseekV4VisionProcessingInfo(ctx or _Context())
     dummy = DeepseekV4VisionDummyInputsBuilder(info)
-    return DeepseekV4VisionMultiModalProcessor(info, dummy, cache=cache)
+    return DeepseekV4VisionMultiModalProcessor(info, dummy)
 
 
 def _reference_block(n_vit_h, n_vit_w, output_offset):
@@ -423,8 +423,9 @@ def test_deepseek_v4_vision_processor_handles_multi_image_n_layout():
     assert first_data["image_indices"].tolist() == first_perm
     assert second_data["image_indices"].tolist() == second_perm
 
+    # Parsing needs no weights or optional multimodal LoRA implementation.
     model = DeepseekV4ForConditionalGeneration.__new__(
-        DeepseekV4ForConditionalGeneration
+        DeepseekV4ForConditionalGeneration  # type: ignore[type-abstract]
     )
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(vocab_size=VOCAB_SIZE)
@@ -520,6 +521,9 @@ def test_deepseek_v4_vision_batches_videos_with_different_frame_counts(
     modality, num_items, batched_kwargs = groups[0]
     assert modality == "video"
     assert num_items == 2
+    assert isinstance(batched_kwargs["video_num_frames"], torch.Tensor)
+    assert isinstance(batched_kwargs["num_video_frame_patches"], torch.Tensor)
+    assert isinstance(batched_kwargs["video_pixel_values"], torch.Tensor)
     assert batched_kwargs["video_num_frames"].tolist() == [1, 3]
     assert batched_kwargs["num_video_frame_patches"].tolist() == [1, 1, 1, 1]
     assert batched_kwargs["video_pixel_values"][:, 0, 0, 0].tolist() == [
@@ -529,8 +533,9 @@ def test_deepseek_v4_vision_batches_videos_with_different_frame_counts(
         40,
     ]
 
+    # Parsing needs no weights or optional multimodal LoRA implementation.
     model = DeepseekV4ForConditionalGeneration.__new__(
-        DeepseekV4ForConditionalGeneration
+        DeepseekV4ForConditionalGeneration  # type: ignore[type-abstract]
     )
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(vocab_size=VOCAB_SIZE)
@@ -545,18 +550,20 @@ def test_deepseek_v4_vision_batches_videos_with_different_frame_counts(
 def test_deepseek_v4_vision_processor_cache_hit_matches_miss():
     ctx = _Context()
     cache = MultiModalProcessorOnlyCache(ctx.model_config)
-    processor = _make_processor(ctx, cache=cache)
+    processor = _make_processor(ctx)
     image = Image.new("RGB", (14, 14), color=(1, 2, 3))
 
     first = processor(
         prompt=f"a{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     second = processor(
         prompt=f"a{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
 
     assert cache.make_stats().hits > 0
@@ -569,23 +576,26 @@ def test_deepseek_v4_vision_processor_cache_hit_matches_miss():
 def test_deepseek_v4_vision_processor_cache_key_tracks_prefix_pad_layout():
     ctx = _Context()
     cache = MultiModalProcessorOnlyCache(ctx.model_config)
-    processor = _make_processor(ctx, cache=cache)
+    processor = _make_processor(ctx)
     image = Image.new("RGB", (14, 14), color=(1, 2, 3))
 
     first = processor(
         prompt=f"{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     second = processor(
         prompt=f"z{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     third = processor(
         prompt=f"q{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
 
     first_expected, first_types, _ = _reference_block(10, 10, output_offset=0)
@@ -607,7 +617,7 @@ def test_deepseek_v4_vision_processor_cache_key_tracks_prefix_pad_layout():
 def test_deepseek_v4_image_video_hashes_use_prompt_order_offsets(monkeypatch):
     ctx = _Context()
     cache = MultiModalProcessorOnlyCache(ctx.model_config)
-    processor = _make_processor(ctx, cache=cache)
+    processor = _make_processor(ctx)
 
     def fake_extract_patches(image, config):
         del image, config
@@ -621,26 +631,31 @@ def test_deepseek_v4_image_video_hashes_use_prompt_order_offsets(monkeypatch):
         prompt=f"{VIDEO_TOKEN}yy{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image, "video": video}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     second = processor(
         prompt=f"z{VIDEO_TOKEN}y{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image, "video": video}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     third = processor(
         prompt=f"{IMAGE_TOKEN}yy{VIDEO_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image, "video": video}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     same_image_offset = processor(
         prompt=f"abc{IMAGE_TOKEN}",
         mm_items=processor.info.parse_mm_data({"image": image}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
     same_video_offset = processor(
         prompt=f"abc{VIDEO_TOKEN}",
         mm_items=processor.info.parse_mm_data({"video": video}),
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
 
     assert first["mm_hashes"]["video"] != second["mm_hashes"]["video"]

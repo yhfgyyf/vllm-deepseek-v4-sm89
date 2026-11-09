@@ -2,18 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 vision variant.
 
-Thin multimodal wrapper around the text-only ``DeepseekV41LLMForCausalLM``:
+Thin multimodal wrapper around the text-only `DeepseekV41LLMForCausalLM`:
 
-- ``vision`` ViT + ``aligner`` produce per-image embeddings for the IMAGE
-  positions; three learned vectors (``image_start`` / ``image_newline`` /
-  ``image_end``) fill the delimiter positions. Every image-span position
-  carries ``image_token_id`` (129264) in ``input_ids``; the per-position
-  roles come from the processor's ``types`` tensor (see
-  ``common/mm_preprocess.py``, and ``common/vision.py`` for the tower).
-- Merged embeddings enter the text model via ``inputs_embeds``, i.e. before
-  its hyper-connection stream expansion. Raw ``input_ids`` still flow into
-  the model so the MoE router can apply ``bias_vl`` to image tokens
-  (``requires_raw_input_tokens``).
+- `vision` ViT + `aligner` produce per-image embeddings for the IMAGE
+  positions; three learned vectors (`image_start` / `image_newline` /
+  `image_end`) fill the delimiter positions. Every image-span position
+  carries `image_token_id` (129264) in `input_ids`; the per-position
+  roles come from the processor's `types` tensor (see
+  `common/mm_preprocess.py`, and `common/vision.py` for the tower).
+- Merged embeddings enter the text model via `inputs_embeds`, i.e. before
+  its hyper-connection stream expansion. Raw `input_ids` still flow into
+  the model so the MoE router can apply `bias_vl` to image tokens
+  (`requires_raw_input_tokens`).
 """
 
 from collections.abc import Iterable
@@ -22,33 +22,40 @@ from typing import Annotated
 import torch
 from torch import nn
 
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
+    SupportsEncoderCudaGraph,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
 )
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
-from vllm.models.deepseek_v4.vision import (
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.models.deepseek_v4.common.vision import (
     DeepseekV4Aligner,
-    DeepseekV4VisionTransformer,
+    DeepseekV4ViT,
+    encode_images,
+    run_dp_sharded_vision_tower,
+)
+from vllm.models.deepseek_v41.common.vl_cudagraph import (
+    DeepseekV4VLEncoderCudaGraphMixin,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from ..common.mm_preprocess import (
-    IMAGE,
-    IMAGE_END,
-    IMAGE_NEW_LINE,
     IMAGE_PLACEHOLDER,
-    IMAGE_START,
     DeepseekV4VLDummyInputsBuilder,
     DeepseekV4VLMultiModalProcessor,
     DeepseekV4VLProcessingInfo,
+    num_image_tokens,
 )
 from .model import (
     DeepseekV41LLMForCausalLM,
@@ -81,7 +88,7 @@ class DeepseekV4VLImagePixelInputs(TensorSchema):
 def _make_deepseek_v4_vl_weights_mapper(
     expert_dtype: str, linear_scale_name: str
 ) -> WeightsMapper:
-    """Text-checkpoint mapping rules re-rooted under ``language_model.``."""
+    """Text-checkpoint mapping rules re-rooted under `language_model.`."""
     base = _make_deepseek_v4_weights_mapper(expert_dtype, linear_scale_name)
     orig_to_new_prefix: dict[str, str | None] = {
         "layers.": "language_model.model.layers.",
@@ -97,7 +104,6 @@ def _make_deepseek_v4_vl_weights_mapper(
             "head.weight": "language_model.lm_head.weight",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-            ".ffn.gate.bias_vl": ".ffn.gate.e_score_correction_bias_vl",
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
@@ -113,14 +119,33 @@ def _make_deepseek_v4_vl_weights_mapper(
     info=DeepseekV4VLProcessingInfo,
     dummy_inputs=DeepseekV4VLDummyInputsBuilder,
 )
-class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3):
+class DeepseekV41ForCausalLM(
+    nn.Module,
+    DeepseekV4VLEncoderCudaGraphMixin,
+    SupportsMultiModal,
+    SupportsEncoderCudaGraph,
+    SupportsPP,
+    SupportsEagle3,
+    SupportsLoRA,
+):
     """Multimodal entry point for DeepSeek-V4.1 checkpoints with a vision tower.
 
-    ``SupportsEagle3`` (aux hidden-state plumbing for MTP/DSpark drafters)
-    delegates through ``language_model`` via the protocol defaults.
+    `SupportsEagle3` (aux hidden-state plumbing for MTP/DSpark drafters)
+    delegates through `language_model` via the protocol defaults.
+    `SupportsEncoderCudaGraph` (ViT CUDA graph capture/replay) is
+    implemented by `DeepseekV4VLEncoderCudaGraphMixin`.
     """
 
     supports_encoder_tp_data = True
+
+    packed_modules_mapping = {
+        "gate_up_proj": ["w1", "w3"],
+        "fused_wqa_wkv": ["wq_a", "wkv"],
+        "fused_wkv_wgate": ["wkv", "wgate"],
+    }
+
+    # The MTP draft head is not LoRA-adapted.
+    lora_skip_prefixes = ["mtp."]
 
     # The MoE router needs raw token ids to detect image-span tokens
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
@@ -129,7 +154,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality == "image":
+        if modality.startswith("image"):
             return IMAGE_PLACEHOLDER
         raise ValueError(f"Unsupported modality: {modality!r}")
 
@@ -144,16 +169,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
         with self._mark_tower_model(vllm_config, {"image"}):
-            self.vision = DeepseekV4VisionTransformer(
-                config,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "vision"),
-            )
-            self.aligner = DeepseekV4Aligner(
-                config,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "aligner"),
-            )
+            self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
+            self.vision = DeepseekV4ViT(config)
+            self.aligner = DeepseekV4Aligner(config)
             self.image_start = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
@@ -201,29 +219,6 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             resolve_bindings={"p": self.config.vision_patch_size},
         )
 
-    def _encode_image(
-        self,
-        patches: torch.Tensor,
-        n_vit_h: int,
-        n_vit_w: int,
-    ) -> torch.Tensor:
-        # Aligner rows in reading order, one per IMAGE slot.
-        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
-
-    def _build_image_span(
-        self, image_embeds: torch.Tensor, types: torch.Tensor
-    ) -> torch.Tensor:
-        """Full image span: aligner rows at IMAGE slots, the learned
-        delimiter vectors at IMAGE_START/IMAGE_NEW_LINE/IMAGE_END."""
-        types = types.to(image_embeds.device)
-        span = image_embeds.new_empty(types.numel(), image_embeds.shape[-1])
-        dtype = image_embeds.dtype
-        span[types == IMAGE_START] = self.image_start.to(dtype)
-        span[types == IMAGE_END] = self.image_end.to(dtype)
-        span[types == IMAGE_NEW_LINE] = self.image_newline.to(dtype)
-        span[types == IMAGE] = image_embeds
-        return span
-
     def _process_image_input(
         self,
         image_input: DeepseekV4VLImagePixelInputs,
@@ -231,16 +226,17 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         patches = image_input.patches.to(self.aligner.w1.weight.dtype)
         vit_grid = image_input.vit_grid.tolist()
 
-        image_embeds_list: list[torch.Tensor] = []
-        vit_offset = 0
-        for n_vit_h, n_vit_w in vit_grid:
-            n_vit = n_vit_h * n_vit_w
-            image_embeds_list.append(
-                self._encode_image(
-                    patches[vit_offset : vit_offset + n_vit], n_vit_h, n_vit_w
-                )
+        image_embeds_list: list[torch.Tensor]
+        if self.use_data_parallel and get_tensor_model_parallel_world_size() > 1:
+            # Data-parallel ViT: shard images across TP ranks and all-gather
+            # the per-image embeddings (weights are replicated on every rank).
+            image_embeds_list = run_dp_sharded_vision_tower(
+                self.vision, self.aligner, patches, vit_grid
             )
-            vit_offset += n_vit
+        else:
+            image_embeds_list = encode_images(
+                self.vision, self.aligner, patches, vit_grid
+            )
 
         embeds: list[torch.Tensor] = []
         span_offset = 0
@@ -258,6 +254,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return tuple(embeds)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        image_embeds = kwargs.get("image_embeds")
+        if image_embeds is not None:
+            llm_grid = kwargs["llm_grid"]
+            assert isinstance(image_embeds, torch.Tensor)
+            assert isinstance(llm_grid, torch.Tensor)
+            sizes = [num_image_tokens(h, w) for h, w in llm_grid.tolist()]
+            return image_embeds.split(sizes)
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -284,11 +287,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             is_multimodal=is_multimodal,
         )
 
-    @staticmethod
-    def get_model_state_cls():
-        from .model_state import DeepseekV41ModelState
-
-        return DeepseekV41ModelState
+    def get_model_state_cls(self):
+        return self.language_model.get_model_state_cls()
 
     @property
     def token_lookback_depth(self) -> int:
@@ -325,22 +325,16 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
-        self._weights_finalized = True
-        return loaded_params
+        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """Get the module prefixes in the multimodal model."""
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="aligner",
+            tower_model="vision.",
+        )
 
     def process_weights_after_loading(self) -> None:
-        # Model-level post-load hook (called by the loader after any load
-        # format). Under DummyModelLoader the child's load_weights — and
-        # hence its finalize step — is bypassed, so run it here instead.
-        if getattr(self, "_weights_finalized", False):
-            return
         self.language_model.process_weights_after_loading()

@@ -14,12 +14,42 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @cuda
+@pytest.mark.parametrize("tokens", [1, 64])
+def test_mhc_entry_points_compile_without_graph_breaks(tokens):
+    from vllm.model_executor.kernels.mhc.deepseek_v41 import (
+        hc_collapse_triton,
+        mhc_post_pre_delayed,
+        mhc_pre_delayed_tilelang,
+    )
+
+    torch.manual_seed(12)
+    residual = torch.randn(tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    fn = torch.randn(24, 4 * 5120, device="cuda") * 0.001
+    scale = torch.rand(3, device="cuda")
+    base = torch.randn(24, device="cuda") * 0.1
+    pre = torch.rand(tokens, 4, device="cuda")
+    norm = torch.randn(5120, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, 5120, device="cuda", dtype=torch.bfloat16)
+    post = torch.rand(tokens, 4, 1, device="cuda")
+    comb = torch.randn(tokens, 4, 4, device="cuda").softmax(-1)
+    coeff_args = (fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
+    for function, args in (
+        (mhc_pre_delayed_tilelang, (residual, *coeff_args, pre, None, norm)),
+        (mhc_post_pre_delayed, (x, residual, post, comb, *coeff_args, pre, norm)),
+        (hc_collapse_triton, (residual, pre)),
+    ):
+        expected = function(*args)
+        actual = torch.compile(function, backend="eager", fullgraph=True)(*args)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@cuda
 @pytest.mark.parametrize("decode_metadata", [False, True])
 def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
     from vllm.models.deepseek_v4_1.nvidia.ced import clamp_replay_swa
     from vllm.v1.attention.backends.mla.sparse_swa import (
         ComputeSWAIndicesAndLensKernel,
-        fill_mm_prefix_query_ranges,
+        _compute_image_visibility_kernel,
     )
 
     replay_start, image_end, prompt_len = 64, 320, 400
@@ -27,14 +57,24 @@ def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
     positions = torch.arange(replay_start, prompt_len, device="cuda")
     query_start_cpu = torch.tensor([0, count], dtype=torch.int32)
     seq_lens_cpu = torch.tensor([prompt_len], dtype=torch.int32)
-    ranges_cpu = torch.full((count, 2), -1, dtype=torch.int32)
-    fill_mm_prefix_query_ranges(
-        ranges_cpu.numpy(),
-        {0: [(replay_start, image_end - 1)]},
-        query_start_cpu,
-        seq_lens_cpu,
-    )
-    ranges = ranges_cpu.cuda()
+    starts, seq_lens = query_start_cpu.cuda(), seq_lens_cpu.cuda()
+    req_indices = torch.zeros(count, dtype=torch.int32, device="cuda")
+    left = torch.zeros(count, dtype=torch.int32, device="cuda")
+    right = torch.zeros_like(left)
+    # Image spans are prefills; decode metadata uses causal visibility.
+    if not decode_metadata:
+        _compute_image_visibility_kernel[(count,)](
+            left,
+            right,
+            torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            torch.tensor([replay_start], dtype=torch.int32, device="cuda"),
+            torch.tensor([image_end - 1], dtype=torch.int32, device="cuda"),
+            starts,
+            seq_lens,
+            req_indices,
+            width,
+            0,
+        )
     # Physical slot order must not be used to clamp logical replay positions.
     blocks = torch.arange(1, 17, dtype=torch.int32).flip(0)[None].cuda()
     slots = torch.empty(count, width, dtype=torch.int32, device="cuda")
@@ -44,16 +84,18 @@ def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
         lengths,
         128,
         width,
-        query_start_cpu.cuda(),
-        seq_lens_cpu.cuda(),
-        torch.zeros(count, dtype=torch.int32, device="cuda"),
+        left,
+        right,
+        starts,
+        seq_lens,
+        req_indices,
         torch.ones(count, dtype=torch.bool, device="cuda"),
         blocks,
         block_size,
-        ranges,
-        True,
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
         num_tokens=count,
         token_offset=0,
+        has_image=not decode_metadata,
     )
     metadata = SimpleNamespace(
         num_decode_tokens=count if decode_metadata else 0,
@@ -61,7 +103,7 @@ def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
         decode_swa_lens=lengths if decode_metadata else None,
         prefill_swa_indices=None if decode_metadata else slots,
         prefill_swa_lens=None if decode_metadata else lengths,
-        mm_prefix_query_ranges=ranges,
+        prefill_left_visible=None if decode_metadata else left,
     )
     clamp_replay_swa(metadata, positions, torch.full_like(positions, replay_start), 128)
 
@@ -70,7 +112,7 @@ def test_ced_image_swa_metadata_matches_logical_visibility(decode_metadata):
     for row, pos in enumerate(range(replay_start, prompt_len)):
         first = max(0, pos - 127)
         end = pos + 1
-        if replay_start <= pos < image_end:
+        if not decode_metadata and replay_start <= pos < image_end:
             first = min(first, replay_start)
             end = image_end
         for offset, key in enumerate(range(first, end)):
@@ -409,8 +451,9 @@ def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
     starts = torch.zeros(5, dtype=torch.int32, device=device)
     positions = torch.zeros(8, dtype=torch.int64, device=device)
     source_slots = torch.full((8,), -1, dtype=torch.int64, device=device)
-    blocks = torch.arange(4, dtype=torch.int32, device=device).view(4, 1)
-    initial_state = torch.randn(4, 8, 1024, device=device)
+    # Block zero is the null block in the current cache allocator.
+    blocks = torch.arange(1, 5, dtype=torch.int32, device=device).view(4, 1)
+    initial_state = torch.randn(5, 8, 1024, device=device)
     state = initial_state.clone()
     raw = torch.randn(8, 1024, device=device)
     weight = torch.randn(512, dtype=torch.bfloat16, device=device)
@@ -455,10 +498,12 @@ def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
             for _ in range(length):
                 p = pos[token]
                 if (p + 1) % 2 == 0:
-                    pair = torch.stack((expected_state[req, (p - 1) % 8], raw[token]))
+                    pair = torch.stack(
+                        (expected_state[req + 1, (p - 1) % 8], raw[token])
+                    )
                     pooled = (pair[:, :512] * pair[:, 512:].softmax(0)).sum(0)
                     expected[token] = _rms(pooled, weight)
-                expected_state[req, p % 8] = raw[token]
+                expected_state[req + 1, p % 8] = raw[token]
                 token += 1
 
         def forward(metadata=metadata):
@@ -496,8 +541,8 @@ def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
 @pytest.mark.parametrize("tokens", [1, 17, 32, 33, 129])
 @pytest.mark.parametrize("carried", [False, True])
 @pytest.mark.parametrize("with_norm", [False, True])
-def test_delayed_mhc_uses_previous_pre_mix(monkeypatch, tokens, carried, with_norm):
-    from tests.kernels.test_mhc_kernels import sinkhorn_normalize_ref
+def test_delayed_mhc_uses_previous_pre_mix(tokens, carried, with_norm):
+    from tests.kernels.mhc.test_mhc_kernels import sinkhorn_normalize_ref
     from vllm.model_executor.kernels.mhc.deepseek_v41 import mhc_pre_delayed_tilelang
 
     torch.manual_seed(7)
@@ -511,9 +556,9 @@ def test_delayed_mhc_uses_previous_pre_mix(monkeypatch, tokens, carried, with_no
     post, comb, layer, next_pre = mhc_pre_delayed_tilelang(
         residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20, pre, x, norm
     )
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    mixed = x.float() @ fn.T
-    mixed *= torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    mixed = x.double() @ fn.double().T
+    mixed *= torch.rsqrt(x.double().square().mean(-1, keepdim=True) + 1e-6)
+    mixed = mixed.float()
     mixed *= torch.cat(
         (scale[:1].expand(4), scale[1:2].expand(4), scale[2:].expand(16))
     )

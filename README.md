@@ -8,10 +8,15 @@
 > SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4.1-Flash、
 > DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
-当前代码为 vLLM `0.28.1rc1.dev517` 开发版，配套 FlashInfer `0.6.18`。已验证配置包括
-**4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
+当前源码已合入 2026-11-09 核对的官方 main
+`3213796cd32df625a0669e9423acb397b627b790`，使用 Torch 2.14 / FlashInfer 0.7.3
+并保留 SM89/SM120、CED、PP 与 DSpark 适配。安装见
+[当前源码构建说明](docs/models/deepseek_v41_sm89_sm120.md)。
 
-## 支持矩阵
+下列支持矩阵、`vision11` 制品和整模型性能记录来自旧版 vLLM 0.28 / Torch 2.13 /
+FlashInfer 0.6.18。新版验证范围为编译、组件、算子与局部真实权重，未做整模型推理对比。
+
+## 历史发布版本支持矩阵
 
 | GPU 架构 | 已验证 GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
 |---|---|---:|---:|---:|---:|
@@ -21,6 +26,13 @@
 ---
 
 ## Changelog
+
+### 2026-11-09
+
+- 合入完整官方 main 框架，迁移模型注册、GPU runner、推测解码、缓存与 Engram 接口。
+- 保留默认 TP4×PP2、DSpark TP4、最多 4 条序列，以及可选 TP2×PP4＋draft TP4。
+- 提供 FlashInfer 0.7.3 原生 V4.1 补丁和新依赖构建流程；旧 wheel / Docker 制品不含本次升级。
+- 数值冲突按算子和局部权重验证选择，未以旧版整模型结果替代新版验证。
 
 ### 2026-09-16
 
@@ -93,7 +105,7 @@
 
 ---
 
-## 1. 已验证环境
+## 1. 历史 vision11 已验证环境
 
 | 项目 | 版本 / 配置 |
 |---|---|
@@ -117,9 +129,8 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
-> **下文命令使用 `vision11` vLLM wheel、第 2.3 节的 GHCR 镜像，或本仓库当前
-> `main` 源码**，包含 adaptive verification 和 CED 图片支持。
-> 配套 FlashInfer `vision2` 保持不变。
+> **本节为历史 `vision11` wheel 安装说明**，配套 FlashInfer `vision2`。
+> 当前源码的依赖和构建步骤见第 2.2 节；这些制品不包含 2026-11-09 框架升级。
 
 最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，
 当前使用其中的 `vision11` vLLM 资产；配套 FlashInfer `vision2` 和依赖下载地址不变。
@@ -143,35 +154,9 @@ PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Re
 
 ### 2.2 从当前 main 源码安装（wheel 的替代方案）
 
-以下流程以 editable 方式直接安装本仓库当前 `main` 源码，并编译 SM89 与
-SM120 的 C++ / CUDA 扩展，不生成用于分发的新 wheel。
-`requirements/cuda.txt` 会安装现有 Release 配套的 FlashInfer wheel。
-构建前需准备 CUDA 13.0 toolkit、C++ 编译器和支持 Rust 2024 edition 的
-Rust/Cargo。
-
-```bash
-git clone --branch main \
-  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
-cd vllm-deepseek-v4-sm89
-
-uv venv --python 3.12 --seed
-source .venv/bin/activate
-uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
-uv pip install -r requirements/cuda.txt --torch-backend=cu130
-uv pip install 'transformers==5.16.1' 'triton==3.7.1'
-
-export CUDA_HOME=/usr/local/cuda-13.0
-export TORCH_CUDA_ARCH_LIST='8.9;12.0'
-export MAX_JOBS=4
-
-uv pip install --no-build-isolation -e . --torch-backend=cu130
-
-.venv/bin/python -I -c 'import vllm; print(vllm.__file__)'
-```
-
-最后的路径应指向当前源码目录下的 `vllm/__init__.py`，不能仍指向旧 wheel 的
-`site-packages/vllm`。后续启动使用此 `.venv` 中的 `vllm` 命令；更新已有 checkout
-时先同步本仓库 `main`，再执行上述安装。
+当前源码依赖已升级，须按照[源码构建说明](docs/models/deepseek_v41_sm89_sm120.md)
+创建新环境，并安装配套的 FlashInfer 0.7.3 原生扩展。不要使用旧版 Torch 2.13 /
+Triton 3.7.1 或将 `vision11` 二进制覆盖到新源码。
 
 ### 2.3 Docker 镜像（GHCR，公开免登录）
 
@@ -254,12 +239,8 @@ source /path/to/.venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=12.0
-export VLLM_USE_V2_MODEL_RUNNER=1
-export TRITON_PTXAS_BLACKWELL_PATH="$(
-  "$VIRTUAL_ENV/bin/python" -c \
-    'from pathlib import Path; import triton; print(Path(triton.__file__).parent / "backends/nvidia/bin/ptxas-blackwell")'
-)"
-"$TRITON_PTXAS_BLACKWELL_PATH" --version
+# 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
+unset TRITON_PTXAS_BLACKWELL_PATH
 
 vllm serve /path/to/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v4.1-flash \
@@ -291,8 +272,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 ```
 
 使用上述新环境中的 `vllm serve`，并将模型路径替换为自己的 checkpoint。
-`ptxas-blackwell --version` 必须显示 CUDA 13.1 工具链（已验证 13.1.80）；
-这不改变 CUDA toolkit / PyTorch 的 cu130 配套。首次 JIT 和 graph capture
+当前源码使用 Triton 3.8 配套编译器；旧 Triton 3.7.1 的 `ptxas-blackwell`
+覆盖设置仅适用于历史环境。首次 JIT 和 graph capture
 可能耗时，应在服务就绪及预热完成后测吞吐。
 
 CED 当前是实验性的近似 prefill 路径。在已测长文本 prefill 中，按输入 token
@@ -300,11 +281,12 @@ CED 当前是实验性的近似 prefill 路径。在已测长文本 prefill 中�
 长度和运行配置变化。它不保证与非 CED 路径输出等价；部署前应按实际任务验证
 质量，也不能把文本测试的收益推广到图片请求。
 
-当前 `main` 保留 CED 单图、多图输入、DSpark 和 prefix caching，并将 V4.1
-语言模型的图片 token 修正为因果 SWA；这项共享语义修复同时适用于 SM89 和 SM120。
-视觉编码器仍然保留，CED 回放保持最后 128 个 query token，不再因图片跨度扩展
-回放窗口。按需设置 `--limit-mm-per-prompt '{"image":2}'`。
-历史 `vision11` wheel / 镜像仍使用此前的图片窗口语义，未包含本次修复。
+当前源码保留 CED 单图、多图输入、DSpark 和 prefix caching，并迁移上游的
+共享的图片区间左右可见性元数据接口。V4.1 的文本和图片 token 均使用因果 SWA；
+双向图片可见性只用于旧 V4 Vision 模型。
+CED 通常回放末尾 128 个 query token，边界落入图片区间时向前扩展，并预留
+`128 + vision_max_n_token` 的尾部容量。按需设置
+`--limit-mm-per-prompt '{"image":2}'`。本次迁移已做算子与组件检查，未验证整模型图片质量。
 非图片模态、prompt embeddings 和 prompt logprobs 仍在进入引擎前被拒绝。
 
 图片路径已有 CPU 回归、SM120 单卡小型权重 GPU 数值测试，以及真实缓存管理器
@@ -399,8 +381,9 @@ DSpark 5 adaptive 和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载
 内存，不能只按 GPU 权重大小估算整机内存需求。
 
 本节 PP/DSpark 组合需要按第 2.2 节安装更新后的 **`main` 源码**；已有的
-`vision11` wheel / 镜像未包含本次 PP 更新。两种并行方式已在 8×L20 上验证；
-本节保留原示例其余参数，容量与吞吐仍需按实际 GPU 和负载检查。在该环境中启动：
+`vision11` wheel / 镜像未包含本次 PP 更新。两种并行方式的 8×L20 整模型验证
+来自框架升级前的版本；新版按组件与通信层验证，未重跑整模型。容量与吞吐
+仍需按实际 GPU 和负载检查。在该环境中启动：
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -408,7 +391,7 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
-export VLLM_USE_V2_MODEL_RUNNER=1
+# 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
 

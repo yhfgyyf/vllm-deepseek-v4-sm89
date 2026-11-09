@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-DeepseekV4 MLA Attention Layer
-"""
+"""DeepseekV4 MLA Attention Layer"""
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -48,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
@@ -58,7 +57,7 @@ from vllm.utils.multi_stream_utils import (
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV41IndexerBackend,
+    DeepseekV41NativeIndexerBackend,
     dsv41_indexer_uses_fp4,
     get_max_prefill_buffer_size,
 )
@@ -74,7 +73,7 @@ logger = init_logger(__name__)
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
-    """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
+    """Swap the layer index inside a `...layers.<idx>...` prefix."""
     new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
     assert n == 1, f"Cannot locate layer index in prefix {prefix}"
     return new_prefix
@@ -180,9 +179,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Q head count the q/output buffers are allocated at.
 
         The layer allocates the q/output buffers at
-        ``[N, get_padded_num_q_heads(n_local_heads), head_dim]``. Must satisfy
-        ``result >= num_heads``. Backends with no padding constraint return
-        ``num_heads``.
+        `[N, get_padded_num_q_heads(n_local_heads), head_dim]`. Must satisfy
+        `result >= num_heads`. Backends with no padding constraint return
+        `num_heads`.
         """
         raise NotImplementedError
 
@@ -194,7 +193,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Platform-specific sparse MLA forward; writes attention into ``output``."""
+        """Platform-specific sparse MLA forward; writes attention into `output`."""
         raise NotImplementedError
 
     @abstractmethod
@@ -294,10 +293,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
-        self.attn_sink = nn.Parameter(
-            torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
-            requires_grad=False,
-        )
+        self.attn_sink = make_attention_sink(self.padded_heads, torch.float32)
 
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             self.hidden_size,
@@ -430,11 +426,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
-        if not vllm_config.use_v2_model_runner:
-            # MRV1's piecewise capture only tolerates the wide eager region: with
-            # the narrow one the attention input preparation stays in the captured
-            # graph and MRV1 produces garbage (#51430).
-            self._prepare_and_attn_fn = self._prepare_and_attn_eager
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
@@ -635,34 +626,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
         )
         return qr, None, kv
-
-    @eager_break_during_capture
-    def _prepare_and_attn_eager(
-        self,
-        hidden_states: torch.Tensor,
-        qr: torch.Tensor | QuantizedActivation,
-        kv: torch.Tensor,
-        qr_scale: torch.Tensor | None,
-        kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
-        positions: torch.Tensor,
-        o_padded: torch.Tensor,
-    ) -> None:
-        """Wide eager region: the whole of ``_prepare_and_attn`` runs eagerly.
-
-        The nested ``_sparse_indexer_and_attn`` break runs inline, since
-        ``add_eager`` clears ``_capturing`` before invoking this.
-        """
-        self._prepare_and_attn(
-            hidden_states,
-            qr,
-            kv,
-            qr_scale,
-            kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
-        )
 
     def _prepare_and_attn(
         self,
@@ -969,7 +932,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return DeepseekV41IndexerBackend
+        return DeepseekV41NativeIndexerBackend
 
 
 class DeepseekV41RemoteKVCache(DeepseekV4IndexerCache):
@@ -993,16 +956,16 @@ class DeepseekV41RemoteKVCache(DeepseekV4IndexerCache):
 class DeepseekV4Indexer(nn.Module):
     """DeepSeek V4.1 sparse-attention indexer.
 
-    Exists only on ``index_source_layer_ids``; consumers reuse the topk
-    indices it publishes into the shared ``topk_indices_buffer``. Unlike v4.0
+    Exists only on `index_source_layer_ids`; consumers reuse the topk
+    indices it publishes into the shared `topk_indices_buffer`. Unlike v4.0
     the index key is derived from the kv-source layer's compressor latent
-    (``k = k_norm(wk(latent))``, ``owns_k``) instead of an indexer-local
+    (`k = k_norm(wk(latent))`, `owns_k`) instead of an indexer-local
     compressor over hidden states, so there is no hidden-state K GEMM here.
     Non-owning index sources share the kv source's paged K cache.
 
-    Two-level candidate filtering: the indexer at ``candidate_source_layer_id``
-    additionally publishes the top ``candidate_topk_blocks`` blocks of
-    ``candidate_block_size`` compressed positions (``candidate_write``);
+    Two-level candidate filtering: the indexer at `candidate_source_layer_id`
+    additionally publishes the top `candidate_topk_blocks` blocks of
+    `candidate_block_size` compressed positions (`candidate_write`);
     later indexers mask their scores to those blocks before their own top-k.
     """
 
@@ -1112,7 +1075,7 @@ class DeepseekV4Indexer(nn.Module):
     ) -> None:
         """Turn the compressor's pre-RoPE latent into paged index keys.
 
-        ``k_norm(wk(latent))`` at group-boundary tokens, RoPE'd at the group
+        `k_norm(wk(latent))` at group-boundary tokens, RoPE'd at the group
         position and MXFP4/FP8-quantized into the indexer K cache.
         """
         attn_metadata = get_forward_context().attn_metadata

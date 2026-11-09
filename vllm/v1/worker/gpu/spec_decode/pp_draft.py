@@ -43,7 +43,6 @@ def maybe_create_pp_draft_group(vllm_config: VllmConfig, device: torch.device):
         and not parallel.use_ubatching
         and vllm_config.model_config.hf_config.model_type == "deepseek_v41"
         and vllm_config.model_config.hf_config.ced_prefill
-        and vllm_config.use_v2_model_runner
     ):
         raise NotImplementedError(
             "Cross-stage drafting requires V4.1 CED DSpark TP4 with a TP2/PP4 "

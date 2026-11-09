@@ -9,12 +9,12 @@ import os
 import numpy as np
 import torch
 from torchvision.transforms.v2 import functional as tvF
-from transformers.image_processing_utils import BatchFeature
-from transformers.image_processing_utils_fast import (
-    BaseImageProcessorFast,
+from transformers.image_processing_backends import (
+    TorchvisionBackend,
     group_images_by_shape,
     reorder_images,
 )
+from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
@@ -67,15 +67,15 @@ def glm_sample_frame_indices(
 ) -> list[int]:
     """GLM video frame sampling (training-reference parity).
 
-    ``target_fps`` is the ``fps_interval`` request knob. The greedy walk
-    advances at ``1 / (temporal_patch_size * target_fps)`` seconds, so on
-    frame-dense sources it collects more candidates than ``extract_t`` and
-    the ``> extract_t`` fixup re-spreads the picks uniformly with
-    ``np.linspace`` -- that fallback is the intended reference behavior, not
-    an accident. Short clips (fewer frames than ``extract_t``) are spread at
-    evenly spaced timestamps (``floor`` sampling; the linspace variant
+    `target_fps` is the `fps_interval` request knob. The greedy walk
+    advances at `1 / (temporal_patch_size * target_fps)` seconds, so on
+    frame-dense sources it collects more candidates than `extract_t` and
+    the `> extract_t` fixup re-spreads the picks uniformly with
+    `np.linspace` -- that fallback is the intended reference behavior, not
+    an accident. Short clips (fewer frames than `extract_t`) are spread at
+    evenly spaced timestamps (`floor` sampling; the linspace variant
     samples frames unevenly and cost 4 points on video grounding evals).
-    Request overrides: ``target_fps`` -> fps interval, ``max_frame_count``
+    Request overrides: `target_fps` -> fps interval, `max_frame_count`
     -> frame cap.
     """
     max_frame_idx = total_frames - 1
@@ -146,7 +146,7 @@ def _fit_aligned_size_within_budget(
 
     Binary search on the unaligned content height; each candidate is rounded
     upward to h_factor/w_factor, so the returned canvas always satisfies
-    ``t * aligned_h * aligned_w <= max_pixels``.
+    `t * aligned_h * aligned_w <= max_pixels`.
     """
     minimum_pixels = t * h_factor * w_factor
     if max_pixels < minimum_pixels:
@@ -180,16 +180,16 @@ def smart_resize(
     min_pixels: int = 56 * 56,
     max_pixels: int = 14 * 14 * 4 * 1280,
 ) -> tuple[int, int]:
-    """GLM-5.3-Flash ``smart_resize``: upward-aligned canvas under a
-    ``t_bar * h_bar * w_bar`` pixel budget.
+    """GLM-5.3-Flash `smart_resize`: upward-aligned canvas under a
+    `t_bar * h_bar * w_bar` pixel budget.
 
     Height/width always round UP to their factors (content is then padded,
     never cropped or distorted); an over-budget canvas is refit by binary
-    search instead of one-shot square-root scaling. ``h_factor`` /
-    ``w_factor`` carry ``patch_expand_factor`` on top of
-    ``patch_size * merge_size``; ``t_factor`` is ``temporal_patch_size``. For
-    a still image ``t = t_factor = temporal_patch_size`` so ``t_bar =
-    temporal_patch_size``.
+    search instead of one-shot square-root scaling. `h_factor` /
+    `w_factor` carry `patch_expand_factor` on top of
+    `patch_size * merge_size`; `t_factor` is `temporal_patch_size`. For
+    a still image `t = t_factor = temporal_patch_size` so `t_bar =
+    temporal_patch_size`.
     """
     if min(t, h, w, t_factor, h_factor, w_factor) <= 0:
         raise ValueError("Image dimensions and alignment factors must be positive.")
@@ -241,7 +241,7 @@ def _get_pad_content_size(
     """Aspect-ratio-preserving content size that fits the canvas.
 
     Oversized images are shrunk proportionally. Small images are enlarged
-    only when ``allow_upscale``. Padding is applied after the resize.
+    only when `allow_upscale`. Padding is applied after the resize.
     """
     scale = min(canvas_height / image_height, canvas_width / image_width)
     if not allow_upscale:
@@ -261,7 +261,7 @@ def _resize_or_pad(
     allow_upscale: bool = False,
 ) -> torch.Tensor:
     """Resize onto the aligned canvas, or keep the aspect ratio and
-    zero-pad the right/bottom sides (``resize_mode="pad"``)."""
+    zero-pad the right/bottom sides (`resize_mode="pad"`)."""
     height, width = stacked_images.shape[-2:]
 
     if resize_mode == "resize":
@@ -306,8 +306,8 @@ def _pixel_budget(
     temporal_patch_size: int,
 ) -> tuple[int, int]:
     """(min_pixels, max_pixels) from the token bounds of
-    ``processor_config.json``; one vision token covers
-    ``temporal_patch_size * (patch_size * merge_size) ** 2`` pixels."""
+    `processor_config.json`; one vision token covers
+    `temporal_patch_size * (patch_size * merge_size) ** 2` pixels."""
     if min_image_tokens is None or max_image_tokens is None:
         raise ValueError(
             "min_image_tokens and max_image_tokens must be provided by "
@@ -327,14 +327,14 @@ class Glm5NextImageProcessorKwargs(ImagesKwargs, total=False):  # type: ignore[c
     max_image_tokens: int | None
 
 
-class Glm5NextImageProcessor(BaseImageProcessorFast):
+class Glm5NextImageProcessor(TorchvisionBackend):
     """Fast torchvision image processor for GLM-5.3-Flash.
 
-    ``patch_expand_factor`` multiplies into the ``smart_resize`` spatial
-    factor ``patch_size * merge_size``. ``resize_mode`` picks the geometry:
-    ``"pad"`` (default) preserves the aspect ratio and zero-pads the
-    right/bottom of the upward-aligned canvas, ``"resize"`` stretches onto
-    it. Defaults mirror the checkpoint's ``image_processor`` config.
+    `patch_expand_factor` multiplies into the `smart_resize` spatial
+    factor `patch_size * merge_size`. `resize_mode` picks the geometry:
+    `"pad"` (default) preserves the aspect ratio and zero-pads the
+    right/bottom of the upward-aligned canvas, `"resize"` stretches onto
+    it. Defaults mirror the checkpoint's `image_processor` config.
     """
 
     do_resize = True
@@ -540,11 +540,11 @@ class Glm5NextVideoProcessorKwargs(VideosKwargs, total=False):  # type: ignore[c
 class Glm5NextVideoProcessor(BaseVideoProcessor):
     """Fast video processor for GLM-5.3-Flash.
 
-    Shares ``smart_resize`` / the pad-mode geometry / the patchify with the
+    Shares `smart_resize` / the pad-mode geometry / the patchify with the
     image processor, and adds GLM-5.3-Flash frame sampling
-    (``glm_sample_frame_indices``: ``fps_interval`` semantics with a
+    (`glm_sample_frame_indices`: `fps_interval` semantics with a
     temporal-patch-scaled greedy walk). Defaults mirror the checkpoint's
-    ``video_processor`` config.
+    `video_processor` config.
     """
 
     resample = PILImageResampling.BICUBIC
@@ -578,9 +578,9 @@ class Glm5NextVideoProcessor(BaseVideoProcessor):
     ) -> np.ndarray:
         """Sample frame indices with GLM's fps-interval policy.
 
-        ``fps`` / ``target_fps``, ``max_frames`` and ``fps_interval`` /
-        ``max_frame_count_dynamic`` are the overrides described in
-        :func:`glm_sample_frame_indices`.
+        `fps` / `target_fps`, `max_frames` and `fps_interval` /
+        `max_frame_count_dynamic` are the overrides described in
+        `glm_sample_frame_indices`.
         """
         if metadata is None or getattr(metadata, "fps", None) is None:
             raise ValueError(
@@ -751,8 +751,8 @@ class Glm5NextProcessorKwargs(ProcessingKwargs, total=False):  # type: ignore[ca
 class Glm5NextProcessor(ProcessorMixin):
     """Wraps a GLM-5.3-Flash image processor, video processor and tokenizer.
 
-    Token expansion per image = ``prod(image_grid_thw) // merge_size**2``; video
-    frames are expanded with ``<|begin_of_image|>...<|end_of_image|>{ts} seconds``
+    Token expansion per image = `prod(image_grid_thw) // merge_size**2`; video
+    frames are expanded with `<|begin_of_image|>...<|end_of_image|>{ts} seconds`
     structure (mrope timestamps).
     """
 
@@ -798,7 +798,7 @@ class Glm5NextProcessor(ProcessorMixin):
         """Build the processor directly from the checkpoint config.
 
         GLM-5.3-Flash stores nested image/video configs in
-        ``processor_config.json`` and declares a custom processor class. This
+        `processor_config.json` and declares a custom processor class. This
         method reads those configs directly and caps only the video token budget.
         """
         from transformers import AutoTokenizer

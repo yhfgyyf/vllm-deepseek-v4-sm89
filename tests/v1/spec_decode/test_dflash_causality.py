@@ -2,15 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Config-only DFlash behavior.
 
-``dflash_has_any_non_causal`` decides pre-build whether the draft needs a
+`dflash_has_any_non_causal` decides pre-build whether the draft needs a
 non-causal-capable backend, so its branch table (explicit override, SWA-derived
-per-layer causality, and the no-``layer_types`` fallback) is worth pinning.
+per-layer causality, and the no-`layer_types` fallback) is worth pinning.
 """
 
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm.v1.worker.gpu_model_runner import (
+    _build_lookback_token_ids,
+    _v41_mm_prefix_span,
+)
 
 from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
@@ -23,10 +27,6 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
-)
-from vllm.v1.worker.gpu_model_runner import (
-    _build_lookback_token_ids,
-    _v41_mm_prefix_span,
 )
 
 
@@ -110,6 +110,18 @@ def test_dflash_fc_uses_aux_layer_count():
     )
 
     assert _get_dflash_fc_input_size(vllm_config) == 3 * 4096
+
+
+def test_dflash_target_layers_map_to_post_layer_boundaries():
+    vllm_config = _vllm_config(
+        dflash_config={"target_layer_ids": [0, 16, 31]},
+    )
+
+    assert get_eagle3_aux_layers_from_config(vllm_config.speculative_config) == (
+        1,
+        17,
+        32,
+    )
 
 
 @pytest.mark.parametrize("config_name", ["dflash_config", "eagle_config"])

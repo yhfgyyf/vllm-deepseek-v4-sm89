@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config import CompilationConfig, CUDAGraphMode, ParallelConfig
+from vllm.config import CacheConfig, CompilationConfig, CUDAGraphMode, ParallelConfig
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekSparseSWAFlashInferMetadataBuilder,
     DeepseekV4FlashInferSM120Attention,
@@ -34,25 +34,30 @@ def _adaptive_full_config():
     compilation_config = CompilationConfig(
         cudagraph_mode="FULL",
         cudagraph_capture_sizes=[_CAPTURE_TOKENS],
+        prefill_cudagraph_capture_token_sizes=[_CAPTURE_TOKENS],
     )
     compilation_config.max_cudagraph_capture_size = _CAPTURE_TOKENS
     compilation_config.post_init_cudagraph_sizes()
     speculative_config = SimpleNamespace(
         enable_adaptive_verification=True,
         num_speculative_tokens=2,
+        max_num_new_slots_for_drafting=0,
         parallel_drafting=False,
         use_dspark=lambda: False,
         uses_dynamic_speculative_decoding=lambda: False,
     )
     return SimpleNamespace(
+        use_cumem_cudagraph_pool=False,
         compilation_config=compilation_config,
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=_CAPTURE_TOKENS,
             max_num_seqs=_CAPTURE_REQUESTS,
         ),
         parallel_config=ParallelConfig(),
+        cache_config=CacheConfig(),
         speculative_config=speculative_config,
         num_speculative_tokens=2,
+        uniform_decode_query_len=3,
         model_config=SimpleNamespace(
             max_model_len=256,
             is_mm_prefix_lm=False,
@@ -94,7 +99,7 @@ def _fill_dsv4_cache(cache: torch.Tensor, values: torch.Tensor) -> None:
 
 
 class _AdaptiveFullTargetHarness:
-    def __init__(self, config, device: torch.device):
+    def __init__(self, config, device: torch.device, monkeypatch):
         from flashinfer.mla.deepseek_v41 import (
             deepseek_v41_pack_global_cache,
             deepseek_v41_pack_swa_cache,
@@ -135,13 +140,17 @@ class _AdaptiveFullTargetHarness:
             device,
         )
         for builder in (self.v4_swa_builder, self.v41_swa_builder):
-            builder.build_tile_scheduler = lambda _: {
-                "swaonly": None,
-                "c4a": None,
-                "c128a": None,
-                "c1a": None,
-                "c2a": None,
-            }
+            monkeypatch.setattr(
+                builder,
+                "build_tile_scheduler",
+                lambda _: {
+                    "swaonly": None,
+                    "c4a": None,
+                    "c128a": None,
+                    "c1a": None,
+                    "c2a": None,
+                },
+            )
         mla_spec = MLAAttentionSpec(
             block_size=128,
             num_kv_heads=1,
@@ -460,7 +469,6 @@ def test_dsv4_adaptive_fullgraph_replays_real_target_attention(monkeypatch):
     monkeypatch.setattr(
         cudagraph_utils.current_platform, "get_global_graph_pool", lambda: graph_pool
     )
-    monkeypatch.setattr(cudagraph_utils, "set_graph_pool_id", lambda _: None)
     monkeypatch.setattr(cudagraph_utils, "is_global_first_rank", lambda: False)
     offloader = SimpleNamespace(
         sync_prev_onload=lambda: None,
@@ -469,7 +477,7 @@ def test_dsv4_adaptive_fullgraph_replays_real_target_attention(monkeypatch):
     monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: offloader)
 
     @contextmanager
-    def local_graph_capture(device):
+    def local_graph_capture(device, stream=None):
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
@@ -481,10 +489,10 @@ def test_dsv4_adaptive_fullgraph_replays_real_target_attention(monkeypatch):
         vllm_config=config,
         device=device,
         cudagraph_mode=CUDAGraphMode.FULL,
-        decode_query_len=3,
+        decode_query_lens={3: _CAPTURE_TOKENS // 3},
         varlen_decode=True,
     )
-    harness = _AdaptiveFullTargetHarness(config, device)
+    harness = _AdaptiveFullTargetHarness(config, device, monkeypatch)
     monkeypatch.setattr(v41_sparse, "get_forward_context", lambda: harness.v41_context)
     workspace_manager = WorkspaceManager(device)
     monkeypatch.setattr(

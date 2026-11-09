@@ -9,11 +9,17 @@
 > DeepSeek-V4.1-Flash, DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and
 > GLM-5.3-Flash on SM89/Ada and SM120/RTX Blackwell.
 
-The current source is a vLLM `0.28.1rc1.dev517` development build paired with
-FlashInfer `0.6.18`. Validated configurations include
-**4×/8× RTX 4090 48 GB** and **4× RTX PRO 6000 Blackwell 96 GB** systems.
+The current source incorporates official main
+`3213796cd32df625a0669e9423acb397b627b790`, checked on 2026-11-09, with Torch
+2.14 / FlashInfer 0.7.3 and the SM89/SM120, CED, PP and DSpark adaptations.
+See the [current source build guide](docs/models/deepseek_v41_sm89_sm120.md).
 
-## Support matrix
+The support matrix, `vision11` artifacts and full-model benchmarks below refer
+to the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack. This upgrade uses
+compilation, component, operator and partial real-weight validation; no
+full-model inference comparison was run.
+
+## Historical release support matrix
 
 | GPU architecture | Validated GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
 |---|---|---:|---:|---:|---:|
@@ -23,6 +29,17 @@ FlashInfer `0.6.18`. Validated configurations include
 ---
 
 ## Changelog
+
+### 2026-11-09
+
+- Merge official main, adapting model registration, the GPU runner, speculative
+  decoding, cache management and Engram interfaces.
+- Retain default TP4/PP2 with DSpark TP4 and at most four sequences, plus the
+  optional TP2/PP4 target with draft TP4.
+- Add the FlashInfer 0.7.3 native V4.1 patch and current source build guide.
+  Historical wheels and Docker images do not contain this framework upgrade.
+- Resolve numerical conflicts using operator and partial real-weight evidence;
+  historical full-model results do not validate the upgraded framework.
 
 ### 2026-09-16
 
@@ -94,7 +111,7 @@ Earlier SM89 builds and environments remain available in
 
 ---
 
-## 1. Validated environment
+## 1. Historical vision11 validated environment
 
 | Item | Version / configuration |
 |---|---|
@@ -116,11 +133,9 @@ shape is compiled once and then reused from the JIT cache.
 
 ## 2. Quick install (prebuilt wheels / container)
 
-> **The DSpark and CED commands below require the current `vision11` vLLM
-> wheel, the GHCR `vision11` image in Section 2.2, or this fork's current
-> `main` source.** This version includes adaptive
-> verification and CED image-input support. The paired FlashInfer `vision2`
-> wheel does not need replacing.
+> **This section installs the historical `vision11` vLLM wheel** and paired
+> FlashInfer `vision2`. For current source dependencies and build instructions,
+> see Section 2.1. These artifacts do not include the 2026-11-09 framework upgrade.
 
 The latest release retains the `v0.28.1rc1-vision9-sm89-sm120-cu130` tag,
 and the instructions now use its `vision11` vLLM asset. Paired FlashInfer `vision2` and its
@@ -153,37 +168,10 @@ the older ACR `vision7` configuration must keep adaptive disabled.
 
 ### 2.1 Install current main source (alternative to the wheel)
 
-This path installs this fork's current `main` source in editable mode and
-compiles the C++ / CUDA extensions for SM89 and SM120, without producing a
-new distributable wheel. `requirements/cuda.txt` installs the paired
-FlashInfer wheel from the existing release.
-Prerequisites are the CUDA 13.0 toolkit, a C++ compiler, and Rust/Cargo with
-Rust 2024 edition support.
-
-```bash
-git clone --branch main \
-  https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
-cd vllm-deepseek-v4-sm89
-
-uv venv --python 3.12 --seed
-source .venv/bin/activate
-uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
-uv pip install -r requirements/cuda.txt --torch-backend=cu130
-uv pip install 'transformers==5.16.1' 'triton==3.7.1'
-
-export CUDA_HOME=/usr/local/cuda-13.0
-export TORCH_CUDA_ARCH_LIST='8.9;12.0'
-export MAX_JOBS=4
-
-uv pip install --no-build-isolation -e . --torch-backend=cu130
-
-.venv/bin/python -I -c 'import vllm; print(vllm.__file__)'
-```
-
-The final path must point to `vllm/__init__.py` in this source checkout, not
-the old wheel's `site-packages/vllm`. Launch with the `vllm` command from this
-`.venv`. For an existing checkout, synchronize this fork's `main` before
-running the installation commands above.
+Follow the [current source build guide](docs/models/deepseek_v41_sm89_sm120.md)
+to create a fresh environment and install the matching native FlashInfer 0.7.3
+extension. Do not pin Torch 2.13 / Triton 3.7.1 or copy historical `vision11`
+binaries into the upgraded source.
 
 ### 2.2 Docker image (GHCR, no login required)
 
@@ -225,12 +213,8 @@ source /path/to/.venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=12.0
-export VLLM_USE_V2_MODEL_RUNNER=1
-export TRITON_PTXAS_BLACKWELL_PATH="$(
-  "$VIRTUAL_ENV/bin/python" -c \
-    'from pathlib import Path; import triton; print(Path(triton.__file__).parent / "backends/nvidia/bin/ptxas-blackwell")'
-)"
-"$TRITON_PTXAS_BLACKWELL_PATH" --version
+# Only historical vision11 artifacts need VLLM_USE_V2_MODEL_RUNNER=1.
+unset TRITON_PTXAS_BLACKWELL_PATH
 
 vllm serve /path/to/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v4.1-flash \
@@ -262,8 +246,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 ```
 
 Use `vllm serve` from the new environment above and replace the model path
-with your checkpoint. `ptxas-blackwell --version` must report CUDA 13.1
-(13.1.80 was validated); the CUDA toolkit / PyTorch pairing remains cu130.
+with your checkpoint. Current source uses Triton 3.8's bundled compiler;
+the Triton 3.7.1 `ptxas-blackwell` override belongs to the historical environment.
 Initial JIT compilation and graph capture may take time. Measure throughput
 only after the service is ready and warmed up.
 
@@ -273,14 +257,15 @@ doubled relative to CED off, but the gain depends on the prompt, length, and
 runtime configuration. It is not guaranteed to be output-equivalent to the
 non-CED path; validate quality for the target workload.
 
-Current `main` retains CED single-image and multi-image input, DSpark, and
-prefix caching, and corrects V4.1 language-model image tokens to use causal
-SWA. This shared semantic correction applies to both SM89 and SM120. The
-vision encoder remains enabled; CED replays the final 128 query tokens
-without expanding the replay window for image spans. Set a limit such as
-`--limit-mm-per-prompt '{"image":2}'` as needed. Existing `vision11` wheels
-and images retain the previous image-window behavior and do not contain
-this correction. Non-image modalities,
+Current source retains CED single-image and multi-image input, DSpark, and
+prefix caching, and adopts the shared upstream left/right visibility metadata
+interface. V4.1 text and image tokens both use causal SWA; bidirectional image
+visibility applies to the legacy V4 Vision model.
+CED normally replays the last 128 query tokens, extending backward when the
+boundary cuts through an image span, with tail capacity reserved for
+`128 + vision_max_n_token`. Set a limit such as
+`--limit-mm-per-prompt '{"image":2}'` as needed. This migration has operator
+and component checks, but no full-model image-quality validation. Non-image modalities,
 prompt embeddings, and prompt logprobs are rejected before engine execution.
 
 The image path has CPU regressions, small-weight SM120 GPU numerical tests,
@@ -389,8 +374,10 @@ the GPU weight footprint alone.
 
 These PP/DSpark configurations require the updated **`main` source** from
 Section 2.1; existing `vision11` wheels and images do not contain this PP update.
-Both parallel layouts were validated on 8×L20. The other example parameters
-are retained; check capacity and throughput on your actual GPUs and workload.
+Full-model validation of both layouts on 8×L20 predates the framework upgrade.
+The upgraded version is checked at the component and communication level;
+full-model inference has not been repeated. Check capacity and throughput
+on your actual GPUs and workload.
 Configure the SM89 toolchain and launch in that environment:
 
 ```bash
@@ -399,7 +386,7 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
-export VLLM_USE_V2_MODEL_RUNNER=1
+# Only historical vision11 artifacts need VLLM_USE_V2_MODEL_RUNNER=1.
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
 

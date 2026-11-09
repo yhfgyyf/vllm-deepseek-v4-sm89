@@ -47,7 +47,7 @@ def test_swa_mixed_metadata_fits_one_token_capacity(monkeypatch, query_lens):
             is_mm_prefix_lm=False,
             hf_config=SimpleNamespace(sliding_window=128),
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8),
         speculative_config=None,
     )
     builder = sparse_swa.DeepseekSparseSWAMetadataBuilder(
@@ -63,7 +63,7 @@ def test_swa_mixed_metadata_fits_one_token_capacity(monkeypatch, query_lens):
         device=torch.device("cpu"),
     )
 
-    def write_rows(indices, lens, *args, num_tokens, token_offset):
+    def write_rows(indices, lens, *args, num_tokens, token_offset, **kwargs):
         indices[:num_tokens] = torch.arange(token_offset, token_offset + num_tokens)[
             :, None, None
         ]
@@ -71,7 +71,6 @@ def test_swa_mixed_metadata_fits_one_token_capacity(monkeypatch, query_lens):
 
     monkeypatch.setattr(sparse_swa, "_COMPUTE_SWA_INDICES_AND_LENS_KERNEL", write_rows)
     monkeypatch.setattr(builder, "_build_deepseek_v4_metadata", lambda *args: {})
-    monkeypatch.setattr(builder, "_build_mm_prefix_query_ranges", lambda _: None)
     monkeypatch.setattr(
         builder,
         "build_tile_scheduler",
@@ -83,6 +82,7 @@ def test_swa_mixed_metadata_fits_one_token_capacity(monkeypatch, query_lens):
         query_start_loc_cpu=starts,
         seq_lens=torch.tensor(query_lens, dtype=torch.int32),
         seq_lens_cpu_upper_bound=torch.tensor(query_lens, dtype=torch.int32),
+        mm_req_doc_ranges=None,
         num_reqs=len(query_lens),
         num_actual_tokens=8,
         max_query_len=max(query_lens),
@@ -546,7 +546,7 @@ def test_v41_workspace_reservation_covers_flashinfer_formula(
     num_swa_slots,
     num_global_slots,
 ):
-    from flashinfer.mla import deepseek_v41_mixed_sparse_workspace_size
+    from flashinfer.mla.deepseek_v41 import deepseek_v41_mixed_sparse_workspace_size
 
     expected = max(
         deepseek_v41_mixed_sparse_workspace_size(
@@ -570,7 +570,7 @@ def test_v41_workspace_reservation_covers_flashinfer_formula(
 
 
 def test_v41_wide_swa_only_workspace_peaks_inside_decode_range():
-    from flashinfer.mla import deepseek_v41_mixed_sparse_workspace_size
+    from flashinfer.mla.deepseek_v41 import deepseek_v41_mixed_sparse_workspace_size
 
     peak = deepseek_v41_mixed_sparse_workspace_size(31, 8, 2048, 0)
     endpoints = max(
@@ -586,7 +586,7 @@ def test_v41_wide_swa_only_workspace_peaks_inside_decode_range():
 def test_v41_workspace_reservation_covers_unified_swa_width_peak(
     max_num_tokens, expected
 ):
-    from flashinfer.mla import deepseek_v41_mixed_sparse_workspace_size
+    from flashinfer.mla.deepseek_v41 import deepseek_v41_mixed_sparse_workspace_size
 
     reserved = flashinfer_sparse._native_workspace_size_upper_bound(
         max_num_tokens=max_num_tokens,
@@ -627,7 +627,7 @@ def test_v41_dspark_context_uses_native_swa_writer(monkeypatch):
     dspark_module._insert_context_kv(attn, kv, positions, slots)
 
     q, seen_kv, seen_positions, seen_cos_sin, seen_cache, seen_slots = seen["args"]
-    assert q.shape == (3, 8, 512)
+    assert q.shape == (3, 0, 512)
     assert q.dtype == torch.bfloat16
     assert torch.count_nonzero(q) == 0
     assert seen_kv is kv

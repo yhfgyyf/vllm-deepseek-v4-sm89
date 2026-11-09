@@ -205,6 +205,7 @@ class AdaMxfp8LinearKernel(Mxfp8LinearKernel):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype, torch.Size]:
         quantized = as_quantized_activation(x, kMxfp8Dynamic)
         if quantized is None:
+            assert isinstance(x, torch.Tensor)
             input_shape = x.shape
             output_dtype = x.dtype
             x_2d = x.reshape(-1, input_size)

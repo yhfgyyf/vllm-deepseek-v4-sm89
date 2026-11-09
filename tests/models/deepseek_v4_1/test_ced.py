@@ -14,6 +14,7 @@ from vllm.models.deepseek_v4_1.nvidia.ced import (
     plan_ced_step,
     validate_ced_config,
 )
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
 def boundary(start, count, offset=0):
@@ -215,7 +216,10 @@ def test_replay_swa_clamp_uses_logical_not_physical_cache_positions():
     # Noncontiguous physical slots deliberately have no ordering relation.
     decode_slots = torch.tensor([[900, 5, 20, -1]], dtype=torch.int32)
     prefill_slots = torch.tensor([[[800, 30, 9, 55]], [[99, 600, 8, 2]]])
-    metadata = SimpleNamespace(
+    metadata = DeepseekSparseSWAMetadata(
+        block_table=torch.empty((0, 0), dtype=torch.int32),
+        slot_mapping=torch.empty(0, dtype=torch.int64),
+        block_size=4,
         num_decode_tokens=1,
         decode_swa_indices=decode_slots,
         decode_swa_lens=torch.tensor([3]),
@@ -230,13 +234,17 @@ def test_replay_swa_clamp_uses_logical_not_physical_cache_positions():
 
 def test_replay_swa_clamp_uses_image_origin_and_preserves_future_image_keys():
     image_keys = torch.arange(100, 301, dtype=torch.int32).view(1, 1, -1)
-    metadata = SimpleNamespace(
+    metadata = DeepseekSparseSWAMetadata(
+        block_table=torch.empty((0, 0), dtype=torch.int32),
+        slot_mapping=torch.empty(0, dtype=torch.int64),
+        block_size=128,
         num_decode_tokens=0,
         decode_swa_indices=None,
         decode_swa_lens=None,
         prefill_swa_indices=image_keys,
         prefill_swa_lens=torch.tensor([201], dtype=torch.int32),
-        mm_prefix_query_ranges=torch.tensor([[100, 300]], dtype=torch.int32),
+        prefill_left_visible=torch.tensor([150], dtype=torch.int32),
+        prefill_right_visible=torch.tensor([50], dtype=torch.int32),
     )
 
     clamp_replay_swa(
@@ -275,7 +283,6 @@ def valid_config():
                 engram_layer_ids=[1, 14],
             )
         ),
-        use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
             data_parallel_size=1,

@@ -63,8 +63,8 @@ def fused_q_rope_swa_insert(
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16:
         raise ValueError("Expected BF16 query [tokens, heads, 512].")
     tokens, heads, _ = q.shape
-    if not q.is_cuda or heads not in (8, 16, 32, 64):
-        raise ValueError("V4.1 query requires CUDA and 8/16/32/64 local heads.")
+    if not q.is_cuda or heads not in (0, 8, 16, 32, 64):
+        raise ValueError("V4.1 query requires CUDA and 0/8/16/32/64 local heads.")
     if kv.shape != (tokens, 512) or kv.dtype != q.dtype:
         raise ValueError("Expected BF16 KV [tokens, 512].")
     if q.stride(-1) != 1 or kv.stride(-1) != 1:

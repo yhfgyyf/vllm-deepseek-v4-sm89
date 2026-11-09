@@ -71,9 +71,9 @@ def _kpool_compress_insert(
     head_dim: int,
     round_scale: bool,
 ) -> None:
-    """Pool ``kpool`` consecutive tokens into one fp8 K and write at pool slots.
+    """Pool `kpool` consecutive tokens into one fp8 K and write at pool slots.
 
-    ``slot_mapping`` is pool-granular (compress_ratio == kpool on the spec):
+    `slot_mapping` is pool-granular (compress_ratio == kpool on the spec):
     only the *last* token of each complete pool carries a valid (>=0) slot;
     intra-pool tokens are -1. Every position is treated as a pool-completion
     candidate and non-completions are masked off inside the kernel. Compacting
@@ -113,10 +113,10 @@ def _build_decode_scatter_indices(
     n: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token (request id, intra-request index) for a non-uniform decode
-    batch, with ``n == decode_lens.sum()`` as a host int (avoids a
+    batch, with `n == decode_lens.sum()` as a host int (avoids a
     device sync and keeps both repeat_interleaves sync-free).
 
-    Shared by every ``_scatter_decode_tokens_by_request`` call in a step:
+    Shared by every `_scatter_decode_tokens_by_request` call in a step:
     building it per call would repeat the same repeat_interleave/cumsum chain
     up to 5x per layer on the eager decode break.
     """
@@ -146,13 +146,13 @@ def _scatter_decode_tokens_by_request(
     lmax: int,
     scatter_indices: tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
-    """Group ``[N, ...]`` decode tokens into a padded ``[num_requests, lmax, ...]``
-    layout: request ``r``'s tokens at row ``r`` in order; short requests padded.
+    """Group `[N, ...]` decode tokens into a padded `[num_requests, lmax, ...]`
+    layout: request `r`'s tokens at row `r` in order; short requests padded.
 
-    Unlike ``pack_seq_triton`` this is dtype-agnostic (needed for the int32
+    Unlike `pack_seq_triton` this is dtype-agnostic (needed for the int32
     slot/pos tensors) — it scatters with the shared per-step indices from
-    ``_build_decode_scatter_indices``. Used only for the non-uniform
-    (``requires_padding``) decode batch; uniform batches use a zero-copy
+    `_build_decode_scatter_indices`. Used only for the non-uniform
+    (`requires_padding`) decode batch; uniform batches use a zero-copy
     reshape.
     """
     req_id, intra = scatter_indices
@@ -176,16 +176,16 @@ def _decode_topk_seq_lens(
 ) -> torch.Tensor:
     """Token-granular seq_len (pos + 1) per pool-topk row, layout-aware.
 
-    ``pool_topk`` (and the logits it comes from) follow the padded
-    ``[batch_size, next_n]`` grid whenever ``requires_padding`` is set, so row
-    ``(b, t)`` corresponds to flat decode token ``offset_b + t`` -- NOT
-    ``b * next_n + t``. Slicing flat ``positions[: batch_size * next_n]``
+    `pool_topk` (and the logits it comes from) follow the padded
+    `[batch_size, next_n]` grid whenever `requires_padding` is set, so row
+    `(b, t)` corresponds to flat decode token `offset_b + t` -- NOT
+    `b * next_n + t`. Slicing flat `positions[: batch_size * next_n]`
     (the uniform-layout shortcut) misaligns every row after the first
     non-uniform request and, past the decode region, reads prefill tokens'
-    positions; ``expand_pools_and_append_tail`` then anchors the tail at
+    positions; `expand_pools_and_append_tail` then anchors the tail at
     another request's length, dropping the row's real tail tokens or emitting
     indices past its sequence (out-of-bounds block-table reads). Padded rows
-    get 0 (empty tail); they are dropped by ``unpack_seq_triton`` anyway.
+    get 0 (empty tail); they are dropped by `unpack_seq_triton` anyway.
     """
     n = batch_size * next_n
     if not requires_padding:
@@ -252,7 +252,7 @@ def kv_cache_as_quant_view(
     head_dim: int,
     use_fp4_cache: bool,
 ) -> torch.Tensor:
-    """4D ``[num_blocks, block_size, 1, head_width]`` view expected by
+    """4D `[num_blocks, block_size, 1, head_width]` view expected by
     DeepGEMM, from the 3D indexer kv-cache allocation."""
     if use_fp4_cache:
         assert kv_cache.ndim == 3 and kv_cache.dtype == torch.uint8
@@ -532,6 +532,8 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            row_starts = chunk.cu_seqlen_ks
+            row_ends = chunk.cu_seqlen_ke
             if current_platform.is_rocm():
                 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                     rocm_fp8_mqa_logits,
@@ -554,8 +556,10 @@ def sparse_attn_indexer_kpool(
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    clean_logits=False,
+                    chunk.max_seqlen_k,
                 )
+                row_starts = torch.zeros_like(chunk.cu_seqlen_ks)
+                row_ends = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -575,8 +579,8 @@ def sparse_attn_indexer_kpool(
             if current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    row_starts,
+                    row_ends,
                     topk_dst,
                     num_rows,
                     logits.stride(0),
@@ -586,8 +590,8 @@ def sparse_attn_indexer_kpool(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    row_starts,
+                    row_ends,
                     topk_dst,
                     num_rows,
                     logits.stride(0),
@@ -819,7 +823,6 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
-                clean_logits=False,
             )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,

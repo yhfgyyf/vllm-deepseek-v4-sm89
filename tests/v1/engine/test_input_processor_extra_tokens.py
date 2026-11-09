@@ -4,10 +4,10 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.inputs import PlaceholderRange
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.engine.input_processor import InputProcessor
 
 

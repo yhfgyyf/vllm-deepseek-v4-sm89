@@ -108,7 +108,7 @@ def test_deep_gemm_mqa_wrappers_route_sm89_to_portable_path(monkeypatch) -> None
         torch.empty((1, 1)),
         torch.zeros(1, dtype=torch.int32),
         torch.ones(1, dtype=torch.int32),
-        clean_logits=False,
+        max_seqlen_k=1,
     )
 
     assert result.shape == (1, 1)
