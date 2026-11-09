@@ -10,11 +10,11 @@
 
 当前源码已合入 2026-11-09 核对的官方 main
 `3213796cd32df625a0669e9423acb397b627b790`，使用 Torch 2.14 / FlashInfer 0.7.3
-并保留 SM89/SM120、CED、PP 与 DSpark 适配。安装见
-[当前源码构建说明](docs/models/deepseek_v41_sm89_sm120.md)。
+并保留 SM89/SM120、CED、PP 与 DSpark 适配。新发布的 `vision12` wheel 见
+[Release](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/tag/v0.33.0-vision12-sm89-sm120-cu130)，安装命令见下文。
 
 新版已通过 8×L20 的 V4.1 TP4/PP2 整模型、图片/OCR、中文、工具调用与近 1M
-上下文验证；8K/32K/128K→512 解码均值较旧版提高约 11.3%/13.0%/9.2%，预填充基本持平。
+上下文验证；最终 wheel 的 8K/32K/128K→512 解码均值较旧版提高约 7.8%/13.0%/8.9%，预填充基本持平。
 完整配置与测量见[验证记录](docs/models/deepseek_v41_sm89_sm120.md#validation-scope)。
 下列历史支持矩阵与 `vision11` 制品仍属于旧版 vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18。
 
@@ -33,8 +33,9 @@
 
 - 合入完整官方 main 框架，迁移模型注册、GPU runner、推测解码、缓存与 Engram 接口。
 - 保留默认 TP4×PP2、DSpark TP4、最多 4 条序列，以及可选 TP2×PP4＋draft TP4。
-- 提供 FlashInfer 0.7.3 原生 V4.1 补丁和新依赖构建流程；旧 wheel / Docker 制品不含本次升级。
+- 发布 vLLM `0.33.0 / vision12` 和配套 FlashInfer `0.7.3 / vision3` wheel，使用 Torch 2.14；Docker 镜像仍为旧版。
 - 修复新版 MoE 加载和压缩器循环缓存接口；通过 8×L20 整模型与近 1M 上下文验证。
+- 修复 TP2×PP4＋draft TP4 的启动预热和混合批次通信顺序。
 
 ### 2026-09-16
 
@@ -107,20 +108,20 @@
 
 ---
 
-## 1. 历史 vision11 已验证环境
+## 1. 当前 vision12 已验证环境
 
 | 项目 | 版本 / 配置 |
 |---|---|
 | 操作系统 | Linux x86_64 |
 | Python | 3.12 |
-| CUDA toolkit | 13.0 |
-| PyTorch | 2.13.0+cu130 |
-| Triton | 3.7.1（`ptxas-blackwell` CUDA 13.1） |
-| Transformers | 5.16.1 |
-| FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision11.sm89sm120.cu130` |
-| SM89 | 4×/8× RTX 4090 48GB |
-| SM120 | 4× RTX PRO 6000 Blackwell 96GB |
+| CUDA toolkit | 13.2 构建；L20 本地 JIT 使用 13.0 |
+| PyTorch | 2.14.0+cu130 |
+| Triton | 3.8.0 |
+| Transformers | 5.22.2 |
+| FlashInfer | `0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214` |
+| vLLM | `0.33.0+glm53.dsv41.vision12.sm89sm120.cu130` |
+| SM89 | 8× L20：V4.1 TP4/PP2、TP2/PP4＋draft TP4 整模型验证 |
+| SM120 | RTX PRO 6000 Blackwell：算子与 wheel 验证 |
 
 FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时会进行一次 JIT
 编译，后续启动会复用缓存。
@@ -131,26 +132,22 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 
 ### 2.1 预编译 wheel
 
-> **本节为历史 `vision11` wheel 安装说明**，配套 FlashInfer `vision2`。
-> 当前源码的依赖和构建步骤见第 2.2 节；这些制品不包含 2026-11-09 框架升级。
-
-最新 Release 沿用 `v0.28.1rc1-vision9-sm89-sm120-cu130` tag，
-当前使用其中的 `vision11` vLLM 资产；配套 FlashInfer `vision2` 和依赖下载地址不变。
-在 Python 3.12 虚拟环境中，直接通过下面的确切 wheel URL 安装：
+在新的 Python 3.12 虚拟环境中安装 `vision12` vLLM 和配套 FlashInfer
+`vision3`。两者均来自新 Release `v0.33.0-vision12-sm89-sm120-cu130`：
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 uv pip install --torch-backend=cu130 \
-  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision11.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e1c8313e6a8b58ec3feecaffb37fc3fda8e61ba4ecff624853b24216b7eb97ed' \
-  'transformers==5.16.1' 'triton==3.7.1'
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.33.0-vision12-sm89-sm120-cu130/vllm-0.33.0%2Bglm53.dsv41.vision12.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=67228efddc16f0769e3578137a734e14cf2869b36610f37946419503d6d8c65e' \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.33.0-vision12-sm89-sm120-cu130/flashinfer_python-0.7.3%2Bglm53.dsv41.vision3.sm89sm120.cu130.pt214-py3-none-any.whl#sha256=b85753d53a0094796e865bffed11b2f55226d1991f776a3b9a76a2f0f77abecf' \
+  'transformers==5.22.2' 'triton==3.8.0'
 ```
 
-`uv` 会校验 URL 中的 SHA256，并自动安装配套 FlashInfer `vision2`，
-无需单独下载或安装 FlashInfer。已激活兼容环境时，只需执行 `uv pip install`。
-该 wheel 的 Python 源码对应提交 `86d35745c8797c9d2524877fb235084a6a5f5a7d`，
-复用已审计的 SM89 / SM120 原生二进制；Release tag 对应的源码归档未移动。
+`uv` 会校验两个 wheel 的 SHA256。该 vLLM wheel 的运行时代码对应 main
+提交 `8e91ca5082c7c21dbdf1f03ae576fdca6c572072`，包含 SM89 / SM120 原生扩展和
+Release 模式的 Rust 前端。源码构建和验证范围见[详细说明](docs/models/deepseek_v41_sm89_sm120.md)。
 
 PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Release URL 下载。
 
@@ -160,7 +157,9 @@ PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Re
 创建新环境，并安装配套的 FlashInfer 0.7.3 原生扩展。不要使用旧版 Torch 2.13 /
 Triton 3.7.1 或将 `vision11` 二进制覆盖到新源码。
 
-### 2.3 Docker 镜像（GHCR，公开免登录）
+### 2.3 历史 vision11 Docker 镜像（GHCR，公开免登录）
+
+此镜像仍使用 vLLM 0.28 / Torch 2.13，不包含本次框架升级。
 
 [GHCR 镜像页面](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
 
@@ -288,7 +287,7 @@ CED 当前是实验性的近似 prefill 路径。在已测长文本 prefill 中�
 双向图片可见性只用于旧 V4 Vision 模型。
 CED 通常回放末尾 128 个 query token，边界落入图片区间时向前扩展，并预留
 `128 + vision_max_n_token` 的尾部容量。按需设置
-`--limit-mm-per-prompt '{"image":2}'`。本次迁移已做算子与组件检查，未验证整模型图片质量。
+`--limit-mm-per-prompt '{"image":2}'`。新版已通过一次整模型双图形状/OCR 检查，尚非广泛图片质量评估。
 非图片模态、prompt embeddings 和 prompt logprobs 仍在进入引擎前被拒绝。
 
 图片路径已有 CPU 回归、SM120 单卡小型权重 GPU 数值测试，以及真实缓存管理器
@@ -296,15 +295,15 @@ CED 通常回放末尾 128 个 query token，边界落入图片区间时向前�
 DSpark，完成了单并发 8K / 32K / 128K 的图片与工具调用请求。输出质量仍需按
 实际任务评估，请求完成不等同于所有图片答案正确。
 
-`vision11` wheel 和 GHCR 镜像已包含 CED 图片支持，使用图片时可保留
+`vision12` wheel 已包含 CED 图片支持，使用图片时可保留
 `--hf-overrides '{"ced_prefill":true}'` 和 DSpark/adaptive。
 
 ### 3.1 DSpark 默认开启 adaptive verification
 
 本文所有 DSpark 启动示例均显式开启 adaptive，并配置 FULL；这是 README
-示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。使用 `vision11`
-wheel、GHCR 镜像或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
-保留模型路径、TP/EP、FP8 KV、Engram、Model Runner V2 和相应 CUDA 工具链设置。
+示例的默认设置，不改变 `SpeculativeConfig` 的通用默认值。使用 `vision12`
+wheel 或当前 `main` 源码，并使用带 confidence head 的 DSpark checkpoint。
+保留模型路径、TP/EP、FP8 KV、Engram 和相应 CUDA 工具链设置。
 
 | 参数 | 旧固定 DSpark 5 | 当前默认 adaptive |
 |---|---|---|
@@ -382,10 +381,10 @@ TP2×PP4（10/10/10/10 层）。保留 EP、FP8 KV、Engram CPU offload、CED �
 DSpark 5 adaptive 和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
 内存，不能只按 GPU 权重大小估算整机内存需求。
 
-本节 PP/DSpark 组合需要按第 2.2 节安装更新后的 **`main` 源码**；已有的
-`vision11` wheel / 镜像未包含本次 PP 更新。两种并行方式的 8×L20 整模型验证
-来自框架升级前的版本；新版按组件与通信层验证，未重跑整模型。容量与吞吐
-仍需按实际 GPU 和负载检查。在该环境中启动：
+本节使用 `vision12` wheel 或更新后的 `main` 源码。两种配置均通过 8×L20
+LongSWE 40 条、每条输出 1,024 tokens 的四并发验证；完成时间为 323.89 / 321.31 秒，
+输出吞吐为 126.46 / 127.48 tokens/s，单次测量基本持平。
+容量与吞吐需按实际 GPU 和负载检查。在该环境中启动：
 
 ```bash
 source /path/to/.venv/bin/activate

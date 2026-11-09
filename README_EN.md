@@ -12,12 +12,14 @@
 The current source incorporates official main
 `3213796cd32df625a0669e9423acb397b627b790`, checked on 2026-11-09, with Torch
 2.14 / FlashInfer 0.7.3 and the SM89/SM120, CED, PP and DSpark adaptations.
-See the [current source build guide](docs/models/deepseek_v41_sm89_sm120.md).
+The new `vision12` wheels are in the
+[release](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/tag/v0.33.0-vision12-sm89-sm120-cu130);
+installation commands are below.
 
 The upgrade passed V4.1 TP4/PP2 full-model, image/OCR, Chinese, tool-call and
 near-1M-context checks on 8x L20. Mean decode rates for 8K/32K/128K inputs and
-512 outputs improved by 11.3%/13.0%/9.2% over the historical stack; prefill was
-roughly unchanged. See the [validation record](docs/models/deepseek_v41_sm89_sm120.md#validation-scope).
+512 outputs from the final wheel improved by 7.8%/13.0%/8.9% over the historical
+stack; prefill was roughly unchanged. See the [validation record](docs/models/deepseek_v41_sm89_sm120.md#validation-scope).
 The historical support matrix and `vision11` artifacts below still describe
 the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
 
@@ -38,10 +40,11 @@ the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
   decoding, cache management and Engram interfaces.
 - Retain default TP4/PP2 with DSpark TP4 and at most four sequences, plus the
   optional TP2/PP4 target with draft TP4.
-- Add the FlashInfer 0.7.3 native V4.1 patch and current source build guide.
-  Historical wheels and Docker images do not contain this framework upgrade.
+- Publish vLLM `0.33.0 / vision12` and paired FlashInfer `0.7.3 / vision3`
+  wheels with Torch 2.14. Docker images retain the older stack.
 - Fix native MoE loading and compressor ring-cache interfaces; validate full-model
   serving and near-1M context on 8x L20.
+- Fix startup warmup and mixed-batch collective ordering for TP2/PP4 with draft TP4.
 
 ### 2026-09-16
 
@@ -113,20 +116,20 @@ Earlier SM89 builds and environments remain available in
 
 ---
 
-## 1. Historical vision11 validated environment
+## 1. Current vision12 validated environment
 
 | Item | Version / configuration |
 |---|---|
 | Operating system | Linux x86_64 |
 | Python | 3.12 |
-| CUDA toolkit | 13.0 |
-| PyTorch | 2.13.0+cu130 |
-| Triton | 3.7.1 (`ptxas-blackwell` from CUDA 13.1) |
-| Transformers | 5.16.1 |
-| FlashInfer | `0.6.18+glm53.dsv41.vision2.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc1.dev517+glm53.dsv41.vision11.sm89sm120.cu130` |
-| SM89 | 4×/8× RTX 4090 48 GB |
-| SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
+| CUDA toolkit | 13.2 build; CUDA 13.0 for local L20 JIT |
+| PyTorch | 2.14.0+cu130 |
+| Triton | 3.8.0 |
+| Transformers | 5.22.2 |
+| FlashInfer | `0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214` |
+| vLLM | `0.33.0+glm53.dsv41.vision12.sm89sm120.cu130` |
+| SM89 | 8x L20: full-model V4.1 TP4/PP2 and TP2/PP4 with draft TP4 |
+| SM120 | RTX PRO 6000 Blackwell: operator and wheel validation |
 
 The FlashInfer wheel is a Python/JIT source package. The first unseen model
 shape is compiled once and then reused from the JIT cache.
@@ -135,37 +138,31 @@ shape is compiled once and then reused from the JIT cache.
 
 ## 2. Quick install (prebuilt wheels / container)
 
-> **This section installs the historical `vision11` vLLM wheel** and paired
-> FlashInfer `vision2`. For current source dependencies and build instructions,
-> see Section 2.1. These artifacts do not include the 2026-11-09 framework upgrade.
-
-The latest release retains the `v0.28.1rc1-vision9-sm89-sm120-cu130` tag,
-and the instructions now use its `vision11` vLLM asset. Paired FlashInfer `vision2` and its
-dependency URL are unchanged. Install directly from the exact wheel URL
-below in a Python 3.12 virtual environment:
+Install `vision12` vLLM and paired FlashInfer `vision3` in a new Python 3.12
+environment. Both wheels come from the new
+`v0.33.0-vision12-sm89-sm120-cu130` release:
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 uv pip install --torch-backend=cu130 \
-  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.28.1rc1-vision9-sm89-sm120-cu130/vllm-0.28.1rc1.dev517%2Bglm53.dsv41.vision11.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=e1c8313e6a8b58ec3feecaffb37fc3fda8e61ba4ecff624853b24216b7eb97ed' \
-  'transformers==5.16.1' 'triton==3.7.1'
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.33.0-vision12-sm89-sm120-cu130/vllm-0.33.0%2Bglm53.dsv41.vision12.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl#sha256=67228efddc16f0769e3578137a734e14cf2869b36610f37946419503d6d8c65e' \
+  'https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.33.0-vision12-sm89-sm120-cu130/flashinfer_python-0.7.3%2Bglm53.dsv41.vision3.sm89sm120.cu130.pt214-py3-none-any.whl#sha256=b85753d53a0094796e865bffed11b2f55226d1991f776a3b9a76a2f0f77abecf' \
+  'transformers==5.22.2' 'triton==3.8.0'
 ```
 
-`uv` verifies the SHA256 in the URL and automatically installs paired
-FlashInfer `vision2`; no separate FlashInfer download or install is needed.
-With a compatible environment already activated, run only `uv pip install`.
-The wheel's Python source corresponds to commit
-`86d35745c8797c9d2524877fb235084a6a5f5a7d`, reusing audited SM89 / SM120
-native binaries. The release tag's source archives were not moved.
+`uv` verifies both wheel hashes. The vLLM runtime code corresponds to main
+commit `8e91ca5082c7c21dbdf1f03ae576fdca6c572072`, with SM89 / SM120 native
+extensions and a release-profile Rust frontend. See the
+[build and validation guide](docs/models/deepseek_v41_sm89_sm120.md) for details.
 
 Optionally use `--index-url` for a PyPI mirror; the wheel still downloads
 from the release URL above.
 
 The older ACR `vision7` Docker image includes neither DeepSeek-V4.1-Flash nor
 this adaptive adaptation. It cannot directly use the adaptive-enabled DSpark
-commands below. Use the `vision11` wheel, GHCR image, or current source;
+commands below. Use the `vision12` wheels or current source;
 the older ACR `vision7` configuration must keep adaptive disabled.
 
 ### 2.1 Install current main source (alternative to the wheel)
@@ -175,7 +172,9 @@ to create a fresh environment and install the matching native FlashInfer 0.7.3
 extension. Do not pin Torch 2.13 / Triton 3.7.1 or copy historical `vision11`
 binaries into the upgraded source.
 
-### 2.2 Docker image (GHCR, no login required)
+### 2.2 Historical vision11 Docker image (GHCR, no login required)
+
+This image retains vLLM 0.28 / Torch 2.13 and does not include the framework upgrade.
 
 [GHCR image](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
 
@@ -267,7 +266,8 @@ CED normally replays the last 128 query tokens, extending backward when the
 boundary cuts through an image span, with tail capacity reserved for
 `128 + vision_max_n_token`. Set a limit such as
 `--limit-mm-per-prompt '{"image":2}'` as needed. This migration has operator
-and component checks, but no full-model image-quality validation. Non-image modalities,
+and component checks, plus one full-model two-image shape/OCR check. This is not
+a broad image-quality evaluation. Non-image modalities,
 prompt embeddings, and prompt logprobs are rejected before engine execution.
 
 The image path has CPU regressions, small-weight SM120 GPU numerical tests,
@@ -281,9 +281,9 @@ was correct.
 
 All DSpark launch examples below explicitly enable adaptive with FULL graphs.
 This is the README example default, not a change to the generic
-`SpeculativeConfig` default. Use the `vision11` wheel, GHCR image, or current
+`SpeculativeConfig` default. Use the `vision12` wheels or current
 `main` source and a DSpark checkpoint with a confidence head. Retain the model
-path, TP/EP, FP8 KV, Engram, Model Runner V2, and CUDA toolchain settings.
+path, TP/EP, FP8 KV, Engram, and CUDA toolchain settings.
 
 | Parameter | Previous fixed DSpark 5 | Current adaptive default |
 |---|---|---|
@@ -374,12 +374,11 @@ DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
 loading both require sufficient host memory, so do not size host memory from
 the GPU weight footprint alone.
 
-These PP/DSpark configurations require the updated **`main` source** from
-Section 2.1; existing `vision11` wheels and images do not contain this PP update.
-Full-model validation of both layouts on 8×L20 predates the framework upgrade.
-The upgraded version is checked at the component and communication level;
-full-model inference has not been repeated. Check capacity and throughput
-on your actual GPUs and workload.
+Use the `vision12` wheels or updated `main` source for these PP/DSpark configurations.
+Both layouts passed 40 LongSWE requests with 1,024 outputs each at concurrency
+four on 8x L20. Completion times were 323.89 / 321.31 seconds, with output
+throughput of 126.46 / 127.48 tokens/s: similar results in this single-batch
+comparison. Check capacity and throughput on your actual GPUs and workload.
 Configure the SM89 toolchain and launch in that environment:
 
 ```bash

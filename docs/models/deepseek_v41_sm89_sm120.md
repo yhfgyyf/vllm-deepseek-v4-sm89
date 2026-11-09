@@ -36,12 +36,12 @@ export MAX_JOBS=4
 uv pip install --no-build-isolation -e . --torch-backend=cu130
 ```
 
-The complete candidate C++/CUDA build used CUDA 13.2 and GCC 13 on the SM120
+The C++/CUDA build used CUDA 13.2 and GCC 13 on the SM120
 host, with both `8.9` and `12.0` targets. Its extensions also ran on L20/SM89;
 L20's local JIT kernels used CUDA 13.0. This does not establish that the whole
-current source builds with CUDA 13.0. The Rust frontend was built in the
-`dev` profile; a release Rust build and distributable vLLM wheel were not
-validated in this upgrade.
+current source builds with CUDA 13.0. The `vision12` wheel bundles a Rust
+frontend built with `tools/build_rust.py --release`, using Rust 1.95.
+The `cu130` package suffix identifies the Torch runtime, not the C++ build toolkit.
 
 Upstream FlashInfer 0.7.3 needs the additive native V4.1 extension below for
 SM89/SM120. It preserves the native 528-byte SWA and 288-byte global-cache
@@ -64,11 +64,11 @@ git apply --check \
 git apply \
   "$vllm_source/tools/recipes/patches/flashinfer-0.7.3-sm89-glm-compat.patch"
 uv pip install --python "$vllm_source/.venv/bin/python" -r requirements.txt
-BUILD_NVEP=0 FLASHINFER_LOCAL_VERSION=dsv41.sm89sm120.3 \
+BUILD_NVEP=0 FLASHINFER_LOCAL_VERSION=glm53.dsv41.vision3.sm89sm120.cu130.pt214 \
   uv build --wheel --no-build-isolation \
   --python "$vllm_source/.venv/bin/python" --out-dir dist
 uv pip install --python "$vllm_source/.venv/bin/python" --no-deps \
-  dist/flashinfer_python-0.7.3+dsv41.sm89sm120.3-py3-none-any.whl
+  dist/flashinfer_python-0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214-py3-none-any.whl
 cd "$vllm_source"
 uv pip check
 uv run --no-project python -c \
@@ -107,10 +107,25 @@ budget when deploying the new dependency stack.
 
 The 2026-11-09 validation used L20 (SM89) and RTX PRO 6000 (SM120), both with
 Torch `2.14.0+cu130`, Triton `3.8.0`, Transformers `5.22.2`, TileLang `0.1.12`
-and the patched FlashInfer source. The final FlashInfer wheel is
-`0.7.3+dsv41.sm89sm120.3`; SHA256:
-`452441ada692081da39c61ababc88884acd6337c22a543e6bcf3c52bf7b0233a`.
-All 38 added runtime files were compared byte-for-byte with the wheel.
+and the patched FlashInfer source. The release FlashInfer wheel is
+`0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214`; SHA256:
+`b85753d53a0094796e865bffed11b2f55226d1991f776a3b9a76a2f0f77abecf`.
+All 38 added runtime files match the validated candidate wheel byte-for-byte;
+only FlashInfer's build-version metadata changed in the new build.
+
+The release vLLM wheel is `0.33.0+glm53.dsv41.vision12.sm89sm120.cu130`,
+with runtime source commit `8e91ca5082c7c21dbdf1f03ae576fdca6c572072` and SHA256
+`67228efddc16f0769e3578137a734e14cf2869b36610f37946419503d6d8c65e`.
+All 3,343 tracked Python files match that commit. Core/MoE cubins include
+SM89 and SM120; the compared native code sections match the tested build,
+with only the install-time RPATH string changed. The Rust binary reports
+the release version on both hosts. Installed-wheel checks pass 27 focused
+ring, padding, codec, MoE, top-k and FlashInfer graph cases on each architecture,
+with imports asserted to come from site-packages. Dependency checks pass on
+both hosts, and fresh dependency resolution with the documented pins succeeds.
+The final rebuild also passes 35 PP wire/FIFO tests on each architecture,
+including deferred draft/confidence receives. The 27 native checks are reused
+because the compared native code sections are unchanged.
 
 | Check | L20 / SM89 | RTX PRO 6000 / SM120 |
 | --- | --- | --- |
@@ -144,9 +159,9 @@ the launch examples retain their four-sequence default.
 
 | Input / output | Previous TTFT (s) | Updated TTFT (s) | Previous decode (tok/s) | Updated decode (tok/s) |
 | --- | ---: | ---: | ---: | ---: |
-| 8192 / 512 | 1.224 | 1.202 ± 0.005 | 106.73 | 118.79 ± 11.61 |
-| 32768 / 512 | 4.775 | 4.719 ± 0.019 | 102.48 | 115.80 ± 12.48 |
-| 131072 / 512 | 21.798 | 22.025 ± 0.021 | 107.10 | 116.93 ± 14.85 |
+| 8192 / 512 | 1.224 | 1.203 ± 0.002 | 106.73 | 115.02 ± 9.93 |
+| 32768 / 512 | 4.775 | 4.724 ± 0.012 | 102.48 | 115.82 ± 7.14 |
+| 131072 / 512 | 21.798 | 22.026 ± 0.064 | 107.10 | 116.61 ± 6.95 |
 
 Each length uses one warmup and four measured, concurrency-one requests with
 identical saved prompt token IDs and a cold prefix for every request. Values
@@ -155,7 +170,9 @@ document topics. Every measured response contained 512 tokens, with zero
 prefix hits and preemptions. Decode counts actual SSE token IDs, excluding
 all tokens delivered in the first event. This historical whole-stack
 comparison does not isolate one optimization or establish output equivalence.
-Server prefill means changed by -1.94%, -0.94% and +1.11%, respectively.
+The final wheel ran all reported performance requests; all eight workers
+loaded it from site-packages. Server prefill means changed by -1.81%, -0.87%
+and +1.22%, respectively.
 
 One Chinese response, one two-image shape/OCR request and one complete tool
 round trip passed. A cold 1,048,064-token request completed in 440.46 seconds
@@ -166,10 +183,36 @@ quality evaluation or a full-model SM120 validation.
 Full-model testing exposed two migration defects: obsolete native MoE
 loading hooks and a compressor that treated disabled generic ring mappings
 as invalid real tokens. The native compressor now derives ring addresses
-from request blocks and positions. Its extended regression failed before
-the fix and passes afterward, preserving null-block and padding behavior.
+from request blocks and positions, and masks FULL-graph padding using the
+device query boundary. The ring and padding regressions failed before their
+respective fixes and pass afterward, preserving null-block behavior.
 Actual adaptive startup calibration and normal graphs were enabled for the
 reported serving measurements.
+
+The final wheel also passed a LongSWE batch of 20 samples from each original
+32K/64K bucket, with a 1,048,576-token context limit, four sequence slots,
+four concurrent clients and exactly 1,024 outputs per request. Actual inputs
+were 3,209–31,927 and 35,215–61,905 tokens, without padding or truncation;
+the same frozen payloads totaled 1,335,265 input and 40,960 output tokens.
+Each layout had four warmup requests, a prefix-cache reset and unique per-case
+cache salts. Loading and warmup are excluded; final request drain is included.
+
+| Target / draft TP | All 40 requests (s) | Output tokens/s | Input + output tokens/s |
+| --- | ---: | ---: | ---: |
+| TP4/PP2 / TP4 | 323.892 | 126.462 | 4,249.028 |
+| TP2/PP4 / TP4 | 321.308 | 127.479 | 4,283.189 |
+
+Both completed 40/40 with zero prefix hits, preemptions and replacement
+characters, and a maximum of four running requests. TP2/PP4's 0.804% higher
+throughput in this one batch is not a stable speedup claim. This is a serving
+throughput test using LongSWE prompts, not a patch-correctness evaluation or
+a test of four simultaneous 1M prompts.
+
+TP2/PP4 initially stalled in startup warmup and then in mixed prefill/decode.
+Helper ranks now join draft warmup and receive draft results after participating
+in the cross-stage draft collectives. Four sequential requests passed before
+the four-concurrent-request regression and the full batch; existing PP wire/FIFO
+tests also cover deferred draft and confidence receives.
 
 The [migration ledger](deepseek_v41_upgrade_audit.md) maps all 24 correctness
 and 21 performance findings from the preceding audit to the active source
