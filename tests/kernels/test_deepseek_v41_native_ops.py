@@ -436,18 +436,32 @@ def test_compression_handles_chunk_start_ring_read_before_tail_write(ratio):
 @pytest.mark.parametrize("graph_replay", [False, True])
 def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
     """Padded FULL-graph capacity is not the live token count."""
+    from vllm.config import SchedulerConfig, VllmConfig
     from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import (
         fused_save_compress_norm,
     )
     from vllm.models.deepseek_v4_1.compressor import CompressorMetadataBuilder
     from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
 
     torch.manual_seed(13)
     device = "cuda"
-    builder = object.__new__(CompressorMetadataBuilder)
-    builder.capacity = 8
-    builder.token_to_req_indices = torch.zeros(8, dtype=torch.int32, device=device)
-    builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_batched_tokens=8,
+            max_num_seqs=4,
+            max_model_len=16,
+            is_encoder_decoder=False,
+        )
+    )
+    spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1024,
+        head_size_v=0,
+        dtype=torch.float32,
+    )
+    builder = CompressorMetadataBuilder(spec, ["state"], config, torch.device(device))
     starts = torch.zeros(5, dtype=torch.int32, device=device)
     positions = torch.zeros(8, dtype=torch.int64, device=device)
     source_slots = torch.full((8,), -1, dtype=torch.int64, device=device)
@@ -470,8 +484,6 @@ def test_compressor_padding_does_not_write_latents_or_ring(graph_replay):
         starts.copy_(torch.tensor([0, *lengths], device=device).cumsum(0))
         pos = [p + i for n, p in zip(lengths, [1, 4, 0, 0]) for i in range(n)]
         positions.copy_(torch.tensor(pos + [1] * (8 - live), device=device))
-        source_slots.fill_(-1)
-        source_slots[:live] = 0
         cm = CommonAttentionMetadata(
             query_start_loc=starts,
             query_start_loc_cpu=cpu_starts,

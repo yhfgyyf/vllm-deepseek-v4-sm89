@@ -64,13 +64,16 @@ def _ring_slot_mapping_kernel(
     block_table_stride,
     token_to_req_ptr,
     positions_ptr,
+    query_start_loc_ptr,
+    num_reqs,
     num_actual_tokens,
     num_tokens,
     CAPACITY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < num_actual_tokens
+    live_tokens = tl.load(query_start_loc_ptr + num_reqs)
+    valid = (offsets < num_actual_tokens) & (offsets < live_tokens)
     req = tl.load(token_to_req_ptr + offsets, mask=valid, other=0).to(tl.int64)
     block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=0)
     pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
@@ -121,6 +124,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             block_table.stride(0),
             token_to_req_indices,
             positions,
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.num_reqs,
             common_attn_metadata.num_actual_tokens,
             num_tokens,
             CAPACITY=self.capacity,
