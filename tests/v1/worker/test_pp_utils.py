@@ -4,6 +4,7 @@
 
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import replace
 from unittest.mock import Mock
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu import pp_utils
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 
 def _batch(
@@ -21,8 +23,12 @@ def _batch(
     is_prefilling=None,
     max_seq_len=None,
 ):
-    return Mock(
-        num_reqs=len(num_computed),
+    num_reqs, num_tokens = len(num_computed), sum(num_scheduled)
+    batch = InputBatch.make_dummy(
+        num_reqs, num_tokens, InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
+    )
+    return replace(
+        batch,
         num_computed_tokens_np=np.array(num_computed, dtype=np.int32),
         prefill_len_np=np.array(prefill_len, dtype=np.int32),
         num_scheduled_tokens=np.array(num_scheduled, dtype=np.int32),
@@ -107,6 +113,7 @@ def _handler(monkeypatch, last=False, num_spec=3):
     handler.is_last_rank = last
     handler.last_rank = 1
     handler.max_sample_len = num_spec + 1
+    handler.num_speculative_steps = num_spec
     handler.device = torch.device("cpu")
     handler.main_stream = Mock()
     handler.broadcast_stream = Mock()
@@ -114,12 +121,13 @@ def _handler(monkeypatch, last=False, num_spec=3):
     handler.queue = deque([None] * 2)
     handler.req_idx_gen_np = np.zeros(8, dtype=np.int32)
     handler.disabled = False
+    handler.sampled_tokens_broadcast = False
     handler.enable_adaptive_verification = False
     handler.aux_hidden_state_relay_keys = ()
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda *args: None)
     monkeypatch.setattr(
-        pp_utils, "async_copy_to_gpu", lambda a, **kwargs: torch.from_numpy(a)
+        pp_utils, "async_tensor_h2d", lambda a, **kwargs: torch.from_numpy(a)
     )
     return handler
 
@@ -128,28 +136,36 @@ def _decode_batch():
     batch = _batch([10, 0, 10], [8, 100, 8], [4, 4, 4])
     batch.idx_mapping_np = np.array([2, 3, 4], dtype=np.int64)
     batch.idx_mapping = torch.from_numpy(batch.idx_mapping_np.copy())
+    batch.num_draft_tokens = 9
     return batch
 
 
-def test_sampled_counts_then_fresh_drafts_have_fixed_wire_shapes(monkeypatch):
+@pytest.mark.parametrize("defer_drafts", [False, True])
+def test_sampled_counts_then_fresh_drafts_have_fixed_wire_shapes(
+    monkeypatch, defer_drafts
+):
     receiver = _handler(monkeypatch)
     batch = _decode_batch()
     payloads = []
     monkeypatch.setattr(
         torch.distributed, "broadcast", lambda tensor, **kwargs: payloads.append(tensor)
     )
-    assert not receiver.receive(batch)
+    assert not receiver.receive(batch, recv_drafts=not defer_drafts)
+    if defer_drafts:
+        assert [tuple(t.shape) for t in payloads] == [(3, 4), (2, 4)]
+        assert receiver.queue[-1].draft_tokens is None
+        receiver.receive_drafts()
     assert [tuple(t.shape) for t in payloads] == [(3, 4), (2, 4), (3, 3)]
     sender = _handler(monkeypatch, last=True)
     payloads.clear()
     sender.broadcast(
-        torch.tensor([[11], [22], [33]]),
+        torch.tensor([[11, 0, 0, 0], [22, 0, 0, 0], [33, 0, 0, 0]]),
         torch.ones(3, dtype=torch.int32),
         torch.zeros(3, dtype=torch.int32),
         batch,
     )
     table = torch.arange(24).reshape(8, 3)
-    sender.broadcast_drafts(table, batch)
+    sender.broadcast_drafts(table[batch.idx_mapping])
     assert [tuple(t.shape) for t in payloads] == [(3, 4), (2, 4), (3, 3)]
     assert payloads[0].tolist() == [[11, 0, 0, 0], [22, 0, 0, 0], [33, 0, 0, 0]]
     expected = table[batch.idx_mapping].clone()
@@ -161,7 +177,7 @@ def test_deferred_fifo_filters_cancelled_reused_and_prefill_slots(monkeypatch):
     handler = _handler(monkeypatch)
     batch = _decode_batch()
     monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
-    handler.receive(batch)
+    handler.receive(batch, recv_drafts=True)
     slot = handler.queue[-1]
     assert slot is not None
     # Reuse/mutate the original batch arrays; the pending slot must be isolated.
@@ -171,11 +187,14 @@ def test_deferred_fifo_filters_cancelled_reused_and_prefill_slots(monkeypatch):
     outputs = handler.get_prev_sampled_outputs()
     assert outputs is not None
     assert outputs["idx_mapping"].tolist() == [-1, -1, 4]
-    assert outputs["broadcast_drafts"] is slot.draft_tokens
+    assert outputs["draft_tokens"] is slot.draft_tokens
     handler.main_stream.wait_event.assert_called_once_with(slot.event)
 
 
-def test_adaptive_confidences_follow_drafts_and_exclude_reused_slots(monkeypatch):
+@pytest.mark.parametrize("defer_drafts", [False, True])
+def test_adaptive_confidences_follow_drafts_and_exclude_reused_slots(
+    monkeypatch, defer_drafts
+):
     receiver = _handler(monkeypatch)
     receiver.enable_adaptive_verification = True
     batch = _decode_batch()
@@ -183,7 +202,11 @@ def test_adaptive_confidences_follow_drafts_and_exclude_reused_slots(monkeypatch
     monkeypatch.setattr(
         torch.distributed, "broadcast", lambda tensor, **kwargs: payloads.append(tensor)
     )
-    receiver.receive(batch)
+    receiver.receive(batch, recv_drafts=not defer_drafts)
+    if defer_drafts:
+        assert [tuple(t.shape) for t in payloads] == [(3, 4), (2, 4)]
+        assert receiver.queue[-1].draft_confidences is None
+        receiver.receive_drafts()
     assert [tuple(t.shape) for t in payloads] == [(3, 4), (2, 4), (3, 3), (3, 3)]
     slot = receiver.queue[-1]
     slot.draft_confidences.copy_(torch.arange(9).reshape(3, 3))
@@ -195,10 +218,16 @@ def test_adaptive_confidences_follow_drafts_and_exclude_reused_slots(monkeypatch
 
     sender = _handler(monkeypatch, last=True)
     sender.enable_adaptive_verification = True
+    sender.broadcast(
+        torch.zeros(3, 4, dtype=torch.int64),
+        torch.ones(3, dtype=torch.int32),
+        torch.zeros(3, dtype=torch.int32),
+        batch,
+    )
     confidences = torch.rand(3, 3)
     expected = confidences.clone()
     payloads.clear()
-    sender.broadcast_drafts(torch.zeros(8, 3, dtype=torch.int64), batch, confidences)
+    sender.broadcast_drafts(torch.zeros(3, 3, dtype=torch.int64), confidences)
     confidences.zero_()
     assert len(payloads) == 2
     torch.testing.assert_close(payloads[1], expected)
@@ -213,9 +242,9 @@ def test_disabled_warmup_enqueues_no_collectives(monkeypatch, last):
     batch = _decode_batch()
     if last:
         handler.broadcast(torch.zeros(3, 1, dtype=torch.int64), None, None, batch)
-        handler.broadcast_drafts(torch.zeros(8, 3, dtype=torch.int64), batch)
+        handler.broadcast_drafts(torch.zeros(3, 3, dtype=torch.int64))
     else:
-        assert not handler.receive(batch)
+        assert not handler.receive(batch, recv_drafts=True)
     broadcast.assert_not_called()
     assert list(handler.queue) == [None, None]
 
@@ -296,8 +325,8 @@ def test_draft_only_loader_avoids_world_collectives(monkeypatch, pp_size, load_f
         assert draft.load_format == "auto"
         assert original.load_format == "fastsafetensors"
         warning.assert_called_once()
-        assert "WORLD collectives" in warning.call_args.args[0]
-        assert "target loader is unchanged" in warning.call_args.args[0]
+        assert "only one pipeline stage" in warning.call_args.args[0]
+        assert "target model still uses fastsafetensors" in warning.call_args.args[0]
     else:
         assert draft is original
         warning.assert_not_called()
@@ -430,6 +459,7 @@ def test_cross_tp_dspark_keeps_loaded_weights_when_target_stage_has_no_head(
 ):
     from types import SimpleNamespace
 
+    from vllm.config import LoadConfig, ParallelConfig
     from vllm.model_executor import model_loader
     from vllm.model_executor.models import qwen3_dflash
     from vllm.model_executor.models import utils as model_utils
@@ -447,9 +477,14 @@ def test_cross_tp_dspark_keeps_loaded_weights_when_target_stage_has_no_head(
         model=SimpleNamespace(embed_tokens=model_utils.PPMissingLayer()),
         lm_head=model_utils.PPMissingLayer(),
     )
+    parallel = ParallelConfig(
+        tensor_parallel_size=4, distributed_executor_backend="external_launcher"
+    )
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             draft_tensor_parallel_size=4,
+            draft_parallel_config=parallel,
+            draft_load_config=None,
             target_parallel_config=SimpleNamespace(tensor_parallel_size=2),
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(), get_vocab_size=lambda: 8
@@ -458,14 +493,12 @@ def test_cross_tp_dspark_keeps_loaded_weights_when_target_stage_has_no_head(
             kv_cache_dtype=None,
         ),
         attention_config=SimpleNamespace(backend=None),
-        load_config=SimpleNamespace(),
+        load_config=LoadConfig(),
         cache_config=SimpleNamespace(),
         model_config=SimpleNamespace(get_vocab_size=lambda: 8),
     )
     monkeypatch.setattr(utils, "replace", lambda *args, **kwargs: SimpleNamespace())
-    monkeypatch.setattr(
-        utils, "get_pp_draft_parallel_config", lambda _: SimpleNamespace()
-    )
+    monkeypatch.setattr(utils, "get_pp_draft_parallel_config", lambda _: parallel)
     monkeypatch.setattr(utils, "get_pp_safe_draft_load_config", lambda value: value)
     monkeypatch.setattr(utils, "_resolve_dspark_attention_backend", lambda *args: None)
     monkeypatch.setattr(model_utils, "get_draft_quant_config", lambda _: None)

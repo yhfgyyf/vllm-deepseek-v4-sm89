@@ -2355,8 +2355,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.pcp_manager is not None:
                 input_batch = self.pcp_manager.global_batch
             assert self.pp_handler is not None
+            defer_draft_recv = (
+                self.pp_draft_group is not None and self.pp_draft_group.participates
+            )
             all_decode_next = self.pp_handler.receive(
-                input_batch, recv_drafts=num_spec_tokens > 0
+                input_batch, recv_drafts=num_spec_tokens > 0 and not defer_draft_recv
             )
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
@@ -2372,8 +2375,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch,
                         attn_metadata,
                         slot_mappings_by_layer,
+                        num_speculative_tokens=num_spec_tokens,
                         dp_sync_state=dp_sync_state,
                     )
+
+            if defer_draft_recv and num_spec_tokens > 0:
+                # Match the source's collective order across the overlapping
+                # PP broadcast and draft TP groups.
+                self.pp_handler.receive_drafts()
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

@@ -687,6 +687,7 @@ steps:
   - tests/models/deepseek_v4/
   - tests/models/deepseek_v4_1/
   - tests/v1/cudagraph/test_dsv4_adaptive_fullgraph.py
+  - tests/v1/worker/test_pp_utils.py
   - tools/recipes/patches/flashinfer-0.7.3-deepseek-v41-native.patch
   - tools/recipes/patches/flashinfer-0.7.3-sm89-glm-compat.patch
   - tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
@@ -704,3 +705,4 @@ steps:
     tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
     tests/models/deepseek_v4_1
     tests/v1/cudagraph/test_dsv4_adaptive_fullgraph.py
+    tests/v1/worker/test_pp_utils.py

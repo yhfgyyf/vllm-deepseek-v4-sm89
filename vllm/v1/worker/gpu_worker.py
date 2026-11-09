@@ -1171,7 +1171,14 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if get_pp_group().is_last_rank and not self.model_runner.is_pooling_model:
+        warmup_sampler = (
+            get_pp_group().is_last_rank and not self.model_runner.is_pooling_model
+        )
+        pp_draft_group = self.model_runner.pp_draft_group
+        # The dummy forward also runs the drafter, so its helper ranks must join.
+        if warmup_sampler or (
+            pp_draft_group is not None and pp_draft_group.participates
+        ):
             # Warm up the sampler and keep its max-batch buffers (e.g. the
             # fp32 logits copy) cached after the empty_cache() in
             # capture_model(), so later steps reuse them instead of reserving
@@ -1185,7 +1192,8 @@ class Worker(WorkerBase):
             _, sample_hidden_states = self.model_runner._dummy_run(
                 num_tokens=max_num_reqs, skip_eplb=True
             )
-            self.model_runner._dummy_sampler_run(hidden_states=sample_hidden_states)
+            if warmup_sampler:
+                self.model_runner._dummy_sampler_run(hidden_states=sample_hidden_states)
             del sample_hidden_states
 
         # Reset the seed to ensure that the random state is not affected by

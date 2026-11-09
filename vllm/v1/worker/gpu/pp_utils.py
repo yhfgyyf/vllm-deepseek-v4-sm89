@@ -219,34 +219,12 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
-            draft_tokens = None
-            draft_confidences = None
-            if recv_drafts:
-                draft_tokens = sampled_tokens.new_empty(
-                    num_reqs, self.num_speculative_steps
-                )
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
-                if self.enable_adaptive_verification:
-                    draft_confidences = torch.empty_like(
-                        draft_tokens, dtype=torch.float32
-                    )
-                    torch.distributed.broadcast(
-                        draft_confidences,
-                        src=self.last_rank,
-                        group=self.broadcast_group,
-                    )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined[:, :num_reqs].unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
             sampled_tokens.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
-            if draft_tokens is not None:
-                draft_tokens.record_stream(self.main_stream)
-            if draft_confidences is not None:
-                draft_confidences.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -256,10 +234,38 @@ class PPHandler:
             idx_mapping_np,
             need_sampled_mask.copy(),
             gen_at_receive_np,
-            draft_tokens,
-            draft_confidences,
         )
+        if recv_drafts:
+            self.receive_drafts()
         return bool(need_sampled_mask.all())
+
+    def receive_drafts(self) -> None:
+        """Complete this step's receive after any cross-stage draft collectives."""
+        assert not self.is_last_rank
+        slot = self.queue[-1]
+        if self.disabled or slot is None:
+            return
+        assert slot.draft_tokens is None
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            slot.draft_tokens = slot.sampled_tokens.new_empty(
+                slot.sampled_tokens.shape[0], self.num_speculative_steps
+            )
+            torch.distributed.broadcast(
+                slot.draft_tokens, src=self.last_rank, group=self.broadcast_group
+            )
+            slot.draft_tokens.record_stream(self.main_stream)
+            if self.enable_adaptive_verification:
+                slot.draft_confidences = torch.empty_like(
+                    slot.draft_tokens, dtype=torch.float32
+                )
+                torch.distributed.broadcast(
+                    slot.draft_confidences,
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
+                slot.draft_confidences.record_stream(self.main_stream)
+            slot.event = self.broadcast_stream.record_event()
 
     def broadcast(
         self,
