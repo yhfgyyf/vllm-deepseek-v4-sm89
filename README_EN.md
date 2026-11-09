@@ -14,10 +14,12 @@ The current source incorporates official main
 2.14 / FlashInfer 0.7.3 and the SM89/SM120, CED, PP and DSpark adaptations.
 See the [current source build guide](docs/models/deepseek_v41_sm89_sm120.md).
 
-The support matrix, `vision11` artifacts and full-model benchmarks below refer
-to the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack. This upgrade uses
-compilation, component, operator and partial real-weight validation; no
-full-model inference comparison was run.
+The upgrade passed V4.1 TP4/PP2 full-model, image/OCR, Chinese, tool-call and
+near-1M-context checks on 8x L20. Mean decode rates for 8K/32K/128K inputs and
+512 outputs improved by 11.3%/13.0%/9.2% over the historical stack; prefill was
+roughly unchanged. See the [validation record](docs/models/deepseek_v41_sm89_sm120.md#validation-scope).
+The historical support matrix and `vision11` artifacts below still describe
+the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
 
 ## Historical release support matrix
 
@@ -38,8 +40,8 @@ full-model inference comparison was run.
   optional TP2/PP4 target with draft TP4.
 - Add the FlashInfer 0.7.3 native V4.1 patch and current source build guide.
   Historical wheels and Docker images do not contain this framework upgrade.
-- Resolve numerical conflicts using operator and partial real-weight evidence;
-  historical full-model results do not validate the upgraded framework.
+- Fix native MoE loading and compressor ring-cache interfaces; validate full-model
+  serving and near-1M context on 8x L20.
 
 ### 2026-09-16
 

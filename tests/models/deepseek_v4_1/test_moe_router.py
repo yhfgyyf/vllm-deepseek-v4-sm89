@@ -280,12 +280,10 @@ def test_v41_dspark_loader_maps_image_router_bias(monkeypatch):
     draft.model.confidence_head = None
     layer = torch.nn.Module()
     layer.ffn = torch.nn.Module()
-    layer.ffn.use_mega_moe = False
+    layer.ffn.use_native_mega_moe = False
     layer.ffn.gate = torch.nn.Module()
     layer.ffn.gate.bias_vl = torch.nn.Parameter(torch.zeros(128), requires_grad=False)
     draft.model.layers = torch.nn.ModuleList([layer])
-    draft.process_weights_after_loading = lambda: None
-
     loaded = draft.load_weights(
         [("mtp.0.ffn.gate.bias_vl", torch.arange(128, dtype=torch.float32))]
     )

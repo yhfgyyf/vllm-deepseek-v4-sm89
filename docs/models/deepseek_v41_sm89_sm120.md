@@ -136,12 +136,40 @@ without loading a complete model. Both test hosts matched all 5,788 Python
 source/test file hashes. Build-generated third-party Python files are recorded
 separately from repository sources.
 
-This upgrade is validated with compilation, component/kernel tests and small
-real-weight slices. Numerical conflict decisions cover E8M0 conversion,
-router selection, mHC and expert MXFP8 quantization. No full-model inference
-comparison was run for this upgrade. End-to-end quality, throughput and
-multi-GPU serving behavior require separate full-model validation; historical
-measurements must not be reported as results from this framework version.
+Full-model validation also passed on 8x L20 with target TP4/PP2, draft TP4,
+DSpark 5, adaptive verification, FULL_AND_PIECEWISE graphs, CED, Engram CPU
+offload, an 8192-token batch budget and 2 GiB KV allocation per worker.
+The benchmark uses eight sequence slots to match the historical baseline;
+the launch examples retain their four-sequence default.
+
+| Input / output | Previous TTFT (s) | Updated TTFT (s) | Previous decode (tok/s) | Updated decode (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| 8192 / 512 | 1.224 | 1.202 ± 0.005 | 106.73 | 118.79 ± 11.61 |
+| 32768 / 512 | 4.775 | 4.719 ± 0.019 | 102.48 | 115.80 ± 12.48 |
+| 131072 / 512 | 21.798 | 22.025 ± 0.021 | 107.10 | 116.93 ± 14.85 |
+
+Each length uses one warmup and four measured, concurrency-one requests with
+identical saved prompt token IDs and a cold prefix for every request. Values
+are means; updated ± values are sample standard deviations across four
+document topics. Every measured response contained 512 tokens, with zero
+prefix hits and preemptions. Decode counts actual SSE token IDs, excluding
+all tokens delivered in the first event. This historical whole-stack
+comparison does not isolate one optimization or establish output equivalence.
+Server prefill means changed by -1.94%, -0.94% and +1.11%, respectively.
+
+One Chinese response, one two-image shape/OCR request and one complete tool
+round trip passed. A cold 1,048,064-token request completed in 440.46 seconds
+and correctly retrieved a unique code placed near the middle; the configured
+context limit was 1,048,576. These are bounded smoke checks, not a broad
+quality evaluation or a full-model SM120 validation.
+
+Full-model testing exposed two migration defects: obsolete native MoE
+loading hooks and a compressor that treated disabled generic ring mappings
+as invalid real tokens. The native compressor now derives ring addresses
+from request blocks and positions. Its extended regression failed before
+the fix and passes afterward, preserving null-block and padding behavior.
+Actual adaptive startup calibration and normal graphs were enabled for the
+reported serving measurements.
 
 The [migration ledger](deepseek_v41_upgrade_audit.md) maps all 24 correctness
 and 21 performance findings from the preceding audit to the active source

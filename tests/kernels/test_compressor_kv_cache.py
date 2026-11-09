@@ -1098,21 +1098,27 @@ def test_v41_rope_insert_plain_row(compress_ratio: int, store_fp8: bool):
 
 
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="Triton kernel")
-def test_v41_compressor_metadata_maps_tokens_to_their_ring():
+@pytest.mark.parametrize("model_package", ["deepseek_v41", "deepseek_v4_1"])
+def test_v41_compressor_metadata_maps_tokens_to_their_ring(model_package):
     """The ring group's generic slot mapping is disabled (all PAD), so the
     builder must map every real token to `ring_block * capacity + pos %
     capacity`. Padding tokens and requests on the null block (block 0, as in
     dummy batches) must stay at PAD."""
-    from unittest.mock import MagicMock
+    from importlib import import_module
 
-    from vllm.models.deepseek_v41.compressor import CompressorMetadataBuilder
+    from vllm.config import SchedulerConfig, VllmConfig
     from vllm.v1.attention.backend import CommonAttentionMetadata
     from vllm.v1.kv_cache_interface import CircularBufferSpec
 
     capacity = 8
-    vllm_config = MagicMock()
-    vllm_config.scheduler_config.max_num_batched_tokens = 16
-    vllm_config.parallel_config.prefill_context_parallel_size = 1
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_batched_tokens=16,
+            max_num_seqs=3,
+            max_model_len=16,
+            is_encoder_decoder=False,
+        )
+    )
     spec = CircularBufferSpec(
         block_size=capacity,
         num_kv_heads=1,
@@ -1121,7 +1127,10 @@ def test_v41_compressor_metadata_maps_tokens_to_their_ring():
         dtype=torch.float32,
     )
     device = torch.device("cuda")
-    builder = CompressorMetadataBuilder(spec, ["state"], vllm_config, device)
+    builder_cls = import_module(
+        f"vllm.models.{model_package}.compressor"
+    ).CompressorMetadataBuilder
+    builder = builder_cls(spec, ["state"], vllm_config, device)
 
     # Three requests: 3 tokens at positions 13..15 on ring block 5, 2 tokens
     # at positions 7..8 on ring block 2, then 2 tokens on the null block;

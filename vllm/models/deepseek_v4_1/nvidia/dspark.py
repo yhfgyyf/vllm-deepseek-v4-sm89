@@ -379,7 +379,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         layouts load their own shards from the target checkpoint.
         """
         first_layer = self.model.layers[0]
-        use_mega_moe = first_layer.ffn.use_mega_moe
+        use_native_mega_moe = first_layer.ffn.use_native_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
         # backbone's (see DeepseekV4MoE and the reference
         # ModelArgs.get_moe_config).
@@ -387,7 +387,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts
         )
-        if use_mega_moe:
+        if use_native_mega_moe:
             expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
         else:
             expert_mapping = fused_moe_make_expert_params_mapping(
@@ -509,16 +509,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             and not {"model.embed_tokens.weight", "lm_head.weight"} <= loaded_params
         ):
             raise ValueError("Cross-TP DSpark requires target embedding/head weights")
-        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
-
-    def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
-
-    def process_weights_after_loading(self) -> None:
-        self._finalize_moe()
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint `mtp.{i}.*` name to this model's parameter path.

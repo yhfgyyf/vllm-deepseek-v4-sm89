@@ -1192,7 +1192,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_mega_moe:
+        if first_layer.ffn.use_native_mega_moe:
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1204,10 +1204,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             num_experts=self.config.n_routed_experts,
             num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
-
-    def finalize_mega_moe_weights(self) -> None:
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1458,12 +1454,9 @@ class DeepseekV41LLMForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
-        return loaded_params
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
-        self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         config = self.model.vllm_config
         if config.engram_config and config.engram_config.use_thp:
