@@ -52,6 +52,7 @@ from vllm.models.deepseek_v4_1.quant_config import (
     DeepseekV4FP8Config,
     DeepseekV41WoALinearMethod,
 )
+from vllm.platforms import current_platform
 
 
 def _config_dict() -> dict:
@@ -105,17 +106,11 @@ def test_v41_router_weight_precedes_bf16_cast_and_second_k32_quantization():
 
 
 def test_v41_rejects_global_marlin_fp8_input_override(monkeypatch):
-    from vllm.model_executor.layers.quantization.utils import marlin_utils
+    from vllm.platforms import current_platform
 
-    monkeypatch.setattr(
-        marlin_utils,
-        "get_marlin_input_dtype",
-        lambda: torch.float8_e4m3fn,
-    )
-    method = DeepseekV41Mxfp4MoEMethod.__new__(DeepseekV41Mxfp4MoEMethod)
-
-    with pytest.raises(ValueError, match="VLLM_MARLIN_INPUT_DTYPE must be unset"):
-        method.process_weights_after_loading(SimpleNamespace())
+    monkeypatch.setenv("VLLM_MARLIN_INPUT_DTYPE", "fp8")
+    with pytest.raises(ValueError, match="VLLM_MARLIN_INPUT_DTYPE"):
+        current_platform.validate_environ(hard_fail=True)
 
 
 def test_v41_moe_quant_config_enables_official_router_weight_order():
@@ -143,7 +138,7 @@ def test_marlin_accepts_v41_moe_pair_without_narrowing_legacy_support():
 def test_marlin_defers_activation_quantization_only_for_v41_router_boundary():
     v41 = SimpleNamespace(router_weight_before_fc2_quant=True)
     legacy = SimpleNamespace(router_weight_before_fc2_quant=False)
-    get_property = MarlinExpertsBase.expects_unquantized_inputs.fget
+    get_property = vars(MarlinExpertsBase)["expects_unquantized_inputs"].fget
 
     assert get_property(v41)
     assert not get_property(legacy)
@@ -184,7 +179,7 @@ def test_v41_moe_selector_requests_native_mxfp8_activation(
     )
     config = SimpleNamespace(
         moe_backend="auto",
-        moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
+        activation_format=mxfp4_oracle.mk.FusedMoEActivationFormat.Standard,
     )
 
     backend, kernel = mxfp4_oracle.select_deepseek_v41_mxfp4_moe_backend(config)
@@ -197,7 +192,7 @@ def test_v41_moe_selector_requests_native_mxfp8_activation(
 def test_v41_explicit_b12x_rejects_inexact_activation_floor():
     config = SimpleNamespace(
         moe_backend="b12x",
-        moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
+        activation_format=mxfp4_oracle.mk.FusedMoEActivationFormat.Standard,
     )
 
     with pytest.raises(NotImplementedError, match="minimum amax of 1e-4"):
@@ -255,7 +250,9 @@ def test_v41_dense_selector_excludes_legacy_w8a16_fallback(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="Failed to find a kernel"):
-        linear_kernels.init_mxfp8_linear_kernel(model_profile="deepseek_v41")
+        linear_kernels.init_mxfp8_linear_kernel(
+            weight_shape=(128, 128), model_profile="deepseek_v41"
+        )
 
 
 def test_checkpoint_scale_loader_expands_32_output_rows():
@@ -369,11 +366,19 @@ def test_v41_engram_mxfp8_tactics_fail_closed_without_package_metadata(monkeypat
     check.cache_clear()
 
 
-def test_flashinfer_mxfp8_default_profile_keeps_public_cutlass_path(monkeypatch):
+def test_flashinfer_mxfp8_default_profile_respects_device_support(monkeypatch):
+    config = Mxfp8LinearLayerConfig(weight_shape=(128, 128))
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(100)):
+        # The shared base now rejects constructing this Blackwell-only kernel.
+        assert not FlashInferCutlassMxfp8LinearKernel.is_supported()[0]
+        with pytest.raises(AssertionError):
+            FlashInferCutlassMxfp8LinearKernel(config)
+        return
     x = torch.zeros((1, 128), dtype=torch.bfloat16)
     xq = torch.zeros((1, 128), dtype=torch.float8_e4m3fn)
     x_scale = torch.full((128,), 127, dtype=torch.uint8)
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     layer.weight = torch.nn.Parameter(
         torch.zeros((128, 128), dtype=torch.float8_e4m3fn),
         requires_grad=False,
@@ -395,7 +400,7 @@ def test_flashinfer_mxfp8_default_profile_keeps_public_cutlass_path(monkeypatch)
         return torch.zeros((1, 128), dtype=torch.bfloat16)
 
     monkeypatch.setattr(mxfp8_flashinfer.vllm_flashinfer, "mm_mxfp8", public_mm)
-    kernel = FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+    kernel = FlashInferCutlassMxfp8LinearKernel(config)
 
     output = kernel.apply_weights(layer, x)
 
@@ -411,6 +416,7 @@ def test_v41_engram_mxfp8_dynamic_compile_keeps_one_graph(monkeypatch):
 
     n, k = mxfp8_flashinfer._DEEPSEEK_V41_ENGRAM_MXFP8_SHAPE
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     layer.weight = torch.nn.Parameter(
         torch.full((n, k), 0.25, dtype=torch.float8_e4m3fn, device="cuda"),
         requires_grad=False,
@@ -420,7 +426,7 @@ def test_v41_engram_mxfp8_dynamic_compile_keeps_one_graph(monkeypatch):
         requires_grad=False,
     )
     kernel = FlashInferCutlassMxfp8LinearKernel(
-        Mxfp8LinearLayerConfig(model_profile="deepseek_v41")
+        Mxfp8LinearLayerConfig(weight_shape=(n, k), model_profile="deepseek_v41")
     )
     kernel.process_weights_after_loading(layer)
     graphs = []
@@ -492,6 +498,7 @@ def test_v41_linear_dispatch_keeps_only_official_wo_a_unquantized():
 def test_v41_wo_a_loader_slices_weight_and_block_scales_on_output_axis(monkeypatch, tp):
     method = DeepseekV41WoALinearMethod.__new__(DeepseekV41WoALinearMethod)
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     rank = tp - 1
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_rank", lambda: rank
@@ -533,6 +540,7 @@ def test_v41_wo_a_dequantizes_after_name_order_independent_loading(
 ):
     method = DeepseekV41WoALinearMethod.__new__(DeepseekV41WoALinearMethod)
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
@@ -574,6 +582,7 @@ def test_v41_wo_a_dequantizes_after_name_order_independent_loading(
 def test_v41_wo_a_rejects_missing_checkpoint_scale(monkeypatch):
     method = DeepseekV41WoALinearMethod.__new__(DeepseekV41WoALinearMethod)
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
@@ -599,6 +608,7 @@ def test_v41_wo_a_rejects_missing_checkpoint_scale(monkeypatch):
 def test_v41_wo_a_dummy_loader_uses_finite_neutral_scales(monkeypatch):
     method = DeepseekV41WoALinearMethod.__new__(DeepseekV41WoALinearMethod)
     layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1

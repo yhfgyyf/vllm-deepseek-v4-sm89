@@ -10,6 +10,7 @@ is not a model-budget cost curve.
 Examples:
     .venv/bin/python benchmarks/kernels/benchmark_dsv4_adaptive_indexer.py \
         --output /tmp/indexer-cost.json
+
 """
 
 import argparse

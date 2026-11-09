@@ -6,22 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-from vllm.config import CUDAGraphMode
-from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepSeekV32IndexerDecodeMetadata,
-    DeepseekV32IndexerMetadata,
-    DeepseekV41IndexerMetadataBuilder,
-)
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
-from vllm.v1.worker.workspace import current_workspace_manager
-
+from vllm.config import AttentionConfig, CompilationConfig, CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.model_executor.kernels.attention.dsa import dsv41_indexer
-from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+from vllm.model_executor.kernels.attention.dsa.dsv41_candidate_blocks import (
     select_candidate_blocks,
 )
 from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
@@ -30,6 +21,15 @@ from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
     dsv41_mxfp4_dense_logits,
     map_candidate_topk_,
 )
+from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
+    DeepseekV41NativeIndexerMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 HEADS = 32
 HEAD_DIM = 128
@@ -428,22 +428,26 @@ def test_native_operator_cuda_graph_replay_reads_live_lengths_and_candidates() -
 
 
 @requires_dsv41_gpu
+@pytest.mark.parametrize("max_tokens", [9, 33])
+@pytest.mark.parametrize("candidate_write", [False, True])
 def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
     workspace_init,
     monkeypatch,
+    max_tokens,
+    candidate_write,
 ) -> None:
-    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+    # Keep one logits slab so every row remains available for inspection.
+    monkeypatch.setenv(
+        "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", str((max_tokens + 15) // 16)
+    )
     torch.manual_seed(6)
     max_model_len = 1088
-    max_tokens = 9
     topk = 512
     page_size = 128
     width = max_model_len // 2
     config = SimpleNamespace(
-        attention_config=SimpleNamespace(
-            resolve_indexer_kv_dtype=lambda default: default
-        ),
-        model_config=SimpleNamespace(max_model_len=max_model_len),
+        attention_config=AttentionConfig(sparse_mla_prefill_workspace_factor=5),
+        model_config=SimpleNamespace(max_model_len=max_model_len, hf_text_config=None),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_tokens,
             max_num_seqs=4,
@@ -453,7 +457,10 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            max_cudagraph_capture_size=max_tokens,
+        ),
         speculative_config=SimpleNamespace(
             enable_adaptive_verification=True,
             num_speculative_tokens=3,
@@ -461,7 +468,7 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
         num_speculative_tokens=3,
     )
     block_table = torch.arange(20, device="cuda", dtype=torch.int32).view(4, 5)
-    builder = DeepseekV41IndexerMetadataBuilder(
+    builder = DeepseekV41NativeIndexerMetadataBuilder(
         kv_cache_spec=MLAAttentionSpec(
             block_size=page_size,
             num_kv_heads=1,
@@ -541,6 +548,11 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
     q_dequant = _dequantize_mxfp4(q_packed, q_scales)
     weights = torch.randn(max_tokens, HEADS, device="cuda", dtype=torch.float32)
     topk_indices = torch.empty(max_tokens, topk, device="cuda", dtype=torch.int32)
+    candidates = (
+        torch.empty(max_tokens, 2048, device="cuda", dtype=torch.int32)
+        if candidate_write
+        else None
+    )
     logits_scratch = current_workspace_manager().get_simultaneous(
         *sparse_indexer._dsv41_workspace_specs(max_model_len)
     )[0]
@@ -555,9 +567,9 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
             topk_indices,
             topk,
             max_model_len,
-            None,
+            candidates,
             8,
-            False,
+            candidate_write,
         )
 
     launch()
@@ -603,7 +615,10 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
             live_metadata.decode.seq_lens.data_ptr(),
             live_metadata.decode.block_table.data_ptr(),
         ) == metadata_ptrs
-        assert (live_metadata.num_decodes, live_metadata.num_decode_tokens) == (4, 9)
+        assert (live_metadata.num_decodes, live_metadata.num_decode_tokens) == (
+            4,
+            max_tokens,
+        )
         assert live_metadata.decode.seq_lens.squeeze(-1).tolist() == (
             expected_compressed_seq_lens(query_locs, seq_lens)
         )
@@ -618,7 +633,7 @@ def test_builder_metadata_drives_live_cuda_graph_logits_and_topk(
             k_dequant,
             weights,
             row_ends,
-            row_requests,
+            row_requests + [-1] * (max_tokens - len(row_requests)),
             width,
         )
         actual_logits = logits_scratch[: max_tokens * width].view(max_tokens, width)
@@ -719,6 +734,7 @@ def test_breakable_replay_reads_fresh_v41_decode_width(monkeypatch) -> None:
             128,
             topk,
             True,
+            False,
             False,
             "",
             use_fp4_cache=True,
@@ -1168,14 +1184,16 @@ def test_predecoded_q_replays_in_cuda_graph(monkeypatch) -> None:
     expected = run().clone()
     out.zero_()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert _same_bits(out, expected)
     assert not _same_bits(out, reference)
 
 
 @requires_cuda_and_triton
 @pytest.mark.parametrize(("target", "minimum"), [(1, 1), (7_000, 8), (10**9, 8)])
-def test_tile_program_count_does_not_change_logits(monkeypatch, target, minimum) -> None:
+def test_tile_program_count_does_not_change_logits(
+    monkeypatch, target, minimum
+) -> None:
     reference = _all_logit_paths()
     monkeypatch.setattr(dsv41_indexer, "_LOGITS_TARGET_PROGRAMS", target)
     monkeypatch.setattr(dsv41_indexer, "_LOGITS_MIN_TILE_PROGRAMS", minimum)
@@ -1199,7 +1217,15 @@ def test_skipped_columns_are_filled_with_neg_inf() -> None:
     )
     out = torch.full((4, width), 3.0, dtype=torch.float32, device="cuda")
     dsv41_mxfp4_dense_logits(
-        q_values, q_scales, k_cache, weights, block_tables, ends, width, row_repeat=4, out=out
+        q_values,
+        q_scales,
+        k_cache,
+        weights,
+        block_tables,
+        ends,
+        width,
+        row_repeat=4,
+        out=out,
     )
     for row, end in enumerate(ends.tolist()):
         assert _same_bits(out[row, :end], reference[row, :end])
@@ -1217,8 +1243,17 @@ def test_skipped_columns_are_filled_with_neg_inf() -> None:
     token_to_seq = torch.zeros(pwidth, dtype=torch.int32, device="cuda")
     out = torch.full((rows, pwidth), 3.0, dtype=torch.float32, device="cuda")
     dsv41_mxfp4_dense_logits(
-        q_values, q_scales, k_cache, weights, block_tables, pends, pwidth,
-        row_starts=starts, cu_seq_lens=cu_seq_lens, token_to_seq=token_to_seq, out=out,
+        q_values,
+        q_scales,
+        k_cache,
+        weights,
+        block_tables,
+        pends,
+        pwidth,
+        row_starts=starts,
+        cu_seq_lens=cu_seq_lens,
+        token_to_seq=token_to_seq,
+        out=out,
     )
     for row, end in enumerate(pends.tolist()):
         assert torch.all(torch.isneginf(out[row, :1_000]))

@@ -58,7 +58,9 @@ def _native_workspace_size(
     num_global_slots: int,
 ) -> int:
     try:
-        from flashinfer.mla import deepseek_v41_mixed_sparse_workspace_size
+        from flashinfer.mla.deepseek_v41 import (
+            deepseek_v41_mixed_sparse_workspace_size,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "DeepSeek V4.1 requires FlashInfer's native mixed sparse "
@@ -119,7 +121,7 @@ def _native_workspace_size_upper_bound(
     num_global_slots: int,
 ) -> int:
     try:
-        from flashinfer.mla import (
+        from flashinfer.mla.deepseek_v41 import (
             deepseek_v41_mixed_sparse_workspace_size_upper_bound,
         )
     except ImportError as exc:
@@ -166,12 +168,12 @@ class DeepseekV41NativeSparseBackend(DeepseekV41SparseMLABackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [128]
 
     @staticmethod
     def get_name() -> str:
-        return "FLASHINFER_MLA_SPARSE_DSV41"
+        return "FLASHINFER_MLA_SPARSE_DSV41_NATIVE"
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -228,10 +230,14 @@ class DeepseekV41NativeSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
         if capacity is not None:
             self.decode_threshold = capacity
 
+    def build_tile_scheduler(self, num_decode_tokens: int):
+        # The native mixed-attention kernel does not consume FlashMLA plans.
+        return super().build_tile_scheduler(0)
+
 
 class DeepseekV41NativeSWABackend(DeepseekSparseSWABackend):
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [32]
 
     @classmethod
@@ -411,11 +417,13 @@ class DeepseekV41NativeMixedAttention(DeepseekV4Attention):
             if swa_metadata.decode_swa_indices is None:
                 raise RuntimeError("V4.1 decode SWA slots are missing.")
             decode_slice = slice(0, decode_tokens)
-            global_slots = (
-                None
-                if swa_only
-                else self._global_slots(global_metadata, swa_metadata, decode_slice)
-            )
+            if swa_only:
+                global_slots = None
+            else:
+                assert global_metadata is not None
+                global_slots = self._global_slots(
+                    global_metadata, swa_metadata, decode_slice
+                )
             self._run_native(
                 q[decode_slice],
                 swa_cache,
@@ -433,11 +441,13 @@ class DeepseekV41NativeMixedAttention(DeepseekV4Attention):
             if swa_metadata.prefill_swa_indices is None:
                 raise RuntimeError("V4.1 prefill SWA slots are missing.")
             prefill_slice = slice(decode_tokens, decode_tokens + prefill_tokens)
-            global_slots = (
-                None
-                if swa_only
-                else self._global_slots(global_metadata, swa_metadata, prefill_slice)
-            )
+            if swa_only:
+                global_slots = None
+            else:
+                assert global_metadata is not None
+                global_slots = self._global_slots(
+                    global_metadata, swa_metadata, prefill_slice
+                )
             self._run_native(
                 q[prefill_slice],
                 swa_cache,

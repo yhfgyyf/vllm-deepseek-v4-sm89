@@ -1,0 +1,4688 @@
+diff --git a/csrc/deepseek_v41_attention.cu b/csrc/deepseek_v41_attention.cu
+new file mode 100644
+--- /dev/null
++++ b/csrc/deepseek_v41_attention.cu
+@@ -0,0 +1,245 @@
++// Copyright (c) 2026 FlashInfer contributors.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <flashinfer/attention/deepseek_v41_epilogue.cuh>
++#include <flashinfer/attention/deepseek_v41_mixed_sparse.cuh>
++
++#include "tvm_ffi_utils.h"
++
++namespace flashinfer::deepseek_v41 {
++
++namespace {
++
++void check_tensor(const TensorView& tensor, DLDataType dtype, int ndim, const TensorView& q,
++                  const char* name) {
++  CHECK_CUDA(tensor);
++  CHECK_DEVICE(q, tensor);
++  TVM_FFI_ICHECK_EQ(tensor.dtype(), dtype) << name << " has an invalid dtype";
++  TVM_FFI_ICHECK_EQ(tensor.ndim(), ndim) << name << " has an invalid rank";
++  CHECK_CONTIGUOUS(tensor);
++}
++
++void check_paged_layout(int64_t nbytes, int64_t page_size, int64_t page_stride, int64_t row_stride,
++                        int64_t payload_bytes, const char* name) {
++  TVM_FFI_ICHECK_GT(nbytes, 0) << name << " must contain storage";
++  TVM_FFI_ICHECK_GT(page_size, 0) << name << " page size must be positive";
++  TVM_FFI_ICHECK_GE(row_stride, payload_bytes) << name << " row stride is smaller than its payload";
++  TVM_FFI_ICHECK_LE(row_stride, INT64_MAX / page_size) << name << " page extent overflows int64";
++  TVM_FFI_ICHECK_GE(page_stride, page_size * row_stride) << name << " page stride overlaps rows";
++}
++
++size_t tensor_nbytes(const TensorView& tensor) {
++  const DLDataType dtype = tensor.dtype();
++  return static_cast<size_t>(tensor.numel()) * dtype.bits * dtype.lanes / 8;
++}
++
++bool tensors_overlap(const TensorView& lhs, const TensorView& rhs) {
++  const size_t lhs_bytes = tensor_nbytes(lhs);
++  const size_t rhs_bytes = tensor_nbytes(rhs);
++  if (lhs_bytes == 0 || rhs_bytes == 0) return false;
++  const auto lhs_begin = reinterpret_cast<uintptr_t>(lhs.data_ptr());
++  const auto rhs_begin = reinterpret_cast<uintptr_t>(rhs.data_ptr());
++  if (lhs_begin <= rhs_begin) {
++    return rhs_begin - lhs_begin < lhs_bytes;
++  }
++  return lhs_begin - rhs_begin < rhs_bytes;
++}
++
++void check_no_overlap(const TensorView& output, const TensorView& operand, const char* name) {
++  TVM_FFI_ICHECK(!tensors_overlap(output, operand)) << "grouped_out must not overlap " << name;
++}
++
++template <typename SwaSlotT, typename GlobalSlotT>
++void launch_attention(const V41AttentionParams& params, TensorView out, cudaStream_t stream) {
++  const cudaError_t status = launch_deepseek_v41_attention<SwaSlotT, GlobalSlotT>(
++      params, static_cast<bf16*>(out.data_ptr()), out.stride(0), out.stride(1), stream);
++  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
++      << "DeepSeek-V4.1 native attention launch failed: " << cudaGetErrorString(status);
++}
++
++}  // namespace
++
++void AttentionImpl(TensorView q, TensorView swa_cache, TensorView global_cache,
++                   TensorView swa_slots, TensorView global_slots, TensorView sinks,
++                   TensorView partial_out, TensorView partial_lse, TensorView out, double sm_scale,
++                   int64_t num_splits, bool has_global, bool unified_tiles, int64_t swa_page_size,
++                   int64_t swa_page_stride, int64_t swa_row_stride, int64_t global_page_size,
++                   int64_t global_page_stride, int64_t global_row_stride,
++                   V41EpilogueParams epilogue = {}) {
++  check_tensor(q, dl_bfloat16, 3, q, "q");
++  check_tensor(swa_cache, dl_uint8, 1, q, "swa_cache");
++  check_tensor(global_cache, dl_uint8, 1, q, "global_cache");
++  check_tensor(swa_slots, swa_slots.dtype(), 2, q, "swa_slots");
++  CHECK_CUDA(global_slots);
++  CHECK_DEVICE(q, global_slots);
++  TVM_FFI_ICHECK_EQ(global_slots.ndim(), 2) << "global_slots has an invalid rank";
++  check_tensor(sinks, dl_float32, 1, q, "sinks");
++  check_tensor(partial_out, dl_bfloat16, 4, q, "partial_out");
++  check_tensor(partial_lse, dl_float32, 3, q, "partial_lse");
++  check_tensor(out, dl_bfloat16, 3, q, "out");
++
++  TVM_FFI_ICHECK(swa_slots.dtype() == dl_int32 || swa_slots.dtype() == dl_int64)
++      << "swa_slots must be int32 or int64";
++  TVM_FFI_ICHECK(global_slots.dtype() == dl_int32 || global_slots.dtype() == dl_int64)
++      << "global_slots must be int32 or int64";
++  if (has_global) CHECK_CONTIGUOUS(global_slots);
++  TVM_FFI_ICHECK_EQ(q.size(2), kV41Dim) << "q must have head dimension 512";
++  TVM_FFI_ICHECK(q.size(1) == 8 || q.size(1) == 16 || q.size(1) == 32)
++      << "q head count must be 8, 16, or 32";
++  TVM_FFI_ICHECK_GT(q.size(0), 0) << "q must contain at least one token";
++  TVM_FFI_ICHECK_EQ(q.stride(2), 1) << "q head dimension must be contiguous";
++  TVM_FFI_ICHECK_EQ(swa_slots.size(0), q.size(0));
++  TVM_FFI_ICHECK_EQ(global_slots.size(0), q.size(0));
++  TVM_FFI_ICHECK_EQ(sinks.size(0), q.size(1));
++  TVM_FFI_ICHECK_GE(swa_slots.size(1), 0);
++  TVM_FFI_ICHECK_EQ(has_global, global_slots.size(1) > 0) << "has_global must match global_slots";
++  TVM_FFI_ICHECK_GE(num_splits, 1);
++  TVM_FFI_ICHECK_LE(num_splits, kV41MaxSplits);
++  TVM_FFI_ICHECK(!unified_tiles || has_global) << "unified scheduling requires the global cache";
++
++  TVM_FFI_ICHECK_EQ(partial_out.size(0), q.size(0));
++  TVM_FFI_ICHECK_EQ(partial_out.size(1), num_splits);
++  TVM_FFI_ICHECK_EQ(partial_out.size(2), q.size(1));
++  TVM_FFI_ICHECK_EQ(partial_out.size(3), kV41Dim);
++  TVM_FFI_ICHECK_EQ(partial_lse.size(0), q.size(0));
++  TVM_FFI_ICHECK_EQ(partial_lse.size(1), num_splits);
++  TVM_FFI_ICHECK_EQ(partial_lse.size(2), q.size(1));
++  TVM_FFI_ICHECK_EQ(out.size(0), q.size(0));
++  TVM_FFI_ICHECK_EQ(out.size(1), q.size(1));
++  TVM_FFI_ICHECK_EQ(out.size(2), kV41Dim);
++
++  TVM_FFI_ICHECK_EQ(swa_page_size, 32);
++  check_paged_layout(swa_cache.numel(), swa_page_size, swa_page_stride, swa_row_stride,
++                     kV41SwaPayloadBytes, "swa_cache");
++  if (has_global) {
++    TVM_FFI_ICHECK(global_page_size == 64 || global_page_size == 128)
++        << "global page size must be 64 or 128";
++    check_paged_layout(global_cache.numel(), global_page_size, global_page_stride,
++                       global_row_stride, kV41GlobalPayloadBytes, "global_cache");
++  }
++
++  V41AttentionParams params{static_cast<const bf16*>(q.data_ptr()),
++                            static_cast<const uint8_t*>(swa_cache.data_ptr()),
++                            static_cast<const uint8_t*>(global_cache.data_ptr()),
++                            swa_slots.data_ptr(),
++                            global_slots.data_ptr(),
++                            static_cast<const float*>(sinks.data_ptr()),
++                            static_cast<bf16*>(partial_out.data_ptr()),
++                            static_cast<float*>(partial_lse.data_ptr()),
++                            q.stride(0),
++                            q.stride(1),
++                            swa_slots.stride(0),
++                            global_slots.stride(0),
++                            partial_out.stride(0),
++                            partial_out.stride(1),
++                            partial_out.stride(2),
++                            partial_lse.stride(0),
++                            partial_lse.stride(1),
++                            partial_lse.stride(2),
++                            swa_cache.numel(),
++                            global_cache.numel(),
++                            swa_page_stride,
++                            swa_row_stride,
++                            global_page_stride,
++                            global_row_stride,
++                            static_cast<int>(swa_page_size),
++                            static_cast<int>(global_page_size),
++                            static_cast<int>(swa_slots.size(1)),
++                            static_cast<int>(global_slots.size(1)),
++                            static_cast<int>(q.size(0)),
++                            static_cast<int>(q.size(1)),
++                            static_cast<int>(num_splits),
++                            static_cast<float>(sm_scale),
++                            has_global,
++                            unified_tiles,
++                            epilogue};
++
++  ffi::CUDADeviceGuard guard(q.device().device_id);
++  const cudaStream_t stream = get_stream(q.device());
++  if (swa_slots.dtype() == dl_int32) {
++    if (global_slots.dtype() == dl_int32) {
++      launch_attention<int32_t, int32_t>(params, out, stream);
++    } else {
++      launch_attention<int32_t, int64_t>(params, out, stream);
++    }
++  } else if (global_slots.dtype() == dl_int32) {
++    launch_attention<int64_t, int32_t>(params, out, stream);
++  } else {
++    launch_attention<int64_t, int64_t>(params, out, stream);
++  }
++}
++
++void Attention(TensorView q, TensorView swa_cache, TensorView global_cache, TensorView swa_slots,
++               TensorView global_slots, TensorView sinks, TensorView partial_out,
++               TensorView partial_lse, TensorView out, double sm_scale, int64_t num_splits,
++               bool has_global, bool unified_tiles, int64_t swa_page_size, int64_t swa_page_stride,
++               int64_t swa_row_stride, int64_t global_page_size, int64_t global_page_stride,
++               int64_t global_row_stride) {
++  AttentionImpl(q, swa_cache, global_cache, swa_slots, global_slots, sinks, partial_out,
++                partial_lse, out, sm_scale, num_splits, has_global, unified_tiles, swa_page_size,
++                swa_page_stride, swa_row_stride, global_page_size, global_page_stride,
++                global_row_stride);
++}
++
++void AttentionWithInvRope(TensorView q, TensorView swa_cache, TensorView global_cache,
++                          TensorView swa_slots, TensorView global_slots, TensorView sinks,
++                          TensorView partial_out, TensorView partial_lse, TensorView out,
++                          double sm_scale, int64_t num_splits, bool has_global, bool unified_tiles,
++                          int64_t swa_page_size, int64_t swa_page_stride, int64_t swa_row_stride,
++                          int64_t global_page_size, int64_t global_page_stride,
++                          int64_t global_row_stride, TensorView positions, TensorView cos_sin,
++                          TensorView grouped_out, int64_t token_offset) {
++  check_tensor(positions, dl_int64, 1, q, "positions");
++  check_tensor(cos_sin, dl_float32, 2, q, "cos_sin");
++  check_tensor(grouped_out, dl_bfloat16, 3, q, "grouped_out");
++  TVM_FFI_ICHECK_EQ(positions.size(0), q.size(0))
++      << "positions must have one entry per query token";
++  TVM_FFI_ICHECK_GT(cos_sin.size(0), 0) << "cos_sin must contain at least one position";
++  TVM_FFI_ICHECK_EQ(cos_sin.size(1), 64) << "cos_sin must have shape [L, 64]";
++  TVM_FFI_ICHECK_GT(grouped_out.size(0), 0) << "grouped_out must contain at least one group";
++  TVM_FFI_ICHECK_EQ(q.size(1) % grouped_out.size(0), 0)
++      << "q heads must divide evenly across grouped_out";
++  const int64_t heads_per_group = q.size(1) / grouped_out.size(0);
++  TVM_FFI_ICHECK_EQ(heads_per_group, 8)
++      << "fused inverse RoPE currently requires eight heads per group";
++  TVM_FFI_ICHECK_EQ(grouped_out.size(2), heads_per_group * kV41Dim)
++      << "grouped_out has an invalid grouped head dimension";
++  TVM_FFI_ICHECK_GE(token_offset, 0) << "token_offset must be non-negative";
++  TVM_FFI_ICHECK_LE(token_offset, grouped_out.size(1))
++      << "token_offset exceeds grouped_out token capacity";
++  TVM_FFI_ICHECK_LE(q.size(0), grouped_out.size(1) - token_offset)
++      << "query tokens exceed grouped_out token capacity";
++
++  check_no_overlap(grouped_out, q, "q");
++  check_no_overlap(grouped_out, swa_cache, "swa_cache");
++  check_no_overlap(grouped_out, global_cache, "global_cache");
++  check_no_overlap(grouped_out, swa_slots, "swa_slots");
++  check_no_overlap(grouped_out, global_slots, "global_slots");
++  check_no_overlap(grouped_out, sinks, "sinks");
++  if (num_splits > 1) {
++    check_no_overlap(grouped_out, partial_out, "partial_out");
++  }
++  check_no_overlap(grouped_out, partial_lse, "partial_lse");
++  check_no_overlap(grouped_out, positions, "positions");
++  check_no_overlap(grouped_out, cos_sin, "cos_sin");
++
++  V41EpilogueParams epilogue{static_cast<const int64_t*>(positions.data_ptr()),
++                             static_cast<const float*>(cos_sin.data_ptr()),
++                             static_cast<bf16*>(grouped_out.data_ptr()),
++                             cos_sin.stride(0),
++                             cos_sin.size(0),
++                             grouped_out.size(1),
++                             token_offset,
++                             static_cast<int>(heads_per_group)};
++  AttentionImpl(q, swa_cache, global_cache, swa_slots, global_slots, sinks, partial_out,
++                partial_lse, out, sm_scale, num_splits, has_global, unified_tiles, swa_page_size,
++                swa_page_stride, swa_row_stride, global_page_size, global_page_stride,
++                global_row_stride, epilogue);
++}
++
++}  // namespace flashinfer::deepseek_v41
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v41_mixed_sparse_attention,
++                              flashinfer::deepseek_v41::Attention);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v41_mixed_sparse_attention_with_inv_rope,
++                              flashinfer::deepseek_v41::AttentionWithInvRope);
+diff --git a/csrc/deepseek_v41_cache.cu b/csrc/deepseek_v41_cache.cu
+new file mode 100644
+--- /dev/null
++++ b/csrc/deepseek_v41_cache.cu
+@@ -0,0 +1,200 @@
++// Copyright (c) 2026 FlashInfer contributors.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++
++#include "tvm_ffi_utils.h"
++
++namespace flashinfer::deepseek_v41 {
++
++constexpr int kDim = 512;
++constexpr int kSwaGroup = 32;
++constexpr int kGlobalGroup = 16;
++constexpr int kSwaRowBytes = 528;
++constexpr int kGlobalRowBytes = 288;
++constexpr float kFp8Max = 448.0f;
++constexpr float kFp4Max = 6.0f;
++
++__device__ __forceinline__ float warp_absmax(float x) {
++#pragma unroll
++  for (int delta = 16; delta > 0; delta >>= 1) {
++    x = fmaxf(x, __shfl_down_sync(0xffffffff, x, delta));
++  }
++  return __shfl_sync(0xffffffff, x, 0);
++}
++
++__device__ __forceinline__ float ceil_pow2(float x) {
++  uint32_t bits = __float_as_uint(x);
++  if (bits & 0x007fffffU) bits = (bits + 0x00800000U) & 0x7f800000U;
++  return __uint_as_float(bits);
++}
++
++__device__ __forceinline__ uint8_t fp8_bits(float x) {
++  __nv_fp8_e4m3 v(x);
++  return v.__x;
++}
++
++// Software E2M1 RNE is used on both Ada and Blackwell.  The alternating
++// strict/non-strict boundaries implement ties-to-even for the representable
++// magnitudes 0, .5, 1, 1.5, 2, 3, 4, and 6.
++__device__ __forceinline__ uint8_t fp4_bits(float x) {
++  const bool negative = signbit(x);
++  const float a = fminf(fabsf(x), kFp4Max);
++  uint8_t code;
++  if (a <= 0.25f)
++    code = 0;
++  else if (a < 0.75f)
++    code = 1;
++  else if (a <= 1.25f)
++    code = 2;
++  else if (a < 1.75f)
++    code = 3;
++  else if (a <= 2.5f)
++    code = 4;
++  else if (a < 3.5f)
++    code = 5;
++  else if (a <= 5.0f)
++    code = 6;
++  else
++    code = 7;
++  return code | (negative ? 0x8 : 0);
++}
++
++template <typename SlotT>
++__global__ void pack_swa_kernel(const __nv_bfloat16* __restrict__ kv,
++                                const SlotT* __restrict__ slots,
++                                uint8_t* __restrict__ cache, int num_tokens,
++                                int64_t kv_stride, int64_t cache_nbytes,
++                                int page_size, int64_t page_stride,
++                                int64_t row_stride) {
++  const int token = blockIdx.x;
++  const int group = blockIdx.y;
++  const int lane = threadIdx.x;
++  if (token >= num_tokens) return;
++  const int64_t slot = static_cast<int64_t>(slots[token]);
++  const int64_t row_offset = (slot / page_size) * page_stride +
++                             (slot % page_size) * row_stride;
++  if (slot < 0 || row_offset < 0 || row_offset + kSwaRowBytes > cache_nbytes) return;
++
++  const int d = group * kSwaGroup + lane;
++  const float x = __bfloat162float(kv[token * kv_stride + d]);
++  const float amax = warp_absmax(fabsf(x));
++  const float scale = ceil_pow2(fmaxf(amax, 1.0e-4f) / kFp8Max);
++  uint8_t* row = cache + row_offset;
++  const float scaled = __fdiv_rn(x, scale);
++  row[d] = fp8_bits(fmaxf(-kFp8Max, fminf(kFp8Max, scaled)));
++  if (lane == 0) row[kDim + group] = (__float_as_uint(scale) >> 23) & 0xff;
++}
++
++template <typename SlotT>
++__global__ void pack_global_kernel(const __nv_bfloat16* __restrict__ kv,
++                                   const SlotT* __restrict__ slots,
++                                   uint8_t* __restrict__ cache, int num_tokens,
++                                   int64_t kv_stride, int64_t cache_nbytes,
++                                   int page_size, int64_t page_stride,
++                                   int64_t row_stride) {
++  const int token = blockIdx.x;
++  const int group = blockIdx.y;
++  const int lane = threadIdx.x;
++  if (token >= num_tokens) return;
++  const int64_t slot = static_cast<int64_t>(slots[token]);
++  const int64_t row_offset = (slot / page_size) * page_stride +
++                             (slot % page_size) * row_stride;
++  if (slot < 0 || row_offset < 0 || row_offset + kGlobalRowBytes > cache_nbytes) return;
++
++  const int d = group * kGlobalGroup + lane;
++  float x = lane < kGlobalGroup
++                ? __bfloat162float(kv[token * kv_stride + d])
++                : 0.0f;
++  const float amax = warp_absmax(fabsf(x));
++  const float raw_scale = fmaxf(amax, kFp4Max * 0x1p-9f) / kFp4Max;
++  const uint8_t scale_bits = fp8_bits(raw_scale);
++  const __nv_fp8_e4m3 scale_fp8 = *reinterpret_cast<const __nv_fp8_e4m3*>(&scale_bits);
++  const float scale = static_cast<float>(scale_fp8);
++  uint8_t* row = cache + row_offset;
++  if (lane < kGlobalGroup / 2) {
++    const int d0 = group * kGlobalGroup + lane * 2;
++    const float x0 = __bfloat162float(kv[token * kv_stride + d0]);
++    const float x1 = __bfloat162float(kv[token * kv_stride + d0 + 1]);
++    row[d0 / 2] = fp4_bits(__fdiv_rn(x0, scale)) |
++                  (fp4_bits(__fdiv_rn(x1, scale)) << 4);
++  }
++  if (lane == 0) row[kDim / 2 + group] = scale_bits;
++}
++
++template <typename SlotT>
++void launch_swa(TensorView kv, TensorView slots, TensorView cache, int page_size,
++                int64_t page_stride, int64_t row_stride, cudaStream_t stream) {
++  pack_swa_kernel<<<dim3(slots.size(0), kDim / kSwaGroup), 32, 0, stream>>>(
++      static_cast<const __nv_bfloat16*>(kv.data_ptr()),
++      static_cast<const SlotT*>(slots.data_ptr()), static_cast<uint8_t*>(cache.data_ptr()),
++      static_cast<int>(slots.size(0)), kv.stride(0), cache.numel(), page_size,
++      page_stride, row_stride);
++}
++
++template <typename SlotT>
++void launch_global(TensorView kv, TensorView slots, TensorView cache, int page_size,
++                   int64_t page_stride, int64_t row_stride, cudaStream_t stream) {
++  pack_global_kernel<<<dim3(slots.size(0), kDim / kGlobalGroup), 32, 0, stream>>>(
++      static_cast<const __nv_bfloat16*>(kv.data_ptr()),
++      static_cast<const SlotT*>(slots.data_ptr()), static_cast<uint8_t*>(cache.data_ptr()),
++      static_cast<int>(slots.size(0)), kv.stride(0), cache.numel(), page_size,
++      page_stride, row_stride);
++}
++
++template <bool Global>
++void pack_cache(TensorView kv, TensorView slots, TensorView cache, int64_t page_size,
++                int64_t page_stride, int64_t row_stride) {
++  CHECK_CUDA(kv);
++  CHECK_CUDA(slots);
++  CHECK_CUDA(cache);
++  CHECK_DEVICE(kv, slots);
++  CHECK_DEVICE(kv, cache);
++  TVM_FFI_ICHECK_EQ(kv.dtype(), dl_bfloat16) << "kv must be bfloat16";
++  TVM_FFI_ICHECK(slots.dtype() == dl_int32 || slots.dtype() == dl_int64)
++      << "slots must be int32 or int64";
++  TVM_FFI_ICHECK_EQ(cache.dtype(), dl_uint8) << "cache must be uint8";
++  TVM_FFI_ICHECK_EQ(kv.ndim(), 2) << "kv must be [T, 512]";
++  TVM_FFI_ICHECK_EQ(kv.size(1), kDim) << "kv must be [T, 512]";
++  TVM_FFI_ICHECK_EQ(kv.stride(1), 1) << "kv inner dimension must be contiguous";
++  TVM_FFI_ICHECK_EQ(slots.ndim(), 1) << "slots must be [T]";
++  TVM_FFI_ICHECK_LE(slots.size(0), kv.size(0));
++  constexpr int kPayload = Global ? kGlobalRowBytes : kSwaRowBytes;
++  TVM_FFI_ICHECK_GT(page_size, 0);
++  TVM_FFI_ICHECK_GE(row_stride, kPayload);
++  TVM_FFI_ICHECK_GE(page_stride, page_size * row_stride);
++  if (slots.size(0) == 0) return;
++  ffi::CUDADeviceGuard guard(kv.device().device_id);
++  const cudaStream_t stream = get_stream(kv.device());
++  if (slots.dtype() == dl_int32) {
++    if constexpr (Global)
++      launch_global<int32_t>(kv, slots, cache, page_size, page_stride, row_stride, stream);
++    else
++      launch_swa<int32_t>(kv, slots, cache, page_size, page_stride, row_stride, stream);
++  } else {
++    if constexpr (Global)
++      launch_global<int64_t>(kv, slots, cache, page_size, page_stride, row_stride, stream);
++    else
++      launch_swa<int64_t>(kv, slots, cache, page_size, page_stride, row_stride, stream);
++  }
++  TVM_FFI_ICHECK_EQ(cudaPeekAtLastError(), cudaSuccess) << "DeepSeek-V4.1 cache pack failed";
++}
++
++void PackSwa(TensorView kv, TensorView slots, TensorView cache, int64_t page_size,
++             int64_t page_stride, int64_t row_stride) {
++  pack_cache<false>(kv, slots, cache, page_size, page_stride, row_stride);
++}
++
++void PackGlobal(TensorView kv, TensorView slots, TensorView cache, int64_t page_size,
++                int64_t page_stride, int64_t row_stride) {
++  pack_cache<true>(kv, slots, cache, page_size, page_stride, row_stride);
++}
++
++}  // namespace flashinfer::deepseek_v41
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v41_pack_swa_cache,
++                              flashinfer::deepseek_v41::PackSwa);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v41_pack_global_cache,
++                              flashinfer::deepseek_v41::PackGlobal);
+diff --git a/flashinfer/jit/deepseek_v41_sparse.py b/flashinfer/jit/deepseek_v41_sparse.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/jit/deepseek_v41_sparse.py
+@@ -0,0 +1,34 @@
++"""JIT builders for DeepSeek-V4.1 mixed sparse kernels."""
++
++from . import env as jit_env
++from .core import JitSpec, current_compilation_context, gen_jit_spec
++
++
++def _deepseek_v41_arch_flags() -> list[str]:
++    archs = []
++    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
++        normalized_minor = str(minor).lower().removesuffix("a").removesuffix("f")
++        if (major, normalized_minor) in ((8, "9"), (12, "0")):
++            archs.append((major, minor))
++    if not archs:
++        raise RuntimeError("DeepSeek-V4.1 sparse kernels require SM89 or SM120")
++    return [
++        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
++        for major, minor in archs
++    ] + current_compilation_context.COMMON_NVCC_FLAGS
++
++
++def gen_deepseek_v41_cache_module() -> JitSpec:
++    return gen_jit_spec(
++        "deepseek_v41_mixed_sparse_cache_v1",
++        [jit_env.FLASHINFER_CSRC_DIR / "deepseek_v41_cache.cu"],
++        extra_cuda_cflags=_deepseek_v41_arch_flags(),
++    )
++
++
++def gen_deepseek_v41_attention_module() -> JitSpec:
++    return gen_jit_spec(
++        "deepseek_v41_mixed_sparse_attention_cuda_v1",
++        [jit_env.FLASHINFER_CSRC_DIR / "deepseek_v41_attention.cu"],
++        extra_cuda_cflags=_deepseek_v41_arch_flags(),
++    )
+diff --git a/flashinfer/mla/_deepseek_v41_sparse_triton.py b/flashinfer/mla/_deepseek_v41_sparse_triton.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/mla/_deepseek_v41_sparse_triton.py
+@@ -0,0 +1,571 @@
++# Copyright (c) 2026 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Triton kernels for native DeepSeek-V4.1 mixed sparse attention."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++from triton.backends.compiler import GPUTarget
++from triton.compiler import ASTSource
++
++HEAD_DIM = 512
++HEAD_TILE = 16
++BLOCK_KV = 32
++SWA_PAYLOAD_BYTES = 528
++GLOBAL_PAYLOAD_BYTES = 288
++LOG2E = 1.4426950408889634
++
++_TL_HEAD_DIM = tl.constexpr(HEAD_DIM)
++_TL_HEAD_TILE = tl.constexpr(HEAD_TILE)
++_TL_SWA_PAYLOAD_BYTES = tl.constexpr(SWA_PAYLOAD_BYTES)
++_TL_GLOBAL_PAYLOAD_BYTES = tl.constexpr(GLOBAL_PAYLOAD_BYTES)
++_TL_LOG2E = tl.constexpr(LOG2E)
++
++
++@triton.jit
++def _decode_e2m1_bits(code):
++    code = code.to(tl.uint32)
++    magnitude = code & 0x7
++    normalized = (((magnitude >> 1) + 126) << 23) | ((magnitude & 1) << 22)
++    magnitude_bits = tl.where(
++        magnitude == 0,
++        0,
++        tl.where(magnitude == 1, 0x3F000000, normalized),
++    )
++    bits = magnitude_bits | ((code & 0x8) << 28)
++    return bits.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _load_swa_tile(
++    cache,
++    slots,
++    slot_mask,
++    cache_nbytes,
++    page_stride,
++    row_stride,
++    PAGE_SIZE: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    slot_limit = (cache_nbytes - _TL_SWA_PAYLOAD_BYTES) // row_stride + 1
++    slot_mask = slot_mask & (slots >= 0) & (slots < slot_limit)
++    safe_slots = tl.where(slot_mask, slots, 0)
++    row_offsets = (safe_slots // PAGE_SIZE) * page_stride + (
++        safe_slots % PAGE_SIZE
++    ) * row_stride
++    valid = slot_mask & (row_offsets + _TL_SWA_PAYLOAD_BYTES <= cache_nbytes)
++
++    dims = tl.arange(0, _TL_HEAD_DIM)
++    raw = tl.load(
++        cache + row_offsets[:, None] + dims[None, :],
++        mask=valid[:, None],
++        other=0,
++    )
++    values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    groups = tl.arange(0, _TL_HEAD_DIM // 32)
++    scale_raw = tl.load(
++        cache + row_offsets[:, None] + _TL_HEAD_DIM + groups[None, :],
++        mask=valid[:, None],
++        other=0,
++    )
++    scales = (scale_raw.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
++    values = tl.reshape(values, (BLOCK_N, _TL_HEAD_DIM // 32, 32))
++    values *= scales[:, :, None]
++    return tl.reshape(values, (BLOCK_N, _TL_HEAD_DIM)).to(tl.bfloat16), valid
++
++
++@triton.jit
++def _load_global_tile(
++    cache,
++    slots,
++    slot_mask,
++    cache_nbytes,
++    page_stride,
++    row_stride,
++    PAGE_SIZE: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    slot_limit = (cache_nbytes - _TL_GLOBAL_PAYLOAD_BYTES) // row_stride + 1
++    slot_mask = slot_mask & (slots >= 0) & (slots < slot_limit)
++    safe_slots = tl.where(slot_mask, slots, 0)
++    row_offsets = (safe_slots // PAGE_SIZE) * page_stride + (
++        safe_slots % PAGE_SIZE
++    ) * row_stride
++    valid = slot_mask & (row_offsets + _TL_GLOBAL_PAYLOAD_BYTES <= cache_nbytes)
++
++    packed_dims = tl.arange(0, _TL_HEAD_DIM // 2)
++    packed = tl.load(
++        cache + row_offsets[:, None] + packed_dims[None, :],
++        mask=valid[:, None],
++        other=0,
++    ).to(tl.int32)
++    values = tl.interleave(
++        _decode_e2m1_bits(packed & 0xF),
++        _decode_e2m1_bits(packed >> 4),
++    )
++    groups = tl.arange(0, _TL_HEAD_DIM // 16)
++    scale_raw = tl.load(
++        cache + row_offsets[:, None] + _TL_HEAD_DIM // 2 + groups[None, :],
++        mask=valid[:, None],
++        other=0,
++    )
++    scales = scale_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    values = tl.reshape(values, (BLOCK_N, _TL_HEAD_DIM // 16, 16))
++    values *= scales[:, :, None]
++    return tl.reshape(values, (BLOCK_N, _TL_HEAD_DIM)).to(tl.bfloat16), valid
++
++
++@triton.jit
++def _online_step(q, kv, valid, head_mask, m_i, l_i, acc, sm_scale):
++    scores = tl.dot(q, tl.trans(kv), out_dtype=tl.float32) * sm_scale
++    score_mask = head_mask[:, None] & valid[None, :]
++    scores = tl.where(score_mask, scores, -float("inf"))
++    tile_has_values = tl.sum(valid.to(tl.int32), axis=0) > 0
++    tile_max = tl.max(scores, axis=1)
++    update_mask = head_mask & tile_has_values
++    m_next = tl.where(update_mask, tl.maximum(m_i, tile_max), m_i)
++    alpha_delta = tl.where(update_mask, m_i - m_next, 0.0)
++    alpha = tl.exp2(alpha_delta * _TL_LOG2E)
++    score_delta = tl.where(score_mask, scores - m_next[:, None], 0.0)
++    p = tl.exp2(score_delta * _TL_LOG2E)
++    p = tl.where(score_mask, p, 0.0)
++    acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv, out_dtype=tl.float32)
++    l_i = l_i * alpha + tl.sum(p, axis=1)
++    return m_next, l_i, acc
++
++
++@triton.jit(do_not_specialize=["swa_topk", "global_topk"])
++def deepseek_v41_mixed_sparse_main_kernel(
++    q,
++    swa_cache,
++    global_cache,
++    swa_slots,
++    global_slots,
++    sinks,
++    partial_out,
++    partial_lse,
++    swa_nbytes,
++    global_nbytes,
++    swa_topk,
++    global_topk,
++    sm_scale,
++    q_stride_token,
++    q_stride_head,
++    swa_slots_stride_token,
++    global_slots_stride_token,
++    swa_page_stride,
++    swa_row_stride,
++    global_page_stride,
++    global_row_stride,
++    partial_out_stride_token,
++    partial_out_stride_split,
++    partial_out_stride_head,
++    partial_lse_stride_token,
++    partial_lse_stride_split,
++    partial_lse_stride_head,
++    NUM_HEADS: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++    HAS_GLOBAL: tl.constexpr,
++    UNIFIED_TILES: tl.constexpr,
++    SWA_PAGE_SIZE: tl.constexpr,
++    GLOBAL_PAGE_SIZE: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    head_block = tl.program_id(1).to(tl.int64)
++    split = tl.program_id(2).to(tl.int64)
++
++    heads = head_block * _TL_HEAD_TILE + tl.arange(0, _TL_HEAD_TILE)
++    dims = tl.arange(0, _TL_HEAD_DIM)
++    head_mask = heads < NUM_HEADS
++    q_tile = tl.load(
++        q + token * q_stride_token + heads[:, None] * q_stride_head + dims[None, :],
++        mask=head_mask[:, None],
++        other=0,
++    )
++
++    m_i = tl.full((_TL_HEAD_TILE,), -float("inf"), tl.float32)
++    l_i = tl.zeros((_TL_HEAD_TILE,), tl.float32)
++    acc = tl.zeros((_TL_HEAD_TILE, _TL_HEAD_DIM), tl.float32)
++    offsets = tl.arange(0, BLOCK_N)
++
++    swa_tiles = tl.cdiv(swa_topk, BLOCK_N)
++    global_tiles = tl.cdiv(global_topk, BLOCK_N)
++    if UNIFIED_TILES:
++        tile = split
++        if tile < swa_tiles:
++            slot_offsets = tile * BLOCK_N + offsets
++            slot_mask = slot_offsets < swa_topk
++            slots = tl.load(
++                swa_slots + token * swa_slots_stride_token + slot_offsets,
++                mask=slot_mask,
++                other=-1,
++            ).to(tl.int64)
++            kv, valid = _load_swa_tile(
++                swa_cache,
++                slots,
++                slot_mask,
++                swa_nbytes,
++                swa_page_stride,
++                swa_row_stride,
++                SWA_PAGE_SIZE,
++                BLOCK_N,
++            )
++            m_i, l_i, acc = _online_step(
++                q_tile, kv, valid, head_mask, m_i, l_i, acc, sm_scale
++            )
++        elif HAS_GLOBAL and tile < swa_tiles + global_tiles:
++            global_tile = tile - swa_tiles
++            slot_offsets = global_tile * BLOCK_N + offsets
++            slot_mask = slot_offsets < global_topk
++            slots = tl.load(
++                global_slots + token * global_slots_stride_token + slot_offsets,
++                mask=slot_mask,
++                other=-1,
++            ).to(tl.int64)
++            kv, valid = _load_global_tile(
++                global_cache,
++                slots,
++                slot_mask,
++                global_nbytes,
++                global_page_stride,
++                global_row_stride,
++                GLOBAL_PAGE_SIZE,
++                BLOCK_N,
++            )
++            m_i, l_i, acc = _online_step(
++                q_tile, kv, valid, head_mask, m_i, l_i, acc, sm_scale
++            )
++    else:
++        for tile_iter in tl.range(0, tl.cdiv(swa_tiles, NUM_SPLITS), num_stages=2):
++            tile = tile_iter * NUM_SPLITS + split
++            slot_offsets = tile * BLOCK_N + offsets
++            slot_mask = slot_offsets < swa_topk
++            slots = tl.load(
++                swa_slots + token * swa_slots_stride_token + slot_offsets,
++                mask=slot_mask,
++                other=-1,
++            ).to(tl.int64)
++            kv, valid = _load_swa_tile(
++                swa_cache,
++                slots,
++                slot_mask,
++                swa_nbytes,
++                swa_page_stride,
++                swa_row_stride,
++                SWA_PAGE_SIZE,
++                BLOCK_N,
++            )
++            m_i, l_i, acc = _online_step(
++                q_tile, kv, valid, head_mask, m_i, l_i, acc, sm_scale
++            )
++
++        if HAS_GLOBAL:
++            for tile_iter in tl.range(
++                0, tl.cdiv(global_tiles, NUM_SPLITS), num_stages=2
++            ):
++                tile = tile_iter * NUM_SPLITS + split
++                slot_offsets = tile * BLOCK_N + offsets
++                slot_mask = slot_offsets < global_topk
++                slots = tl.load(
++                    global_slots + token * global_slots_stride_token + slot_offsets,
++                    mask=slot_mask,
++                    other=-1,
++                ).to(tl.int64)
++                kv, valid = _load_global_tile(
++                    global_cache,
++                    slots,
++                    slot_mask,
++                    global_nbytes,
++                    global_page_stride,
++                    global_row_stride,
++                    GLOBAL_PAGE_SIZE,
++                    BLOCK_N,
++                )
++                m_i, l_i, acc = _online_step(
++                    q_tile, kv, valid, head_mask, m_i, l_i, acc, sm_scale
++                )
++
++    if split == 0:
++        sink = tl.load(sinks + heads, mask=head_mask, other=-float("inf"))
++        has_sink = sink > -float("inf")
++        m_next = tl.where(has_sink, tl.maximum(m_i, sink), m_i)
++        alpha_delta = tl.where(has_sink, m_i - m_next, 0.0)
++        sink_delta = tl.where(has_sink, sink - m_next, 0.0)
++        alpha = tl.exp2(alpha_delta * _TL_LOG2E)
++        sink_p = tl.where(has_sink, tl.exp2(sink_delta * _TL_LOG2E), 0.0)
++        acc *= alpha[:, None]
++        l_i = l_i * alpha + sink_p
++        m_i = m_next
++
++    safe_l = tl.where(l_i > 0, l_i, 1.0)
++    normalized = tl.where(l_i[:, None] > 0, acc / safe_l[:, None], 0.0)
++    out_offsets = (
++        token * partial_out_stride_token
++        + split * partial_out_stride_split
++        + heads[:, None] * partial_out_stride_head
++        + dims[None, :]
++    )
++    tl.store(partial_out + out_offsets, normalized, mask=head_mask[:, None])
++    lse = tl.where(l_i > 0, m_i + tl.log(l_i), -float("inf"))
++    lse_offsets = (
++        token * partial_lse_stride_token
++        + split * partial_lse_stride_split
++        + heads * partial_lse_stride_head
++    )
++    tl.store(partial_lse + lse_offsets, lse, mask=head_mask)
++
++
++@triton.jit
++def deepseek_v41_mixed_sparse_merge_kernel(
++    partial_out,
++    partial_lse,
++    out,
++    partial_out_stride_token,
++    partial_out_stride_split,
++    partial_out_stride_head,
++    partial_lse_stride_token,
++    partial_lse_stride_split,
++    partial_lse_stride_head,
++    out_stride_token,
++    out_stride_head,
++    NUM_SPLITS: tl.constexpr,
++    SPLIT_BLOCK: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    head = tl.program_id(1).to(tl.int64)
++    splits = tl.arange(0, SPLIT_BLOCK)
++    split_mask = splits < NUM_SPLITS
++    dims = tl.arange(0, _TL_HEAD_DIM)
++    lse = tl.load(
++        partial_lse
++        + token * partial_lse_stride_token
++        + splits * partial_lse_stride_split
++        + head * partial_lse_stride_head,
++        mask=split_mask,
++        other=-float("inf"),
++    )
++    max_lse = tl.max(lse, axis=0)
++    has_values = max_lse > -float("inf")
++    safe_max = tl.where(has_values, max_lse, 0.0)
++    weights = tl.where(has_values, tl.exp2((lse - safe_max) * _TL_LOG2E), 0.0)
++    denominator = tl.sum(weights, axis=0)
++    partial = tl.load(
++        partial_out
++        + token * partial_out_stride_token
++        + splits[:, None] * partial_out_stride_split
++        + head * partial_out_stride_head
++        + dims[None, :],
++        mask=split_mask[:, None],
++        other=0.0,
++    ).to(tl.float32)
++    numerator = tl.sum(partial * weights[:, None], axis=0)
++    safe_denominator = tl.where(denominator > 0, denominator, 1.0)
++    result = tl.where(denominator > 0, numerator / safe_denominator, 0.0)
++    tl.store(out + token * out_stride_token + head * out_stride_head + dims, result)
++
++
++def launch_deepseek_v41_mixed_sparse(
++    q: torch.Tensor,
++    swa_storage: torch.Tensor,
++    global_storage: torch.Tensor,
++    swa_slots: torch.Tensor,
++    global_slots: torch.Tensor,
++    sinks: torch.Tensor,
++    partial_out: torch.Tensor,
++    partial_lse: torch.Tensor,
++    out: torch.Tensor,
++    sm_scale: float,
++    *,
++    num_splits: int,
++    has_global: bool,
++    unified_tiles: bool,
++    swa_page_size: int,
++    swa_page_stride: int,
++    swa_row_stride: int,
++    global_page_size: int,
++    global_page_stride: int,
++    global_row_stride: int,
++    _block_n: int = BLOCK_KV,
++    _num_warps: int = 8,
++    _pipeline_stages: int = 2,
++) -> None:
++    grid = (q.shape[0], triton.cdiv(q.shape[1], HEAD_TILE), num_splits)
++    deepseek_v41_mixed_sparse_main_kernel[grid](
++        q,
++        swa_storage,
++        global_storage,
++        swa_slots,
++        global_slots,
++        sinks,
++        partial_out,
++        partial_lse,
++        swa_storage.numel(),
++        global_storage.numel(),
++        swa_slots.shape[1],
++        global_slots.shape[1],
++        sm_scale,
++        q.stride(0),
++        q.stride(1),
++        swa_slots.stride(0),
++        global_slots.stride(0),
++        swa_page_stride,
++        swa_row_stride,
++        global_page_stride,
++        global_row_stride,
++        partial_out.stride(0),
++        partial_out.stride(1),
++        partial_out.stride(2),
++        partial_lse.stride(0),
++        partial_lse.stride(1),
++        partial_lse.stride(2),
++        NUM_HEADS=q.shape[1],
++        NUM_SPLITS=num_splits,
++        HAS_GLOBAL=has_global,
++        UNIFIED_TILES=unified_tiles,
++        SWA_PAGE_SIZE=swa_page_size,
++        GLOBAL_PAGE_SIZE=global_page_size,
++        BLOCK_N=_block_n,
++        num_warps=_num_warps,
++        num_stages=_pipeline_stages,
++    )
++    if num_splits > 1:
++        deepseek_v41_mixed_sparse_merge_kernel[(q.shape[0], q.shape[1])](
++            partial_out,
++            partial_lse,
++            out,
++            partial_out.stride(0),
++            partial_out.stride(1),
++            partial_out.stride(2),
++            partial_lse.stride(0),
++            partial_lse.stride(1),
++            partial_lse.stride(2),
++            out.stride(0),
++            out.stride(1),
++            NUM_SPLITS=num_splits,
++            SPLIT_BLOCK=triton.next_power_of_2(num_splits),
++            num_warps=4,
++        )
++
++
++def _main_ast(
++    num_heads: int,
++    num_splits: int,
++    has_global: bool,
++    global_page_size: int,
++    unified_tiles: bool = False,
++    block_n: int = BLOCK_KV,
++) -> ASTSource:
++    pointer_types = {
++        "q": "*bf16",
++        "swa_cache": "*u8",
++        "global_cache": "*u8",
++        "swa_slots": "*i32",
++        "global_slots": "*i64",
++        "sinks": "*fp32",
++        "partial_out": "*bf16",
++        "partial_lse": "*fp32",
++    }
++    constexprs = {
++        "NUM_HEADS": num_heads,
++        "NUM_SPLITS": num_splits,
++        "HAS_GLOBAL": has_global,
++        "UNIFIED_TILES": unified_tiles,
++        "SWA_PAGE_SIZE": 32,
++        "GLOBAL_PAGE_SIZE": global_page_size,
++        "BLOCK_N": block_n,
++    }
++    signature = {}
++    for name in deepseek_v41_mixed_sparse_main_kernel.arg_names:
++        if name in constexprs:
++            continue
++        if name in pointer_types:
++            signature[name] = pointer_types[name]
++        elif name in ("swa_topk", "global_topk"):
++            signature[name] = "i32"
++        elif name == "sm_scale":
++            signature[name] = "fp32"
++        else:
++            signature[name] = "i64"
++    return ASTSource(deepseek_v41_mixed_sparse_main_kernel, signature, constexprs)
++
++
++def _merge_ast(num_splits: int) -> ASTSource:
++    pointer_types = {
++        "partial_out": "*bf16",
++        "partial_lse": "*fp32",
++        "out": "*bf16",
++    }
++    constexprs = {
++        "NUM_SPLITS": num_splits,
++        "SPLIT_BLOCK": triton.next_power_of_2(num_splits),
++    }
++    signature = {
++        name: pointer_types.get(name, "i64")
++        for name in deepseek_v41_mixed_sparse_merge_kernel.arg_names
++        if name not in constexprs
++    }
++    return ASTSource(deepseek_v41_mixed_sparse_merge_kernel, signature, constexprs)
++
++
++def compile_deepseek_v41_mixed_sparse_ptx(
++    arch: int,
++    num_heads: int,
++    num_splits: int,
++    has_global: bool,
++    global_page_size: int,
++    unified_tiles: bool = False,
++    *,
++    block_n: int = BLOCK_KV,
++    num_warps: int = 8,
++    pipeline_stages: int = 2,
++) -> tuple[str, int]:
++    """Offline compile one main-kernel specialization for source auditing."""
++    compiled = triton.compile(
++        _main_ast(
++            num_heads,
++            num_splits,
++            has_global,
++            global_page_size,
++            unified_tiles,
++            block_n,
++        ),
++        target=GPUTarget("cuda", arch, 32),
++        options={"num_warps": num_warps, "num_stages": pipeline_stages},
++    )
++    return compiled.asm["ptx"], compiled.metadata.shared
++
++
++def compile_deepseek_v41_mixed_sparse_merge_ptx(
++    arch: int, num_splits: int
++) -> tuple[str, int]:
++    """Offline compile one merge specialization for source auditing."""
++    compiled = triton.compile(
++        _merge_ast(num_splits),
++        target=GPUTarget("cuda", arch, 32),
++        options={"num_warps": 4, "num_stages": 2},
++    )
++    return compiled.asm["ptx"], compiled.metadata.shared
++
++
++__all__ = [
++    "compile_deepseek_v41_mixed_sparse_merge_ptx",
++    "compile_deepseek_v41_mixed_sparse_ptx",
++    "deepseek_v41_mixed_sparse_main_kernel",
++    "deepseek_v41_mixed_sparse_merge_kernel",
++    "launch_deepseek_v41_mixed_sparse",
++]
+diff --git a/flashinfer/mla/deepseek_v41.py b/flashinfer/mla/deepseek_v41.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/mla/deepseek_v41.py
+@@ -0,0 +1,884 @@
++"""Native mixed sparse MLA for DeepSeek-V4.1 Flash."""
++
++from __future__ import annotations
++
++import functools
++from dataclasses import dataclass
++
++import torch
++
++from ..api_logging import flashinfer_api
++from ..trace.templates.deepseek_v41 import deepseek_v41_mixed_sparse_trace
++from ..utils import register_custom_op, register_fake_op
++
++DEEPSEEK_V41_SWA_FORMAT = "fp8_e4m3_ue8m0_g32"
++DEEPSEEK_V41_GLOBAL_FORMAT = "fp4_e2m1_e4m3_g16"
++DEEPSEEK_V41_SWA_ROW_BYTES = 528
++DEEPSEEK_V41_GLOBAL_ROW_BYTES = 288
++DEEPSEEK_V41_SWA_PAGE_SIZE = 32
++
++_D_HEAD = 512
++_CANDIDATE_TILE = 32
++_UNIFIED_CANDIDATE_TILE = 16
++_MAX_DECODE_SPLITS = 16
++
++
++@dataclass(frozen=True)
++class _PagedByteLayout:
++    storage: torch.Tensor
++    page_size: int
++    page_stride: int
++    row_stride: int
++
++
++@dataclass(frozen=True)
++class _InverseRopeOutput:
++    positions: torch.Tensor
++    cos_sin: torch.Tensor
++    grouped_out: torch.Tensor
++    token_offset: int
++
++
++def _storage_view(cache: torch.Tensor, span_bytes: int) -> torch.Tensor:
++    storage_bytes = cache.untyped_storage().nbytes()
++    offset_bytes = cache.storage_offset() * cache.element_size()
++    available_bytes = storage_bytes - offset_bytes
++    if span_bytes < 0 or span_bytes > available_bytes:
++        raise ValueError("cache layout exceeds its backing storage")
++    return cache.as_strided((span_bytes,), (1,), cache.storage_offset())
++
++
++def _paged_layout(
++    cache: torch.Tensor,
++    *,
++    payload_bytes: int,
++    expected_page_sizes: tuple[int, ...],
++    page_size: int | None,
++    page_stride_bytes: int | None,
++    row_stride_bytes: int | None,
++    name: str,
++) -> _PagedByteLayout:
++    if cache.dtype != torch.uint8 or not cache.is_cuda:
++        raise ValueError(f"{name} must be a CUDA uint8 tensor")
++    if cache.storage_offset() < 0:
++        raise ValueError(f"{name} has an invalid storage offset")
++    if cache.ndim == 3:
++        if cache.shape[0] == 0 or cache.shape[1] == 0:
++            raise ValueError(f"{name} must contain at least one cache row")
++        inferred_page_size = int(cache.shape[1])
++        inferred_row_stride = int(cache.stride(1))
++        inferred_page_stride = int(cache.stride(0))
++        if cache.stride(2) != 1 or cache.shape[2] < payload_bytes:
++            raise ValueError(
++                f"{name} must have contiguous byte rows at least "
++                f"{payload_bytes} bytes wide"
++            )
++    elif cache.ndim == 2:
++        if cache.shape[0] == 0:
++            raise ValueError(f"{name} must contain at least one cache row")
++        if cache.stride(1) != 1 or cache.shape[1] < payload_bytes:
++            raise ValueError(
++                f"{name} must be [rows, row_bytes>={payload_bytes}] with "
++                "contiguous rows"
++            )
++        inferred_page_size = expected_page_sizes[0] if page_size is None else page_size
++        inferred_row_stride = int(cache.stride(0))
++        inferred_page_stride = inferred_page_size * inferred_row_stride
++    elif cache.ndim == 1:
++        if cache.stride(0) != 1:
++            raise ValueError(f"1-D {name} storage must be contiguous")
++        if page_size is None or page_stride_bytes is None or row_stride_bytes is None:
++            raise ValueError(
++                f"1-D {name} requires page_size, page_stride_bytes, and "
++                "row_stride_bytes"
++            )
++        inferred_page_size = page_size
++        inferred_page_stride = page_stride_bytes
++        inferred_row_stride = row_stride_bytes
++    else:
++        raise ValueError(
++            f"{name} must be 1-D storage, 2-D flat rows, or 3-D paged rows"
++        )
++
++    resolved_page_size = inferred_page_size if page_size is None else page_size
++    resolved_row_stride = (
++        inferred_row_stride if row_stride_bytes is None else row_stride_bytes
++    )
++    resolved_page_stride = (
++        inferred_page_stride if page_stride_bytes is None else page_stride_bytes
++    )
++    if resolved_page_size not in expected_page_sizes:
++        raise ValueError(
++            f"{name} page_size must be one of {expected_page_sizes}, got "
++            f"{resolved_page_size}"
++        )
++    if cache.ndim == 3 and resolved_page_size != cache.shape[1]:
++        raise ValueError(f"{name} page_size does not match cache.shape[1]")
++    if cache.ndim == 3 and (
++        resolved_page_stride != inferred_page_stride
++        or resolved_row_stride != inferred_row_stride
++    ):
++        raise ValueError(f"{name} stride arguments do not match its tensor strides")
++    if cache.ndim == 2 and (
++        resolved_row_stride != inferred_row_stride
++        or resolved_page_stride != resolved_page_size * resolved_row_stride
++    ):
++        raise ValueError(f"2-D {name} must use a compact paged layout")
++    if resolved_row_stride < payload_bytes:
++        raise ValueError(
++            f"{name} row stride is smaller than its {payload_bytes}B payload"
++        )
++    if resolved_page_stride < resolved_page_size * resolved_row_stride:
++        raise ValueError(f"{name} page stride overlaps rows within a page")
++    if cache.ndim == 3:
++        last_slot = int(cache.shape[0]) * resolved_page_size - 1
++    elif cache.ndim == 2:
++        last_slot = int(cache.shape[0]) - 1
++    else:
++        last_slot = -1
++    if last_slot >= 0:
++        logical_span = (
++            (last_slot // resolved_page_size) * resolved_page_stride
++            + (last_slot % resolved_page_size) * resolved_row_stride
++            + payload_bytes
++        )
++    else:
++        logical_span = cache.numel()
++    return _PagedByteLayout(
++        _storage_view(cache, int(logical_span)),
++        int(resolved_page_size),
++        int(resolved_page_stride),
++        int(resolved_row_stride),
++    )
++
++
++def _check_slots(slots: torch.Tensor, q: torch.Tensor, name: str) -> None:
++    if not slots.is_cuda or slots.device != q.device:
++        raise ValueError(f"{name} must be a CUDA tensor on q.device")
++    if slots.dtype not in (torch.int32, torch.int64):
++        raise ValueError(f"{name} must be int32 or int64")
++    if slots.ndim != 2 or slots.shape[0] != q.shape[0]:
++        raise ValueError(f"{name} must have shape [q.shape[0], K]")
++    if not slots.is_contiguous():
++        raise ValueError(f"{name} must be contiguous")
++
++
++def _attention_num_splits(
++    num_tokens: int, num_heads: int, swa_topk: int, global_topk: int
++) -> int:
++    if _attention_uses_unified_tiles(num_tokens, num_heads, swa_topk, global_topk):
++        return (swa_topk + _UNIFIED_CANDIDATE_TILE - 1) // _UNIFIED_CANDIDATE_TILE + (
++            global_topk + _UNIFIED_CANDIDATE_TILE - 1
++        ) // _UNIFIED_CANDIDATE_TILE
++    if num_tokens > 32:
++        return 1
++    swa_tiles = (swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
++    global_tiles = (global_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
++    candidate_splits = min(_MAX_DECODE_SPLITS, max(1, swa_tiles, global_tiles))
++    head_tiles = (num_heads + 15) // 16
++    occupancy_splits = (128 + num_tokens * head_tiles - 1) // (num_tokens * head_tiles)
++    return min(candidate_splits, max(1, occupancy_splits))
++
++
++def _attention_uses_unified_tiles(
++    num_tokens: int, num_heads: int, swa_topk: int, global_topk: int
++) -> bool:
++    total_tiles = (swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE + (
++        global_topk + _CANDIDATE_TILE - 1
++    ) // _CANDIDATE_TILE
++    return num_tokens == 1 and num_heads == 8 and global_topk > 0 and total_tiles <= 32
++
++
++def deepseek_v41_mixed_sparse_workspace_size(
++    num_tokens: int,
++    num_heads: int,
++    swa_topk: int,
++    global_topk: int = 0,
++) -> int:
++    """Return workspace bytes for the native attention launch."""
++    if num_tokens < 0 or swa_topk < 0 or global_topk < 0:
++        raise ValueError("token and candidate counts must be non-negative")
++    if num_heads not in (8, 16, 32):
++        raise ValueError("num_heads must be one of {8,16,32}")
++    if num_tokens == 0:
++        return 0
++    num_splits = _attention_num_splits(num_tokens, num_heads, swa_topk, global_topk)
++    lse_bytes = num_tokens * num_splits * num_heads * 4
++    if num_splits == 1:
++        return lse_bytes
++    partial_bytes = num_tokens * num_splits * num_heads * _D_HEAD * 2
++    return partial_bytes + lse_bytes
++
++
++def deepseek_v41_mixed_sparse_workspace_size_upper_bound(
++    max_num_tokens: int,
++    num_heads: int,
++    min_swa_topk: int,
++    max_swa_topk: int,
++    global_topk: int = 0,
++) -> int:
++    """Return bytes sufficient for every supported shape in the given range."""
++    if min_swa_topk < 0 or min_swa_topk > max_swa_topk:
++        raise ValueError("SWA candidate bounds must satisfy 0 <= min <= max")
++    if max_num_tokens < 0 or global_topk < 0:
++        raise ValueError("token and candidate counts must be non-negative")
++    if num_heads not in (8, 16, 32):
++        raise ValueError("num_heads must be one of {8,16,32}")
++    if max_num_tokens == 0:
++        return 0
++
++    token_counts = range(1, min(max_num_tokens, 32) + 1)
++    if max_num_tokens > 32:
++        token_counts = (*token_counts, max_num_tokens)
++    min_tiles = (min_swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
++    max_tiles = (max_swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
++    swa_topks = {min_swa_topk, max_swa_topk}
++    for num_tiles in range(min_tiles, min(max_tiles, 32) + 1):
++        representative = 0 if num_tiles == 0 else (num_tiles - 1) * _CANDIDATE_TILE + 1
++        if min_swa_topk <= representative <= max_swa_topk:
++            swa_topks.add(representative)
++    if num_heads == 8 and global_topk > 0:
++        global_tiles = (global_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
++        max_unified_swa_topk = max(0, 32 - global_tiles) * _CANDIDATE_TILE
++        unified_end = min(max_swa_topk, max_unified_swa_topk)
++        if unified_end >= min_swa_topk:
++            swa_topks.add(unified_end)
++            first_unified_tile = (
++                min_swa_topk + _UNIFIED_CANDIDATE_TILE - 1
++            ) // _UNIFIED_CANDIDATE_TILE
++            last_unified_tile = (
++                unified_end + _UNIFIED_CANDIDATE_TILE - 1
++            ) // _UNIFIED_CANDIDATE_TILE
++            for num_tiles in range(first_unified_tile, last_unified_tile + 1):
++                representative = max(
++                    min_swa_topk,
++                    (num_tiles - 1) * _UNIFIED_CANDIDATE_TILE + 1,
++                )
++                swa_topks.add(representative)
++    return max(
++        deepseek_v41_mixed_sparse_workspace_size(
++            num_tokens, num_heads, swa_topk, global_topk
++        )
++        for num_tokens in token_counts
++        for swa_topk in swa_topks
++    )
++
++
++@functools.cache
++def _cache_ops():
++    from ..jit.deepseek_v41_sparse import gen_deepseek_v41_cache_module
++
++    module = gen_deepseek_v41_cache_module().build_and_load()
++
++    @register_custom_op(
++        "flashinfer::deepseek_v41_pack_swa_cache", mutates_args=("cache",)
++    )
++    def pack_swa(kv, slots, cache, page_size, page_stride, row_stride):
++        module.deepseek_v41_pack_swa_cache(
++            kv, slots, cache, page_size, page_stride, row_stride
++        )
++
++    @register_fake_op("flashinfer::deepseek_v41_pack_swa_cache")
++    def _fake_swa(*_args, **_kwargs):
++        return None
++
++    @register_custom_op(
++        "flashinfer::deepseek_v41_pack_global_cache", mutates_args=("cache",)
++    )
++    def pack_global(kv, slots, cache, page_size, page_stride, row_stride):
++        module.deepseek_v41_pack_global_cache(
++            kv, slots, cache, page_size, page_stride, row_stride
++        )
++
++    @register_fake_op("flashinfer::deepseek_v41_pack_global_cache")
++    def _fake_global(*_args, **_kwargs):
++        return None
++
++    return pack_swa, pack_global
++
++
++@functools.cache
++def _attention_op():
++    from ..jit.deepseek_v41_sparse import gen_deepseek_v41_attention_module
++
++    module = gen_deepseek_v41_attention_module().build_and_load()
++
++    @register_custom_op(
++        "flashinfer::deepseek_v41_mixed_sparse_attention_native",
++        mutates_args=("partial_out", "partial_lse", "out"),
++    )
++    def attention(
++        q: torch.Tensor,
++        swa_cache: torch.Tensor,
++        global_cache: torch.Tensor,
++        swa_slots: torch.Tensor,
++        global_slots: torch.Tensor,
++        sinks: torch.Tensor,
++        partial_out: torch.Tensor,
++        partial_lse: torch.Tensor,
++        out: torch.Tensor,
++        sm_scale: float,
++        num_splits: int,
++        has_global: bool,
++        unified_tiles: bool,
++        swa_page_size: int,
++        swa_page_stride: int,
++        swa_row_stride: int,
++        global_page_size: int,
++        global_page_stride: int,
++        global_row_stride: int,
++    ) -> None:
++        module.deepseek_v41_mixed_sparse_attention(
++            q,
++            swa_cache,
++            global_cache,
++            swa_slots,
++            global_slots,
++            sinks,
++            partial_out,
++            partial_lse,
++            out,
++            sm_scale,
++            num_splits,
++            has_global,
++            unified_tiles,
++            swa_page_size,
++            swa_page_stride,
++            swa_row_stride,
++            global_page_size,
++            global_page_stride,
++            global_row_stride,
++        )
++
++    @register_fake_op("flashinfer::deepseek_v41_mixed_sparse_attention_native")
++    def _fake_attention(*_args, **_kwargs) -> None:
++        return None
++
++    return attention
++
++
++@functools.cache
++def _attention_with_inv_rope_op():
++    from ..jit.deepseek_v41_sparse import gen_deepseek_v41_attention_module
++
++    module = gen_deepseek_v41_attention_module().build_and_load()
++
++    @register_custom_op(
++        "flashinfer::deepseek_v41_mixed_sparse_attention_with_inv_rope_native",
++        mutates_args=("partial_out", "partial_lse", "out", "grouped_out"),
++    )
++    def attention_with_inv_rope(
++        q: torch.Tensor,
++        swa_cache: torch.Tensor,
++        global_cache: torch.Tensor,
++        swa_slots: torch.Tensor,
++        global_slots: torch.Tensor,
++        sinks: torch.Tensor,
++        partial_out: torch.Tensor,
++        partial_lse: torch.Tensor,
++        out: torch.Tensor,
++        sm_scale: float,
++        num_splits: int,
++        has_global: bool,
++        unified_tiles: bool,
++        swa_page_size: int,
++        swa_page_stride: int,
++        swa_row_stride: int,
++        global_page_size: int,
++        global_page_stride: int,
++        global_row_stride: int,
++        positions: torch.Tensor,
++        cos_sin: torch.Tensor,
++        grouped_out: torch.Tensor,
++        token_offset: int,
++    ) -> None:
++        module.deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q,
++            swa_cache,
++            global_cache,
++            swa_slots,
++            global_slots,
++            sinks,
++            partial_out,
++            partial_lse,
++            out,
++            sm_scale,
++            num_splits,
++            has_global,
++            unified_tiles,
++            swa_page_size,
++            swa_page_stride,
++            swa_row_stride,
++            global_page_size,
++            global_page_stride,
++            global_row_stride,
++            positions,
++            cos_sin,
++            grouped_out,
++            token_offset,
++        )
++
++    @register_fake_op(
++        "flashinfer::deepseek_v41_mixed_sparse_attention_with_inv_rope_native"
++    )
++    def _fake_attention_with_inv_rope(*_args, **_kwargs) -> None:
++        return None
++
++    return attention_with_inv_rope
++
++
++def _validate_inverse_rope_layout(
++    epilogue: _InverseRopeOutput, q: torch.Tensor
++) -> None:
++    positions = epilogue.positions
++    if (
++        positions.dtype != torch.int64
++        or positions.shape != (q.shape[0],)
++        or not positions.is_cuda
++        or positions.device != q.device
++        or not positions.is_contiguous()
++    ):
++        raise ValueError("positions must be contiguous CUDA int64 [T] on q.device")
++    cos_sin = epilogue.cos_sin
++    if (
++        cos_sin.dtype != torch.float32
++        or cos_sin.ndim != 2
++        or cos_sin.shape[0] == 0
++        or cos_sin.shape[1] != 64
++        or not cos_sin.is_cuda
++        or cos_sin.device != q.device
++        or not cos_sin.is_contiguous()
++    ):
++        raise ValueError("cos_sin must be contiguous CUDA float32 [L, 64] on q.device")
++    grouped_out = epilogue.grouped_out
++    if (
++        grouped_out.dtype != torch.bfloat16
++        or grouped_out.ndim != 3
++        or grouped_out.shape[0] == 0
++        or not grouped_out.is_cuda
++        or grouped_out.device != q.device
++        or not grouped_out.is_contiguous()
++    ):
++        raise ValueError("grouped_out must be contiguous CUDA bfloat16 [G, T, D]")
++    groups = int(grouped_out.shape[0])
++    if q.shape[1] % groups != 0 or q.shape[1] // groups != 8:
++        raise ValueError("fused inverse RoPE requires exactly eight heads per group")
++    if grouped_out.shape[2] != 8 * _D_HEAD:
++        raise ValueError("grouped_out.shape[2] must be 4096")
++    if isinstance(epilogue.token_offset, bool) or not isinstance(
++        epilogue.token_offset, int
++    ):
++        raise ValueError("token_offset must be an int")
++    if (
++        epilogue.token_offset < 0
++        or epilogue.token_offset + q.shape[0] > grouped_out.shape[1]
++    ):
++        raise ValueError("token_offset and T exceed grouped_out token capacity")
++
++
++def _check_no_storage_alias(
++    grouped_out: torch.Tensor, operands: tuple[tuple[str, torch.Tensor], ...]
++) -> None:
++    grouped_storage = grouped_out.untyped_storage().data_ptr()
++    for name, operand in operands:
++        if grouped_storage == operand.untyped_storage().data_ptr():
++            raise ValueError(f"grouped_out must not alias {name}")
++
++
++def _pack(
++    kv: torch.Tensor,
++    slots: torch.Tensor,
++    cache: torch.Tensor,
++    *,
++    global_cache: bool,
++    page_size: int | None,
++    page_stride_bytes: int | None,
++    row_stride_bytes: int | None,
++) -> None:
++    if kv.dtype != torch.bfloat16 or kv.ndim != 2 or kv.shape[1] != 512:
++        raise ValueError("kv must be bfloat16 [T, 512]")
++    if not kv.is_cuda or not kv.is_contiguous():
++        raise ValueError("kv must be contiguous CUDA storage")
++    if not cache.is_cuda or cache.device != kv.device:
++        raise ValueError("cache must be a CUDA tensor on kv.device")
++    if slots.ndim != 1 or slots.shape[0] > kv.shape[0]:
++        raise ValueError("slots must be [T] and no longer than kv")
++    if (
++        not slots.is_cuda
++        or slots.device != kv.device
++        or slots.dtype not in (torch.int32, torch.int64)
++        or not slots.is_contiguous()
++    ):
++        raise ValueError("slots must be contiguous CUDA int32/int64 on kv.device")
++    expected = (64, 128) if global_cache else (32,)
++    payload = (
++        DEEPSEEK_V41_GLOBAL_ROW_BYTES if global_cache else DEEPSEEK_V41_SWA_ROW_BYTES
++    )
++    layout = _paged_layout(
++        cache,
++        payload_bytes=payload,
++        expected_page_sizes=expected,
++        page_size=page_size,
++        page_stride_bytes=page_stride_bytes,
++        row_stride_bytes=row_stride_bytes,
++        name="global_cache" if global_cache else "swa_cache",
++    )
++    op = _cache_ops()[1 if global_cache else 0]
++    op(
++        kv,
++        slots,
++        layout.storage,
++        layout.page_size,
++        layout.page_stride,
++        layout.row_stride,
++    )
++
++
++def deepseek_v41_pack_swa_cache(
++    kv: torch.Tensor,
++    slots: torch.Tensor,
++    cache: torch.Tensor,
++    *,
++    page_size: int | None = None,
++    page_stride_bytes: int | None = None,
++    row_stride_bytes: int | None = None,
++) -> None:
++    """Quantize post-RoPE BF16 K to the addressed 528B SWA cache rows."""
++    _pack(
++        kv,
++        slots,
++        cache,
++        global_cache=False,
++        page_size=page_size,
++        page_stride_bytes=page_stride_bytes,
++        row_stride_bytes=row_stride_bytes,
++    )
++
++
++def deepseek_v41_pack_global_cache(
++    kv: torch.Tensor,
++    slots: torch.Tensor,
++    cache: torch.Tensor,
++    *,
++    page_size: int | None = None,
++    page_stride_bytes: int | None = None,
++    row_stride_bytes: int | None = None,
++) -> None:
++    """Quantize post-RoPE BF16 K to the addressed 288B global cache rows."""
++    _pack(
++        kv,
++        slots,
++        cache,
++        global_cache=True,
++        page_size=page_size,
++        page_stride_bytes=page_stride_bytes,
++        row_stride_bytes=row_stride_bytes,
++    )
++
++
++def _deepseek_v41_mixed_sparse_attention_impl(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    global_cache: torch.Tensor | None,
++    swa_slots: torch.Tensor,
++    global_slots: torch.Tensor | None,
++    sm_scale: float,
++    sinks: torch.Tensor | None = None,
++    *,
++    swa_page_size: int | None = None,
++    swa_page_stride_bytes: int | None = None,
++    swa_row_stride_bytes: int | None = None,
++    global_page_size: int | None = None,
++    global_page_stride_bytes: int | None = None,
++    global_row_stride_bytes: int | None = None,
++    out: torch.Tensor | None = None,
++    workspace: torch.Tensor | None = None,
++    inverse_rope_output: _InverseRopeOutput | None = None,
++) -> torch.Tensor:
++    """Run native BF16-Q attention without expanding either packed cache.
++
++    ``swa_slots`` and ``global_slots`` contain physical token slots. ``-1`` and
++    addresses outside the backing storage are masked. The page/row stride
++    arguments preserve allocator padding between pages.
++    """
++    if q.dtype != torch.bfloat16 or q.ndim != 3 or q.shape[-1] != 512:
++        raise ValueError("q must be bfloat16 [T, H, 512]")
++    if (
++        not q.is_cuda
++        or not q.is_contiguous()
++        or q.shape[0] == 0
++        or q.shape[1] not in (8, 16, 32)
++    ):
++        raise ValueError("q must be contiguous CUDA storage with H in {8,16,32}")
++    if torch.cuda.get_device_capability(q.device) not in ((8, 9), (12, 0)):
++        raise ValueError("DeepSeek-V4.1 mixed sparse attention requires SM89 or SM120")
++    if inverse_rope_output is not None:
++        _validate_inverse_rope_layout(inverse_rope_output, q)
++    if not swa_cache.is_cuda or swa_cache.device != q.device:
++        raise ValueError("swa_cache must be a CUDA tensor on q.device")
++    _check_slots(swa_slots, q, "swa_slots")
++    swa = _paged_layout(
++        swa_cache,
++        payload_bytes=DEEPSEEK_V41_SWA_ROW_BYTES,
++        expected_page_sizes=(DEEPSEEK_V41_SWA_PAGE_SIZE,),
++        page_size=swa_page_size,
++        page_stride_bytes=swa_page_stride_bytes,
++        row_stride_bytes=swa_row_stride_bytes,
++        name="swa_cache",
++    )
++    if global_slots is None:
++        if global_cache is not None:
++            raise ValueError("global_cache and global_slots must be supplied together")
++        has_global = False
++        glob = swa
++        global_slots = swa_slots[:, :0]
++    else:
++        _check_slots(global_slots, q, "global_slots")
++        has_global = global_slots.shape[1] > 0
++        if has_global and global_cache is None:
++            raise ValueError("global_cache and global_slots must be supplied together")
++    if has_global:
++        assert global_cache is not None
++        if not global_cache.is_cuda or global_cache.device != q.device:
++            raise ValueError("global_cache must be a CUDA tensor on q.device")
++        glob = _paged_layout(
++            global_cache,
++            payload_bytes=DEEPSEEK_V41_GLOBAL_ROW_BYTES,
++            expected_page_sizes=(64, 128),
++            page_size=global_page_size,
++            page_stride_bytes=global_page_stride_bytes,
++            row_stride_bytes=global_row_stride_bytes,
++            name="global_cache",
++        )
++    elif global_slots.shape[1] == 0:
++        if global_cache is not None and (
++            not global_cache.is_cuda or global_cache.device != q.device
++        ):
++            raise ValueError("global_cache must be a CUDA tensor on q.device")
++        glob = swa
++
++    if sinks is None:
++        sinks = torch.full(
++            (q.shape[1],), -float("inf"), dtype=torch.float32, device=q.device
++        )
++    if (
++        sinks.dtype != torch.float32
++        or sinks.shape != (q.shape[1],)
++        or not sinks.is_cuda
++        or sinks.device != q.device
++        or not sinks.is_contiguous()
++    ):
++        raise ValueError("sinks must be contiguous CUDA float32 [H] on q.device")
++    if out is None:
++        if inverse_rope_output is None:
++            out = torch.empty_like(q)
++        else:
++            out = inverse_rope_output.grouped_out.view(-1)[: q.numel()].view_as(q)
++    if (
++        out.dtype != q.dtype
++        or out.shape != q.shape
++        or not out.is_cuda
++        or out.device != q.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "out must be contiguous CUDA bfloat16 on q.device with q.shape"
++        )
++    global_topk = int(global_slots.shape[1]) if has_global else 0
++    num_splits = _attention_num_splits(
++        int(q.shape[0]),
++        int(q.shape[1]),
++        int(swa_slots.shape[1]),
++        global_topk,
++    )
++    unified_tiles = _attention_uses_unified_tiles(
++        int(q.shape[0]),
++        int(q.shape[1]),
++        int(swa_slots.shape[1]),
++        global_topk,
++    )
++    workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
++        int(q.shape[0]),
++        int(q.shape[1]),
++        int(swa_slots.shape[1]),
++        global_topk,
++    )
++    if workspace is None:
++        workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
++    if (
++        workspace.dtype != torch.uint8
++        or not workspace.is_cuda
++        or workspace.device != q.device
++        or not workspace.is_contiguous()
++        or workspace.storage_offset() % 4 != 0
++        or workspace.numel() < workspace_bytes
++    ):
++        raise ValueError(
++            f"workspace must be aligned contiguous CUDA uint8 with at least "
++            f"{workspace_bytes} bytes on q.device"
++        )
++
++    lse_elements = int(q.shape[0]) * num_splits * int(q.shape[1])
++    if num_splits == 1:
++        partial_out = out.unsqueeze(1)
++        partial_lse = (
++            workspace[: lse_elements * 4]
++            .view(torch.float32)
++            .view(q.shape[0], 1, q.shape[1])
++        )
++    else:
++        partial_elements = int(q.shape[0]) * num_splits * int(q.shape[1]) * _D_HEAD
++        partial_bytes = partial_elements * 2
++        partial_out = (
++            workspace[:partial_bytes]
++            .view(torch.bfloat16)
++            .view(q.shape[0], num_splits, q.shape[1], _D_HEAD)
++        )
++        partial_lse = (
++            workspace[partial_bytes : partial_bytes + lse_elements * 4]
++            .view(torch.float32)
++            .view(q.shape[0], num_splits, q.shape[1])
++        )
++
++    attention_args = (
++        q,
++        swa.storage,
++        glob.storage,
++        swa_slots,
++        global_slots,
++        sinks,
++        partial_out,
++        partial_lse,
++        out,
++        float(sm_scale),
++        num_splits,
++        has_global,
++        unified_tiles,
++        swa.page_size,
++        swa.page_stride,
++        swa.row_stride,
++        glob.page_size,
++        glob.page_stride,
++        glob.row_stride,
++    )
++    with torch.cuda.device(q.device):
++        if inverse_rope_output is None:
++            _attention_op()(*attention_args)
++        else:
++            _check_no_storage_alias(
++                inverse_rope_output.grouped_out,
++                (
++                    ("q", q),
++                    ("swa_cache", swa.storage),
++                    ("global_cache", glob.storage),
++                    ("swa_slots", swa_slots),
++                    ("global_slots", global_slots),
++                    ("sinks", sinks),
++                    ("positions", inverse_rope_output.positions),
++                    ("cos_sin", inverse_rope_output.cos_sin),
++                    ("workspace", workspace),
++                ),
++            )
++            _attention_with_inv_rope_op()(
++                *attention_args,
++                inverse_rope_output.positions,
++                inverse_rope_output.cos_sin,
++                inverse_rope_output.grouped_out,
++                inverse_rope_output.token_offset,
++            )
++    return out
++
++
++@flashinfer_api(trace=deepseek_v41_mixed_sparse_trace)
++def deepseek_v41_mixed_sparse_attention(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    global_cache: torch.Tensor | None,
++    swa_slots: torch.Tensor,
++    global_slots: torch.Tensor | None,
++    sm_scale: float,
++    sinks: torch.Tensor | None = None,
++    *,
++    swa_page_size: int | None = None,
++    swa_page_stride_bytes: int | None = None,
++    swa_row_stride_bytes: int | None = None,
++    global_page_size: int | None = None,
++    global_page_stride_bytes: int | None = None,
++    global_row_stride_bytes: int | None = None,
++    out: torch.Tensor | None = None,
++    workspace: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Run native BF16-Q attention without expanding either packed cache.
++
++    ``swa_slots`` and ``global_slots`` contain physical token slots. ``-1`` and
++    addresses outside the backing storage are masked. The page/row stride
++    arguments preserve allocator padding between pages.
++    """
++    return _deepseek_v41_mixed_sparse_attention_impl(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        sm_scale,
++        sinks,
++        swa_page_size=swa_page_size,
++        swa_page_stride_bytes=swa_page_stride_bytes,
++        swa_row_stride_bytes=swa_row_stride_bytes,
++        global_page_size=global_page_size,
++        global_page_stride_bytes=global_page_stride_bytes,
++        global_row_stride_bytes=global_row_stride_bytes,
++        out=out,
++        workspace=workspace,
++    )
++
++
++def _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    global_cache: torch.Tensor | None,
++    swa_slots: torch.Tensor,
++    global_slots: torch.Tensor | None,
++    sm_scale: float,
++    sinks: torch.Tensor | None = None,
++    *,
++    positions: torch.Tensor,
++    cos_sin: torch.Tensor,
++    grouped_out: torch.Tensor,
++    token_offset: int,
++    swa_page_size: int | None = None,
++    swa_page_stride_bytes: int | None = None,
++    swa_row_stride_bytes: int | None = None,
++    global_page_size: int | None = None,
++    global_page_stride_bytes: int | None = None,
++    global_row_stride_bytes: int | None = None,
++    out: torch.Tensor | None = None,
++    workspace: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Run attention and write inverse-RoPE output in grouped layout."""
++    inverse_rope_output = _InverseRopeOutput(
++        positions=positions,
++        cos_sin=cos_sin,
++        grouped_out=grouped_out,
++        token_offset=token_offset,
++    )
++    _deepseek_v41_mixed_sparse_attention_impl(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        sm_scale,
++        sinks,
++        swa_page_size=swa_page_size,
++        swa_page_stride_bytes=swa_page_stride_bytes,
++        swa_row_stride_bytes=swa_row_stride_bytes,
++        global_page_size=global_page_size,
++        global_page_stride_bytes=global_page_stride_bytes,
++        global_row_stride_bytes=global_row_stride_bytes,
++        out=out,
++        workspace=workspace,
++        inverse_rope_output=inverse_rope_output,
++    )
++    token_end = token_offset + q.shape[0]
++    return grouped_out[:, token_offset:token_end].transpose(0, 1)
+diff --git a/flashinfer/trace/templates/deepseek_v41.py b/flashinfer/trace/templates/deepseek_v41.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/trace/templates/deepseek_v41.py
+@@ -0,0 +1,36 @@
++"""Trace schema for DeepSeek-V4.1 mixed sparse MLA."""
++
++from ..template import Const, Scalar, Tensor, TraceTemplate, Var
++
++
++deepseek_v41_mixed_sparse_trace = TraceTemplate(
++    op_type="mla_mixed_sparse",
++    name_prefix="deepseek_v41_mixed_sparse",
++    description=(
++        "BF16-Q sparse attention over the post-RoPE FP8-group32 sliding-window "
++        "cache and the optional FP4-group16 global cache. Cache rows remain packed."
++    ),
++    axes={
++        "num_tokens": Var(),
++        "num_heads": Const(abbrev="h"),
++        "head_dim": Const(value=512, abbrev="d"),
++        "swa_topk": Var(),
++        "global_topk": Var(),
++    },
++    inputs={
++        "q": Tensor(["num_tokens", "num_heads", "head_dim"]),
++        "swa_cache": Tensor(["swa_storage_bytes"]),
++        "global_cache": Tensor(["global_storage_bytes"], optional=True),
++        "swa_slots": Tensor(["num_tokens", "swa_topk"]),
++        "global_slots": Tensor(["num_tokens", "global_topk"], optional=True),
++        "sinks": Tensor(["num_heads"], optional=True),
++        "sm_scale": Scalar("float32"),
++    },
++    outputs={"out": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="q")},
++    constraints=[
++        "num_heads in {8,16,32}",
++        "SWA format fp8_e4m3+ue8m0_g32, 528 bytes/row",
++        "global format fp4_e2m1+e4m3_g16, 288 bytes/row",
++    ],
++    tags=["mla", "deepseek-v4.1", "mixed-cache", "tensor-core"],
++)
+diff --git a/include/flashinfer/attention/deepseek_v41_epilogue.cuh b/include/flashinfer/attention/deepseek_v41_epilogue.cuh
+new file mode 100644
+--- /dev/null
++++ b/include/flashinfer/attention/deepseek_v41_epilogue.cuh
+@@ -0,0 +1,62 @@
++// Copyright (c) 2026 FlashInfer contributors.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace flashinfer::deepseek_v41 {
++
++using bf16 = __nv_bfloat16;
++
++struct V41EpilogueParams {
++  const int64_t* positions = nullptr;
++  const float* cos_sin = nullptr;
++  bf16* output = nullptr;
++  int64_t cos_stride = 0;
++  int64_t num_positions = 0;
++  int64_t total_tokens = 0;
++  int64_t token_offset = 0;
++  int heads_per_group = 0;
++};
++
++__device__ __forceinline__ void store_v41_inv_rope_pair(const V41EpilogueParams& epilogue,
++                                                        int64_t local_token, int head, int even_dim,
++                                                        float even_value, float odd_value) {
++  if (epilogue.output == nullptr) return;
++
++  float even = __bfloat162float(__float2bfloat16_rn(even_value));
++  float odd = __bfloat162float(__float2bfloat16_rn(odd_value));
++  if (even_dim >= 448) {
++    const int64_t position = epilogue.positions[local_token];
++    if (position >= 0 && position < epilogue.num_positions) {
++      const float* cos_sin = epilogue.cos_sin + position * epilogue.cos_stride;
++      const int pair = (even_dim - 448) / 2;
++      const float cosine = cos_sin[pair];
++      const float sine = cos_sin[32 + pair];
++      const float even_cos = __fmul_rn(even, cosine);
++      const float odd_sin = __fmul_rn(odd, sine);
++      const float odd_cos = __fmul_rn(odd, cosine);
++      const float even_sin = __fmul_rn(even, sine);
++      even = __fadd_rn(even_cos, odd_sin);
++      odd = __fsub_rn(odd_cos, even_sin);
++    }
++  }
++
++  const int group = head / epilogue.heads_per_group;
++  const int head_in_group = head % epilogue.heads_per_group;
++  const int64_t output_token = epilogue.token_offset + local_token;
++  const int64_t output_offset =
++      ((static_cast<int64_t>(group) * epilogue.total_tokens + output_token) *
++           epilogue.heads_per_group +
++       head_in_group) *
++          512 +
++      even_dim;
++  epilogue.output[output_offset] = __float2bfloat16_rn(even);
++  epilogue.output[output_offset + 1] = __float2bfloat16_rn(odd);
++}
++
++}  // namespace flashinfer::deepseek_v41
+diff --git a/include/flashinfer/attention/deepseek_v41_mixed_sparse.cuh b/include/flashinfer/attention/deepseek_v41_mixed_sparse.cuh
+new file mode 100644
+--- /dev/null
++++ b/include/flashinfer/attention/deepseek_v41_mixed_sparse.cuh
+@@ -0,0 +1,955 @@
++// Copyright (c) 2026 FlashInfer contributors.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++#include <math_constants.h>
++#include <mma.h>
++
++#include <cmath>
++#include <cstdint>
++
++#include "deepseek_v41_epilogue.cuh"
++
++namespace flashinfer::deepseek_v41 {
++
++using bf16 = __nv_bfloat16;
++
++constexpr int kV41Dim = 512;
++constexpr int kV41SmemDim = 520;
++constexpr int kV41HeadTile = 16;
++constexpr int kV41CandidateTile = 32;
++constexpr int kV41MmaTile = 16;
++constexpr int kV41Warps = 8;
++constexpr int kV41Threads = kV41Warps * 32;
++constexpr int kV41OutputTiles = kV41Dim / kV41MmaTile;
++constexpr int kV41SwaPayloadBytes = 528;
++constexpr int kV41GlobalPayloadBytes = 288;
++constexpr int kV41MaxSplits = 64;
++constexpr int kV41ScratchBytes = kV41Warps * 256 * sizeof(float);
++constexpr int kV41ScratchFloats = kV41ScratchBytes / sizeof(float);
++
++struct V41AttentionParams {
++  const bf16* q;
++  const uint8_t* swa_cache;
++  const uint8_t* global_cache;
++  const void* swa_slots;
++  const void* global_slots;
++  const float* sinks;
++  bf16* partial_out;
++  float* partial_lse;
++  int64_t q_stride_token;
++  int64_t q_stride_head;
++  int64_t swa_slots_stride_token;
++  int64_t global_slots_stride_token;
++  int64_t partial_out_stride_token;
++  int64_t partial_out_stride_split;
++  int64_t partial_out_stride_head;
++  int64_t partial_lse_stride_token;
++  int64_t partial_lse_stride_split;
++  int64_t partial_lse_stride_head;
++  int64_t swa_nbytes;
++  int64_t global_nbytes;
++  int64_t swa_page_stride;
++  int64_t swa_row_stride;
++  int64_t global_page_stride;
++  int64_t global_row_stride;
++  int swa_page_size;
++  int global_page_size;
++  int swa_topk;
++  int global_topk;
++  int num_tokens;
++  int num_heads;
++  int num_splits;
++  float sm_scale;
++  bool has_global;
++  bool unified_tiles;
++  V41EpilogueParams epilogue;
++};
++
++__device__ __forceinline__ float decode_fp8_e4m3(uint8_t bits) {
++  __nv_fp8_e4m3 value;
++  value.__x = bits;
++  return static_cast<float>(value);
++}
++
++__device__ __forceinline__ float decode_e2m1(uint8_t code) {
++  const uint32_t magnitude = code & 7;
++  uint32_t magnitude_bits;
++  if (magnitude == 0) {
++    magnitude_bits = 0;
++  } else if (magnitude == 1) {
++    magnitude_bits = 0x3f000000U;
++  } else {
++    magnitude_bits = ((magnitude >> 1) + 126U) << 23;
++    magnitude_bits |= (magnitude & 1U) << 22;
++  }
++  return __uint_as_float(magnitude_bits | ((code & 8U) << 28));
++}
++
++__device__ __forceinline__ uint32_t load_u32_unaligned(const uint8_t* src) {
++  return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
++         (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
++}
++
++__device__ __forceinline__ uint4 load_u128(const uint8_t* src) {
++  if ((reinterpret_cast<uintptr_t>(src) & 15U) == 0) {
++    return *reinterpret_cast<const uint4*>(src);
++  }
++  return make_uint4(load_u32_unaligned(src), load_u32_unaligned(src + 4),
++                    load_u32_unaligned(src + 8), load_u32_unaligned(src + 12));
++}
++
++__device__ __forceinline__ uint8_t extract_u8(const uint4& value, int byte) {
++  const uint32_t word = byte < 4 ? value.x : byte < 8 ? value.y : byte < 12 ? value.z : value.w;
++  return static_cast<uint8_t>(word >> ((byte & 3) * 8));
++}
++
++template <typename SlotT>
++__device__ __forceinline__ bool resolve_v41_row(const SlotT* slots, int64_t slot_offset,
++                                                int page_size, int64_t page_stride,
++                                                int64_t row_stride, int64_t cache_nbytes,
++                                                int payload_bytes, int64_t* row_offset) {
++  const int64_t slot = static_cast<int64_t>(slots[slot_offset]);
++  if (slot < 0 || page_size <= 0 || page_stride <= 0 || row_stride < payload_bytes ||
++      cache_nbytes < payload_bytes) {
++    *row_offset = 0;
++    return false;
++  }
++  const int64_t page = slot / page_size;
++  const int64_t row = slot % page_size;
++  if (page > cache_nbytes / page_stride) {
++    *row_offset = 0;
++    return false;
++  }
++  const int64_t offset = page * page_stride + row * row_stride;
++  if (offset < 0 || offset > cache_nbytes - payload_bytes) {
++    *row_offset = 0;
++    return false;
++  }
++  *row_offset = offset;
++  return true;
++}
++
++template <bool Global, typename SlotT, int Rows = kV41MmaTile, int Threads = kV41Threads>
++__device__ __forceinline__ void load_v41_kv_tile(
++    const uint8_t* cache, const SlotT* slots, int64_t slots_stride_token, int token,
++    int candidate_begin, int topk, int page_size, int64_t page_stride, int64_t row_stride,
++    int64_t cache_nbytes, bf16* kv_smem, float* scale_smem, int* valid_smem, int64_t* row_smem) {
++  constexpr int kPayload = Global ? kV41GlobalPayloadBytes : kV41SwaPayloadBytes;
++  const int tid = threadIdx.x;
++  if (tid < Rows) {
++    const int candidate = candidate_begin + tid;
++    bool valid = candidate < topk;
++    int64_t row_offset = 0;
++    if (valid) {
++      valid =
++          resolve_v41_row(slots, static_cast<int64_t>(token) * slots_stride_token + candidate,
++                          page_size, page_stride, row_stride, cache_nbytes, kPayload, &row_offset);
++    }
++    valid_smem[tid] = valid;
++    row_smem[tid] = row_offset;
++  }
++  __syncthreads();
++
++  constexpr int kScaleGroups = Global ? 32 : 16;
++  constexpr int kScaleOffset = Global ? 256 : 512;
++  for (int linear = tid; linear < Rows * kScaleGroups; linear += Threads) {
++    const int row = linear / kScaleGroups;
++    const int group = linear % kScaleGroups;
++    float scale = 0.0f;
++    if (valid_smem[row]) {
++      const uint8_t bits = cache[row_smem[row] + kScaleOffset + group];
++      if constexpr (Global) {
++        scale = decode_fp8_e4m3(bits);
++      } else {
++        scale = __uint_as_float(static_cast<uint32_t>(bits) << 23);
++      }
++    }
++    scale_smem[linear] = scale;
++  }
++  __syncthreads();
++
++  if constexpr (Global) {
++    constexpr int kChunksPerRow = (kV41Dim / 2) / sizeof(uint4);
++    for (int linear = tid; linear < Rows * kChunksPerRow; linear += Threads) {
++      const int row = linear / kChunksPerRow;
++      const int chunk = linear % kChunksPerRow;
++      uint4 packed = make_uint4(0, 0, 0, 0);
++      if (valid_smem[row]) {
++        packed = load_u128(cache + row_smem[row] + chunk * sizeof(uint4));
++      }
++#pragma unroll
++      for (int byte = 0; byte < static_cast<int>(sizeof(uint4)); ++byte) {
++        const uint8_t codes = extract_u8(packed, byte);
++        const float scale = scale_smem[row * kScaleGroups + chunk * 2 + byte / 8];
++        const __nv_bfloat162 values = __floats2bfloat162_rn(decode_e2m1(codes & 0xF) * scale,
++                                                            decode_e2m1(codes >> 4) * scale);
++        *reinterpret_cast<__nv_bfloat162*>(kv_smem + row * kV41SmemDim + chunk * 32 + byte * 2) =
++            values;
++      }
++    }
++  } else {
++    constexpr int kChunksPerRow = kV41Dim / sizeof(uint4);
++    for (int linear = tid; linear < Rows * kChunksPerRow; linear += Threads) {
++      const int row = linear / kChunksPerRow;
++      const int chunk = linear % kChunksPerRow;
++      uint4 packed = make_uint4(0, 0, 0, 0);
++      if (valid_smem[row]) {
++        packed = load_u128(cache + row_smem[row] + chunk * sizeof(uint4));
++      }
++      const float scale = scale_smem[row * kScaleGroups + chunk / 2];
++#pragma unroll
++      for (int pair = 0; pair < static_cast<int>(sizeof(uint4)) / 2; ++pair) {
++        const __nv_bfloat162 values =
++            __floats2bfloat162_rn(decode_fp8_e4m3(extract_u8(packed, pair * 2)) * scale,
++                                  decode_fp8_e4m3(extract_u8(packed, pair * 2 + 1)) * scale);
++        *reinterpret_cast<__nv_bfloat162*>(kv_smem + row * kV41SmemDim + chunk * 16 + pair * 2) =
++            values;
++      }
++    }
++  }
++  __syncthreads();
++}
++
++template <bool PadQ>
++__device__ __forceinline__ void compute_v41_tile(const bf16* q_tile, const bf16* kv_smem,
++                                                 float* scratch, bf16* probs, const int* valid,
++                                                 float* running_m, float* running_l, float* alpha,
++                                                 float (&acc)[kV41OutputTiles], float sm_scale,
++                                                 int valid_heads) {
++  namespace wmma = nvcuda::wmma;
++  const int tid = threadIdx.x;
++  const int warp = tid / 32;
++  const int head = tid / kV41MmaTile;
++
++  wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> q_frag;
++  wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::col_major> k_frag;
++  wmma::fragment<wmma::accumulator, 16, 16, 16, float> score_frag;
++  wmma::fill_fragment(score_frag, 0.0f);
++#pragma unroll
++  for (int k = 0; k < 64; k += 16) {
++    const int k_offset = warp * 64 + k;
++    wmma::load_matrix_sync(q_frag, q_tile + k_offset, PadQ ? kV41SmemDim : kV41Dim);
++    wmma::load_matrix_sync(k_frag, kv_smem + k_offset, kV41SmemDim);
++    wmma::mma_sync(score_frag, q_frag, k_frag, score_frag);
++  }
++  wmma::store_matrix_sync(scratch + warp * 256, score_frag, 16, wmma::mem_row_major);
++  __syncthreads();
++
++  float score = 0.0f;
++#pragma unroll
++  for (int source_warp = 0; source_warp < kV41Warps; ++source_warp) {
++    score += scratch[source_warp * 256 + tid];
++  }
++  __syncthreads();
++  scratch[tid] = score * sm_scale;
++  __syncthreads();
++
++  if (tid < kV41HeadTile) {
++    if (tid < valid_heads) {
++      bool has_value = false;
++      float tile_max = -CUDART_INF_F;
++#pragma unroll
++      for (int candidate = 0; candidate < kV41MmaTile; ++candidate) {
++        if (valid[candidate]) {
++          has_value = true;
++          tile_max = fmaxf(tile_max, scratch[tid * 16 + candidate]);
++        }
++      }
++      if (has_value) {
++        const float old_m = running_m[tid];
++        const float new_m = fmaxf(old_m, tile_max);
++        const float scale_old = expf(old_m - new_m);
++        float tile_sum = 0.0f;
++#pragma unroll
++        for (int candidate = 0; candidate < kV41MmaTile; ++candidate) {
++          const float probability =
++              valid[candidate] ? expf(scratch[tid * 16 + candidate] - new_m) : 0.0f;
++          probs[tid * 16 + candidate] = __float2bfloat16_rn(probability);
++          tile_sum += probability;
++        }
++        running_m[tid] = new_m;
++        running_l[tid] = running_l[tid] * scale_old + tile_sum;
++        alpha[tid] = scale_old;
++      } else {
++#pragma unroll
++        for (int candidate = 0; candidate < kV41MmaTile; ++candidate) {
++          probs[tid * 16 + candidate] = __float2bfloat16_rn(0.0f);
++        }
++        alpha[tid] = 1.0f;
++      }
++    } else {
++#pragma unroll
++      for (int candidate = 0; candidate < kV41MmaTile; ++candidate) {
++        probs[tid * 16 + candidate] = __float2bfloat16_rn(0.0f);
++      }
++      alpha[tid] = 1.0f;
++    }
++  }
++  __syncthreads();
++
++  using PFrag = wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major>;
++  using VFrag = wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::row_major>;
++  using OFrag = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
++#pragma unroll
++  for (int batch = 0; batch < kV41OutputTiles / kV41Warps; ++batch) {
++    const int output_tile = batch * kV41Warps + warp;
++    PFrag p_frag;
++    VFrag v_frag;
++    OFrag out_frag;
++    wmma::fill_fragment(out_frag, 0.0f);
++    wmma::load_matrix_sync(p_frag, probs, 16);
++    wmma::load_matrix_sync(v_frag, kv_smem + output_tile * 16, kV41SmemDim);
++    wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
++    wmma::store_matrix_sync(scratch + warp * 256, out_frag, 16, wmma::mem_row_major);
++    __syncthreads();
++#pragma unroll
++    for (int tile_in_batch = 0; tile_in_batch < kV41Warps; ++tile_in_batch) {
++      const int acc_tile = batch * kV41Warps + tile_in_batch;
++      acc[acc_tile] = acc[acc_tile] * alpha[head] + scratch[tile_in_batch * 256 + tid];
++    }
++    __syncthreads();
++  }
++}
++
++template <bool Global, typename SlotT, bool PadQ>
++__device__ __forceinline__ void run_v41_tile(
++    const bf16* q_tile, const uint8_t* cache, const SlotT* slots, int64_t slots_stride_token,
++    int token, int candidate_begin, int topk, int page_size, int64_t page_stride,
++    int64_t row_stride, int64_t cache_nbytes, bf16* kv_smem, float* scratch, bf16* probs,
++    int* valid_smem, int64_t* row_smem, float* running_m, float* running_l, float* alpha,
++    float (&acc)[kV41OutputTiles], float sm_scale, int valid_heads) {
++  load_v41_kv_tile<Global>(cache, slots, slots_stride_token, token, candidate_begin, topk,
++                           page_size, page_stride, row_stride, cache_nbytes, kv_smem, scratch,
++                           valid_smem, row_smem);
++  compute_v41_tile<PadQ>(q_tile, kv_smem, scratch, probs, valid_smem, running_m, running_l, alpha,
++                         acc, sm_scale, valid_heads);
++}
++
++template <typename SwaSlotT, typename GlobalSlotT, bool PadQ, bool FuseEpilogue = false>
++__global__ void __launch_bounds__(kV41Threads)
++    deepseek_v41_mixed_sparse_main_kernel(V41AttentionParams params) {
++  const int token = blockIdx.x;
++  const int head_block = blockIdx.y;
++  const int split = blockIdx.z;
++  if (token >= params.num_tokens || split >= params.num_splits) return;
++
++  const int tid = threadIdx.x;
++  const int head_start = head_block * kV41HeadTile;
++  const int remaining_heads = params.num_heads - head_start;
++  const int valid_heads = remaining_heads > kV41HeadTile ? kV41HeadTile : remaining_heads;
++
++  extern __shared__ __align__(16) uint8_t smem_raw[];
++  bf16* q_pad = reinterpret_cast<bf16*>(smem_raw);
++  bf16* kv_smem = q_pad + (PadQ ? kV41HeadTile * kV41SmemDim : 0);
++  float* scratch = reinterpret_cast<float*>(kv_smem + kV41MmaTile * kV41SmemDim);
++  bf16* probs = reinterpret_cast<bf16*>(scratch + kV41ScratchFloats);
++  int* valid_smem = reinterpret_cast<int*>(probs + kV41HeadTile * kV41MmaTile);
++  int64_t* row_smem = reinterpret_cast<int64_t*>(valid_smem + kV41MmaTile);
++  float* running_m = reinterpret_cast<float*>(row_smem + kV41MmaTile);
++  float* running_l = running_m + kV41HeadTile;
++  float* alpha = running_l + kV41HeadTile;
++
++  const bf16* q_token = params.q + static_cast<int64_t>(token) * params.q_stride_token +
++                        static_cast<int64_t>(head_start) * params.q_stride_head;
++  if constexpr (PadQ) {
++    for (int linear = tid; linear < kV41HeadTile * kV41Dim; linear += kV41Threads) {
++      const int head = linear / kV41Dim;
++      const int dim = linear % kV41Dim;
++      q_pad[head * kV41SmemDim + dim] = head < valid_heads
++                                            ? q_token[head * params.q_stride_head + dim]
++                                            : __float2bfloat16_rn(0.0f);
++    }
++    __syncthreads();
++  }
++  const bf16* q_tile = PadQ ? q_pad : q_token;
++
++  if (tid < kV41HeadTile) {
++    running_m[tid] = -CUDART_INF_F;
++    running_l[tid] = 0.0f;
++    alpha[tid] = 1.0f;
++  }
++  float acc[kV41OutputTiles];
++#pragma unroll
++  for (int tile = 0; tile < kV41OutputTiles; ++tile) acc[tile] = 0.0f;
++  __syncthreads();
++
++  const auto* swa_slots = static_cast<const SwaSlotT*>(params.swa_slots);
++  const auto* global_slots = static_cast<const GlobalSlotT*>(params.global_slots);
++  const int swa_tiles = (params.swa_topk + kV41CandidateTile - 1) / kV41CandidateTile;
++  const int global_tiles = (params.global_topk + kV41CandidateTile - 1) / kV41CandidateTile;
++
++  if (params.unified_tiles) {
++    const int unified_swa_tiles = (params.swa_topk + kV41MmaTile - 1) / kV41MmaTile;
++    const int unified_global_tiles = (params.global_topk + kV41MmaTile - 1) / kV41MmaTile;
++    if (split < unified_swa_tiles) {
++      const int begin = split * kV41MmaTile;
++      run_v41_tile<false, SwaSlotT, PadQ>(
++          q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token, begin,
++          params.swa_topk, params.swa_page_size, params.swa_page_stride, params.swa_row_stride,
++          params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem, running_m, running_l,
++          alpha, acc, params.sm_scale, valid_heads);
++    } else if (params.has_global && split < unified_swa_tiles + unified_global_tiles) {
++      const int begin = (split - unified_swa_tiles) * kV41MmaTile;
++      run_v41_tile<true, GlobalSlotT, PadQ>(
++          q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token, begin,
++          params.global_topk, params.global_page_size, params.global_page_stride,
++          params.global_row_stride, params.global_nbytes, kv_smem, scratch, probs, valid_smem,
++          row_smem, running_m, running_l, alpha, acc, params.sm_scale, valid_heads);
++    }
++  } else {
++    for (int tile = split; tile < swa_tiles; tile += params.num_splits) {
++      const int begin = tile * kV41CandidateTile;
++      run_v41_tile<false, SwaSlotT, PadQ>(
++          q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token, begin,
++          params.swa_topk, params.swa_page_size, params.swa_page_stride, params.swa_row_stride,
++          params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem, running_m, running_l,
++          alpha, acc, params.sm_scale, valid_heads);
++      if (begin + kV41MmaTile < params.swa_topk) {
++        run_v41_tile<false, SwaSlotT, PadQ>(
++            q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token,
++            begin + kV41MmaTile, params.swa_topk, params.swa_page_size, params.swa_page_stride,
++            params.swa_row_stride, params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem,
++            running_m, running_l, alpha, acc, params.sm_scale, valid_heads);
++      }
++    }
++    if (params.has_global) {
++      for (int tile = split; tile < global_tiles; tile += params.num_splits) {
++        const int begin = tile * kV41CandidateTile;
++        run_v41_tile<true, GlobalSlotT, PadQ>(
++            q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token,
++            begin, params.global_topk, params.global_page_size, params.global_page_stride,
++            params.global_row_stride, params.global_nbytes, kv_smem, scratch, probs, valid_smem,
++            row_smem, running_m, running_l, alpha, acc, params.sm_scale, valid_heads);
++        if (begin + kV41MmaTile < params.global_topk) {
++          run_v41_tile<true, GlobalSlotT, PadQ>(
++              q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token,
++              begin + kV41MmaTile, params.global_topk, params.global_page_size,
++              params.global_page_stride, params.global_row_stride, params.global_nbytes, kv_smem,
++              scratch, probs, valid_smem, row_smem, running_m, running_l, alpha, acc,
++              params.sm_scale, valid_heads);
++        }
++      }
++    }
++  }
++
++  if (tid < kV41HeadTile) {
++    alpha[tid] = 1.0f;
++    if (tid < valid_heads && split == 0) {
++      const float sink = params.sinks[head_start + tid];
++      if (sink > -CUDART_INF_F) {
++        const float old_m = running_m[tid];
++        const float new_m = fmaxf(old_m, sink);
++        const float scale_old = expf(old_m - new_m);
++        running_l[tid] = running_l[tid] * scale_old + expf(sink - new_m);
++        running_m[tid] = new_m;
++        alpha[tid] = scale_old;
++      }
++    }
++  }
++  __syncthreads();
++
++  const int head = tid / kV41MmaTile;
++  const int column = tid % kV41MmaTile;
++#pragma unroll
++  for (int tile = 0; tile < kV41OutputTiles; ++tile) {
++    acc[tile] *= alpha[head];
++  }
++  if (head < valid_heads) {
++    const int global_head = head_start + head;
++    const float denominator = running_l[head];
++    const int64_t out_base = static_cast<int64_t>(token) * params.partial_out_stride_token +
++                             static_cast<int64_t>(split) * params.partial_out_stride_split +
++                             static_cast<int64_t>(global_head) * params.partial_out_stride_head;
++#pragma unroll
++    for (int tile = 0; tile < kV41OutputTiles; ++tile) {
++      const float value = denominator > 0.0f ? acc[tile] / denominator : 0.0f;
++      if constexpr (FuseEpilogue) {
++        const float peer = __shfl_xor_sync(0xffffffff, value, 1);
++        if ((column & 1) == 0) {
++          store_v41_inv_rope_pair(params.epilogue, token, global_head, tile * 16 + column, value,
++                                  peer);
++        }
++      } else {
++        params.partial_out[out_base + tile * 16 + column] = __float2bfloat16_rn(value);
++      }
++    }
++    if (column == 0) {
++      const int64_t lse_offset = static_cast<int64_t>(token) * params.partial_lse_stride_token +
++                                 static_cast<int64_t>(split) * params.partial_lse_stride_split +
++                                 static_cast<int64_t>(global_head) * params.partial_lse_stride_head;
++      params.partial_lse[lse_offset] =
++          denominator > 0.0f ? running_m[head] + logf(denominator) : -CUDART_INF_F;
++    }
++  }
++}
++
++struct V41MergeParams {
++  const bf16* partial_out;
++  const float* partial_lse;
++  bf16* out;
++  int64_t partial_out_stride_token;
++  int64_t partial_out_stride_split;
++  int64_t partial_out_stride_head;
++  int64_t partial_lse_stride_token;
++  int64_t partial_lse_stride_split;
++  int64_t partial_lse_stride_head;
++  int64_t out_stride_token;
++  int64_t out_stride_head;
++  int num_tokens;
++  int num_heads;
++  int num_splits;
++  V41EpilogueParams epilogue;
++};
++
++template <bool FuseEpilogue = false>
++__global__ void deepseek_v41_mixed_sparse_merge_kernel(V41MergeParams params) {
++  const int token = blockIdx.x;
++  const int head = blockIdx.y;
++  const int tid = threadIdx.x;
++  __shared__ float weights[kV41MaxSplits];
++  __shared__ float denominator;
++
++  if (tid == 0) {
++    float max_lse = -CUDART_INF_F;
++    for (int split = 0; split < params.num_splits; ++split) {
++      const int64_t offset = static_cast<int64_t>(token) * params.partial_lse_stride_token +
++                             static_cast<int64_t>(split) * params.partial_lse_stride_split +
++                             static_cast<int64_t>(head) * params.partial_lse_stride_head;
++      max_lse = fmaxf(max_lse, params.partial_lse[offset]);
++    }
++    float sum = 0.0f;
++    if (max_lse > -CUDART_INF_F) {
++      for (int split = 0; split < params.num_splits; ++split) {
++        const int64_t offset = static_cast<int64_t>(token) * params.partial_lse_stride_token +
++                               static_cast<int64_t>(split) * params.partial_lse_stride_split +
++                               static_cast<int64_t>(head) * params.partial_lse_stride_head;
++        weights[split] = expf(params.partial_lse[offset] - max_lse);
++        sum += weights[split];
++      }
++    } else {
++      for (int split = 0; split < params.num_splits; ++split) weights[split] = 0.0f;
++    }
++    denominator = sum;
++  }
++  __syncthreads();
++
++  for (int dim = tid; dim < kV41Dim; dim += blockDim.x) {
++    float numerator = 0.0f;
++    for (int split = 0; split < params.num_splits; ++split) {
++      const int64_t offset = static_cast<int64_t>(token) * params.partial_out_stride_token +
++                             static_cast<int64_t>(split) * params.partial_out_stride_split +
++                             static_cast<int64_t>(head) * params.partial_out_stride_head + dim;
++      numerator += __bfloat162float(params.partial_out[offset]) * weights[split];
++    }
++    const float value = denominator > 0.0f ? numerator / denominator : 0.0f;
++    if constexpr (FuseEpilogue) {
++      const float peer = __shfl_xor_sync(0xffffffff, value, 1);
++      if ((dim & 1) == 0) {
++        store_v41_inv_rope_pair(params.epilogue, token, head, dim, value, peer);
++      }
++    } else {
++      params.out[static_cast<int64_t>(token) * params.out_stride_token +
++                 static_cast<int64_t>(head) * params.out_stride_head + dim] =
++          __float2bfloat16_rn(value);
++    }
++  }
++}
++
++// Unlike WMMA's opaque fragment layout, m16n8k16 defines the two accumulator
++// rows per lane. Keep PV in those registers across online softmax updates.
++__device__ __forceinline__ void v41_mma_bf16(float* acc, const uint32_t* a, const uint32_t* b) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++      : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++__device__ __forceinline__ uint32_t v41_load_bf16_pair(const bf16* ptr) {
++  if ((reinterpret_cast<uintptr_t>(ptr) & 3U) == 0) {
++    return *reinterpret_cast<const uint32_t*>(ptr);
++  }
++  return static_cast<uint32_t>(__bfloat16_as_ushort(ptr[0])) |
++         (static_cast<uint32_t>(__bfloat16_as_ushort(ptr[1])) << 16);
++}
++
++__device__ __forceinline__ void v41_load_mma_a(const bf16* matrix, int64_t stride, int column,
++                                               int valid_heads, uint32_t* a) {
++  const int lane = threadIdx.x & 31;
++  const int row = lane >> 2;
++  const int col = column + (lane & 3) * 2;
++  a[0] = v41_load_bf16_pair(matrix + row * stride + col);
++  a[1] = row + 8 < valid_heads ? v41_load_bf16_pair(matrix + (row + 8) * stride + col) : 0;
++  a[2] = v41_load_bf16_pair(matrix + row * stride + col + 8);
++  a[3] = row + 8 < valid_heads ? v41_load_bf16_pair(matrix + (row + 8) * stride + col + 8) : 0;
++}
++
++__device__ __forceinline__ void v41_load_mma_v(const bf16* matrix, int row, int col, uint32_t* b) {
++  const bf16* ptr = matrix + (row + (threadIdx.x & 15)) * kV41SmemDim + col;
++  const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
++  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
++               : "=r"(b[0]), "=r"(b[1])
++               : "r"(address));
++}
++
++constexpr int kV41PrefillRows = 32;
++constexpr int kV41PrefillWarps = kV41PrefillRows / 8;
++constexpr int kV41PrefillThreads = 32 * kV41PrefillWarps;
++constexpr int kV41PrefillOutputTiles = kV41Dim / (kV41PrefillWarps * 8);
++
++struct alignas(16) V41PrefillSmem {
++  bf16 kv[kV41PrefillRows * kV41SmemDim];
++  alignas(16) uint8_t packed[2][8 * kV41SwaPayloadBytes];
++  bf16 probs[kV41HeadTile * kV41PrefillRows];
++  float maxima[kV41PrefillWarps * kV41HeadTile];
++  float sums[kV41PrefillWarps * kV41HeadTile];
++  int valid[kV41PrefillRows];
++  int64_t rows[kV41PrefillRows];
++};
++
++template <bool Global>
++__device__ __forceinline__ void v41_prefetch_stage(const V41AttentionParams& params, int stage,
++                                                   V41PrefillSmem& smem) {
++  constexpr int payload = Global ? kV41GlobalPayloadBytes : kV41SwaPayloadBytes;
++  constexpr int chunks = payload / 16;
++  const uint8_t* cache = Global ? params.global_cache : params.swa_cache;
++  for (int linear = threadIdx.x; linear < 8 * chunks; linear += kV41PrefillThreads) {
++    const int row = stage * 8 + linear / chunks;
++    const int chunk = linear % chunks;
++    uint8_t* dst = smem.packed[stage & 1] + linear * 16;
++    if (smem.valid[row]) {
++      const uint8_t* src = cache + smem.rows[row] + chunk * 16;
++      if ((reinterpret_cast<uintptr_t>(src) & 15U) == 0) {
++        const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
++        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(address), "l"(src)
++                     : "memory");
++      } else {
++        *reinterpret_cast<uint4*>(dst) = load_u128(src);
++      }
++    } else {
++      *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
++    }
++  }
++  asm volatile("cp.async.commit_group;\n" ::: "memory");
++}
++
++template <bool Global, typename SlotT>
++__device__ __forceinline__ void load_v41_prefill_tile(const V41AttentionParams& params, int token,
++                                                      int begin, V41PrefillSmem& smem) {
++  constexpr int payload = Global ? kV41GlobalPayloadBytes : kV41SwaPayloadBytes;
++  constexpr int chunks = Global ? 16 : 32;
++  const auto* slots = static_cast<const SlotT*>(Global ? params.global_slots : params.swa_slots);
++  const int topk = Global ? params.global_topk : 128;
++  const int tid = threadIdx.x;
++  if (tid < kV41PrefillRows) {
++    smem.rows[tid] = 0;
++    smem.valid[tid] =
++        begin + tid < topk &&
++        resolve_v41_row(slots,
++                        static_cast<int64_t>(token) * (Global ? params.global_slots_stride_token
++                                                              : params.swa_slots_stride_token) +
++                            begin + tid,
++                        Global ? params.global_page_size : 32,
++                        Global ? params.global_page_stride : params.swa_page_stride,
++                        Global ? params.global_row_stride : params.swa_row_stride,
++                        Global ? params.global_nbytes : params.swa_nbytes, payload,
++                        &smem.rows[tid]);
++  }
++  __syncthreads();
++  v41_prefetch_stage<Global>(params, 0, smem);
++#pragma unroll
++  for (int stage = 0; stage < kV41PrefillRows / 8; ++stage) {
++    if (stage + 1 < kV41PrefillRows / 8) {
++      v41_prefetch_stage<Global>(params, stage + 1, smem);
++      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
++    } else {
++      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
++    }
++    __syncthreads();
++    for (int linear = tid; linear < 8 * chunks; linear += kV41PrefillThreads) {
++      const int row = linear / chunks;
++      const int chunk = linear % chunks;
++      const uint8_t* src = smem.packed[stage & 1] + row * payload;
++      const uint4 packed = *reinterpret_cast<const uint4*>(src + chunk * 16);
++      float scales[2];
++      if constexpr (Global) {
++        scales[0] = decode_fp8_e4m3(src[256 + chunk * 2]);
++        scales[1] = decode_fp8_e4m3(src[256 + chunk * 2 + 1]);
++      } else {
++        scales[0] = __uint_as_float(static_cast<uint32_t>(src[512 + chunk / 2]) << 23);
++      }
++#pragma unroll
++      for (int half = 0; half < (Global ? 4 : 2); ++half) {
++        uint32_t words[4];
++#pragma unroll
++        for (int pair = 0; pair < 4; ++pair) {
++          float even, odd;
++          if constexpr (Global) {
++            const uint8_t codes = extract_u8(packed, half * 4 + pair);
++            even = decode_e2m1(codes & 0xf) * scales[half / 2];
++            odd = decode_e2m1(codes >> 4) * scales[half / 2];
++          } else {
++            const int byte = half * 8 + pair * 2;
++            even = decode_fp8_e4m3(extract_u8(packed, byte)) * scales[0];
++            odd = decode_fp8_e4m3(extract_u8(packed, byte + 1)) * scales[0];
++          }
++          const __nv_bfloat162_raw values = __floats2bfloat162_rn(even, odd);
++          words[pair] = static_cast<uint32_t>(values.x) | (static_cast<uint32_t>(values.y) << 16);
++        }
++        *reinterpret_cast<uint4*>(smem.kv + (stage * 8 + row) * kV41SmemDim +
++                                  chunk * (Global ? 32 : 16) + half * 8) =
++            make_uint4(words[0], words[1], words[2], words[3]);
++      }
++    }
++    __syncthreads();
++  }
++}
++
++template <typename SwaSlotT, typename GlobalSlotT, bool HasGlobal, bool FuseEpilogue = false>
++__global__ void __launch_bounds__(kV41PrefillThreads)
++    deepseek_v41_prefill_kernel(V41AttentionParams params) {
++  const int token = blockIdx.x;
++  const int head_start = blockIdx.y * kV41HeadTile;
++  const int valid_heads = min(kV41HeadTile, params.num_heads - head_start);
++  const int warp = threadIdx.x / 32;
++  const int lane = threadIdx.x & 31;
++  const int row = lane >> 2;
++  const int col = (lane & 3) * 2;
++  extern __shared__ __align__(16) uint8_t storage[];
++  auto& smem = *reinterpret_cast<V41PrefillSmem*>(storage);
++  const bf16* q = params.q + static_cast<int64_t>(token) * params.q_stride_token +
++                  static_cast<int64_t>(head_start) * params.q_stride_head;
++#if __CUDA_ARCH__ == 890
++  // Ada needs more registers for FP8 decoding. Retain most Q fragments while
++  // leaving enough registers for the mixed-cache loader without local spills.
++  constexpr int cached_query_tiles = 24;
++#else
++  constexpr int cached_query_tiles = kV41Dim / 16;
++#endif
++  uint32_t query_fragments[cached_query_tiles][4];
++#pragma unroll
++  for (int k = 0; k < cached_query_tiles; ++k) {
++    v41_load_mma_a(q, params.q_stride_head, k * 16, valid_heads, query_fragments[k]);
++  }
++  float acc[kV41PrefillOutputTiles][4] = {};
++  float running_m[2] = {-CUDART_INF_F, -CUDART_INF_F};
++  float running_l[2] = {};
++
++#pragma unroll 1
++  for (int tile = 0;
++       tile < 128 / kV41PrefillRows +
++                  (HasGlobal ? (params.global_topk + kV41PrefillRows - 1) / kV41PrefillRows : 0);
++       ++tile) {
++    if constexpr (HasGlobal) {
++      if (tile < 128 / kV41PrefillRows) {
++        load_v41_prefill_tile<false, SwaSlotT>(params, token, tile * kV41PrefillRows, smem);
++      } else {
++        load_v41_prefill_tile<true, GlobalSlotT>(
++            params, token, (tile - 128 / kV41PrefillRows) * kV41PrefillRows, smem);
++      }
++    } else {
++      load_v41_prefill_tile<false, SwaSlotT>(params, token, tile * kV41PrefillRows, smem);
++    }
++
++    float scores[4] = {};
++#pragma unroll
++    for (int k = 0; k < kV41Dim; k += 16) {
++      uint32_t b[2];
++      const bf16* key = smem.kv + (warp * 8 + row) * kV41SmemDim + k + col;
++      b[0] = v41_load_bf16_pair(key);
++      b[1] = v41_load_bf16_pair(key + 8);
++      if (k / 16 < cached_query_tiles) {
++        v41_mma_bf16(scores, query_fragments[k / 16], b);
++      } else {
++        uint32_t a[4];
++        v41_load_mma_a(q, params.q_stride_head, k, valid_heads, a);
++        v41_mma_bf16(scores, a, b);
++      }
++    }
++    float alpha[2];
++#pragma unroll
++    for (int r = 0; r < 2; ++r) {
++      const int head = row + r * 8;
++      float maximum = -CUDART_INF_F;
++#pragma unroll
++      for (int c = 0; c < 2; ++c) {
++        float& score = scores[r * 2 + c];
++        score = smem.valid[warp * 8 + col + c] ? score * params.sm_scale : -CUDART_INF_F;
++        maximum = fmaxf(maximum, score);
++      }
++      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
++      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
++      if ((lane & 3) == 0) smem.maxima[warp * kV41HeadTile + head] = maximum;
++    }
++    __syncthreads();
++#pragma unroll
++    for (int r = 0; r < 2; ++r) {
++      const int head = row + r * 8;
++      float maximum = running_m[r];
++#pragma unroll
++      for (int w = 0; w < kV41PrefillWarps; ++w) {
++        maximum = fmaxf(maximum, smem.maxima[w * kV41HeadTile + head]);
++      }
++      alpha[r] = maximum > -CUDART_INF_F ? expf(running_m[r] - maximum) : 1.0f;
++      running_m[r] = maximum;
++      float sum = 0.0f;
++#pragma unroll
++      for (int c = 0; c < 2; ++c) {
++        const int candidate = warp * 8 + col + c;
++        const float p = smem.valid[candidate] ? expf(scores[r * 2 + c] - maximum) : 0.0f;
++        sum += p;
++        smem.probs[head * kV41PrefillRows + candidate] = __float2bfloat16_rn(p);
++      }
++      sum += __shfl_xor_sync(0xffffffff, sum, 1);
++      sum += __shfl_xor_sync(0xffffffff, sum, 2);
++      if ((lane & 3) == 0) smem.sums[warp * kV41HeadTile + head] = sum;
++    }
++    __syncthreads();
++#pragma unroll
++    for (int r = 0; r < 2; ++r) {
++      float sum = 0.0f;
++#pragma unroll
++      for (int w = 0; w < kV41PrefillWarps; ++w) {
++        sum += smem.sums[w * kV41HeadTile + row + r * 8];
++      }
++      running_l[r] = running_l[r] * alpha[r] + sum;
++    }
++#pragma unroll
++    for (int n = 0; n < kV41PrefillOutputTiles; ++n) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) acc[n][i] *= alpha[i / 2];
++    }
++#pragma unroll
++    for (int k = 0; k < kV41PrefillRows; k += 16) {
++      uint32_t a[4];
++      v41_load_mma_a(smem.probs, kV41PrefillRows, k, kV41HeadTile, a);
++#pragma unroll
++      for (int n = 0; n < kV41PrefillOutputTiles; ++n) {
++        uint32_t b[2];
++        v41_load_mma_v(smem.kv, k, warp * kV41PrefillOutputTiles * 8 + n * 8, b);
++        v41_mma_bf16(acc[n], a, b);
++      }
++    }
++    __syncthreads();
++  }
++
++#pragma unroll
++  for (int r = 0; r < 2; ++r) {
++    const int head = row + r * 8;
++    if (head >= valid_heads) continue;
++    const float sink = params.sinks[head_start + head];
++    float scale = 1.0f;
++    if (sink > -CUDART_INF_F) {
++      const float maximum = fmaxf(running_m[r], sink);
++      scale = expf(running_m[r] - maximum);
++      running_l[r] = running_l[r] * scale + expf(sink - maximum);
++      running_m[r] = maximum;
++    }
++    const int64_t output_base = static_cast<int64_t>(token) * params.partial_out_stride_token +
++                                (head_start + head) * params.partial_out_stride_head;
++#pragma unroll
++    for (int n = 0; n < kV41PrefillOutputTiles; ++n) {
++      float values[2];
++#pragma unroll
++      for (int c = 0; c < 2; ++c) {
++        values[c] = running_l[r] > 0.0f ? acc[n][r * 2 + c] * scale / running_l[r] : 0.0f;
++      }
++      const int dim = warp * kV41PrefillOutputTiles * 8 + n * 8 + col;
++      if constexpr (FuseEpilogue) {
++        store_v41_inv_rope_pair(params.epilogue, token, head_start + head, dim, values[0],
++                                values[1]);
++      } else {
++        params.partial_out[output_base + dim] = __float2bfloat16_rn(values[0]);
++        params.partial_out[output_base + dim + 1] = __float2bfloat16_rn(values[1]);
++      }
++    }
++    if (warp == 0 && (lane & 3) == 0) {
++      const int64_t lse_index = static_cast<int64_t>(token) * params.partial_lse_stride_token +
++                                (head_start + head) * params.partial_lse_stride_head;
++      params.partial_lse[lse_index] =
++          running_l[r] > 0.0f ? running_m[r] + logf(running_l[r]) : -CUDART_INF_F;
++    }
++  }
++}
++
++template <typename SwaSlotT, typename GlobalSlotT, bool FuseEpilogue>
++inline cudaError_t launch_v41_attention_impl(const V41AttentionParams& params, bf16* output,
++                                             int64_t out_stride_token, int64_t out_stride_head,
++                                             cudaStream_t stream) {
++  if (params.swa_topk == 128 && params.num_tokens > 32 && params.num_splits == 1) {
++    if (params.has_global) {
++      deepseek_v41_prefill_kernel<SwaSlotT, GlobalSlotT, true, FuseEpilogue>
++          <<<dim3(params.num_tokens, (params.num_heads + 15) / 16), kV41PrefillThreads,
++             sizeof(V41PrefillSmem), stream>>>(params);
++    } else {
++      deepseek_v41_prefill_kernel<SwaSlotT, SwaSlotT, false, FuseEpilogue>
++          <<<dim3(params.num_tokens, (params.num_heads + 15) / 16), kV41PrefillThreads,
++             sizeof(V41PrefillSmem), stream>>>(params);
++    }
++    return cudaGetLastError();
++  }
++  const bool pad_q = params.num_heads == 8;
++  const size_t q_bytes = pad_q ? kV41HeadTile * kV41SmemDim * sizeof(bf16) : 0;
++  const size_t smem_bytes = q_bytes + kV41MmaTile * kV41SmemDim * sizeof(bf16) + kV41ScratchBytes +
++                            kV41HeadTile * kV41MmaTile * sizeof(bf16) + kV41MmaTile * sizeof(int) +
++                            kV41MmaTile * sizeof(int64_t) + 3 * kV41HeadTile * sizeof(float);
++  const dim3 grid(params.num_tokens, (params.num_heads + kV41HeadTile - 1) / kV41HeadTile,
++                  params.num_splits);
++  if (pad_q) {
++    if (FuseEpilogue && params.num_splits == 1) {
++      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, true>
++          <<<grid, kV41Threads, smem_bytes, stream>>>(params);
++    } else {
++      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, false>
++          <<<grid, kV41Threads, smem_bytes, stream>>>(params);
++    }
++  } else {
++    if (FuseEpilogue && params.num_splits == 1) {
++      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, true>
++          <<<grid, kV41Threads, smem_bytes, stream>>>(params);
++    } else {
++      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, false>
++          <<<grid, kV41Threads, smem_bytes, stream>>>(params);
++    }
++  }
++  cudaError_t status = cudaGetLastError();
++  if (status != cudaSuccess || params.num_splits == 1) return status;
++
++  V41MergeParams merge{params.partial_out,
++                       params.partial_lse,
++                       output,
++                       params.partial_out_stride_token,
++                       params.partial_out_stride_split,
++                       params.partial_out_stride_head,
++                       params.partial_lse_stride_token,
++                       params.partial_lse_stride_split,
++                       params.partial_lse_stride_head,
++                       out_stride_token,
++                       out_stride_head,
++                       params.num_tokens,
++                       params.num_heads,
++                       params.num_splits,
++                       params.epilogue};
++  deepseek_v41_mixed_sparse_merge_kernel<FuseEpilogue>
++      <<<dim3(params.num_tokens, params.num_heads), 256, 0, stream>>>(merge);
++  return cudaGetLastError();
++}
++
++template <typename SwaSlotT, typename GlobalSlotT>
++inline cudaError_t launch_deepseek_v41_attention(const V41AttentionParams& params, bf16* output,
++                                                 int64_t out_stride_token, int64_t out_stride_head,
++                                                 cudaStream_t stream) {
++  if (params.epilogue.output != nullptr) {
++    return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, true>(params, output, out_stride_token,
++                                                                  out_stride_head, stream);
++  }
++  return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, false>(params, output, out_stride_token,
++                                                                 out_stride_head, stream);
++}
++
++}  // namespace flashinfer::deepseek_v41
+diff --git a/tests/attention/test_deepseek_v41_mixed_sparse.py b/tests/attention/test_deepseek_v41_mixed_sparse.py
+new file mode 100644
+--- /dev/null
++++ b/tests/attention/test_deepseek_v41_mixed_sparse.py
+@@ -0,0 +1,1656 @@
++"""DeepSeek-V4.1 mixed sparse cache and attention contracts."""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++import torch
++
++from flashinfer.mla.deepseek_v41 import (
++    DEEPSEEK_V41_GLOBAL_FORMAT,
++    DEEPSEEK_V41_GLOBAL_ROW_BYTES,
++    DEEPSEEK_V41_SWA_FORMAT,
++    DEEPSEEK_V41_SWA_PAGE_SIZE,
++    DEEPSEEK_V41_SWA_ROW_BYTES,
++    _deepseek_v41_mixed_sparse_attention_with_inv_rope,
++    deepseek_v41_mixed_sparse_attention,
++    deepseek_v41_mixed_sparse_workspace_size,
++    deepseek_v41_mixed_sparse_workspace_size_upper_bound,
++    deepseek_v41_pack_global_cache,
++    deepseek_v41_pack_swa_cache,
++)
++
++
++def _fp4_decode(data: torch.Tensor) -> torch.Tensor:
++    codes = torch.stack((data & 0xF, data >> 4), dim=-1).flatten(-2)
++    levels = torch.tensor(
++        [0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=data.device
++    )
++    return levels[(codes & 7).long()] * torch.where((codes & 8) != 0, -1.0, 1.0)
++
++
++def _decode_swa(rows: torch.Tensor) -> torch.Tensor:
++    values = rows[:, :512].view(torch.float8_e4m3fn).float()
++    scales = rows[:, 512:528].view(torch.float8_e8m0fnu).float()
++    return (values.unflatten(-1, (16, 32)) * scales.unsqueeze(-1)).flatten(-2)
++
++
++def _decode_global(rows: torch.Tensor) -> torch.Tensor:
++    values = _fp4_decode(rows[:, :256]).unflatten(-1, (32, 16))
++    scales = rows[:, 256:288].view(torch.float8_e4m3fn).float()
++    return (values * scales.unsqueeze(-1)).flatten(-2)
++
++
++def _make_inverse_rope_inputs(num_tokens: int, device: torch.device):
++    num_positions = 3 * num_tokens + 11
++    positions = (
++        torch.arange(num_tokens, dtype=torch.int64, device=device) * 7 + 3
++    ) % num_positions
++    frequencies = torch.exp(
++        -torch.arange(32, dtype=torch.float32, device=device)
++        * (math.log(10_000.0) / 32)
++    )
++    angles = (
++        torch.arange(num_positions, dtype=torch.float32, device=device)[:, None]
++        * frequencies[None]
++        + 0.03125
++    )
++    return positions.contiguous(), torch.cat((angles.cos(), angles.sin()), dim=1)
++
++
++def _inverse_rope_grouped_reference(
++    attention_out: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin: torch.Tensor,
++) -> torch.Tensor:
++    rotated = attention_out.float().clone()
++    selected = cos_sin[positions.long()].float()
++    cosine = selected[:, None, :32]
++    sine = selected[:, None, 32:]
++    even = attention_out[..., -64::2].float()
++    odd = attention_out[..., -63::2].float()
++    even_cos = even * cosine
++    odd_sin = odd * sine
++    odd_cos = odd * cosine
++    even_sin = even * sine
++    rotated[..., -64::2] = even_cos + odd_sin
++    rotated[..., -63::2] = odd_cos - even_sin
++    groups = attention_out.shape[1] // 8
++    return (
++        rotated.to(torch.bfloat16)
++        .reshape(attention_out.shape[0], groups, 4096)
++        .transpose(0, 1)
++        .contiguous()
++        .transpose(0, 1)
++    )
++
++
++def _gather(storage, slots, page_size, page_stride, row_stride, payload):
++    if storage.ndim == 3:
++        last_slot = storage.shape[0] * page_size - 1
++        span = (
++            (last_slot // page_size) * page_stride
++            + (last_slot % page_size) * row_stride
++            + payload
++        )
++    else:
++        span = storage.numel()
++    flat = storage.as_strided((span,), (1,), storage.storage_offset())
++    result = torch.zeros(*slots.shape, payload, dtype=torch.uint8, device=slots.device)
++    for t in range(slots.shape[0]):
++        for i in range(slots.shape[1]):
++            slot = int(slots[t, i])
++            offset = (slot // page_size) * page_stride + (slot % page_size) * row_stride
++            if slot >= 0 and offset + payload <= flat.numel():
++                result[t, i].copy_(flat[offset : offset + payload])
++    return result
++
++
++def _attention_reference(
++    q,
++    swa_cache,
++    swa_slots,
++    sinks,
++    *,
++    global_cache=None,
++    global_slots=None,
++):
++    swa_rows = _gather(
++        swa_cache,
++        swa_slots,
++        32,
++        swa_cache.stride(0),
++        swa_cache.stride(1),
++        DEEPSEEK_V41_SWA_ROW_BYTES,
++    )
++    swa_decoded = _decode_swa(swa_rows.flatten(0, 1)).unflatten(0, swa_slots.shape)
++    swa_capacity = swa_cache.shape[0] * swa_cache.shape[1]
++
++    global_decoded = None
++    global_capacity = 0
++    if global_cache is not None and global_slots is not None:
++        global_rows = _gather(
++            global_cache,
++            global_slots,
++            global_cache.shape[1],
++            global_cache.stride(0),
++            global_cache.stride(1),
++            DEEPSEEK_V41_GLOBAL_ROW_BYTES,
++        )
++        global_decoded = _decode_global(global_rows.flatten(0, 1)).unflatten(
++            0, global_slots.shape
++        )
++        global_capacity = global_cache.shape[0] * global_cache.shape[1]
++
++    expected = torch.empty_like(q)
++    for token in range(q.shape[0]):
++        valid_swa = (swa_slots[token] >= 0) & (swa_slots[token] < swa_capacity)
++        kv = swa_decoded[token, valid_swa].to(torch.bfloat16)
++        if global_decoded is not None and global_slots is not None:
++            valid_global = (global_slots[token] >= 0) & (
++                global_slots[token] < global_capacity
++            )
++            kv = torch.cat((kv, global_decoded[token, valid_global].to(torch.bfloat16)))
++        logits = q[token].float() @ kv.float().T * (512**-0.5)
++        logits = torch.cat((logits, sinks[:, None]), dim=1)
++        probabilities = logits.softmax(dim=1)[:, :-1].to(torch.bfloat16)
++        expected[token] = (probabilities.float() @ kv.float()).to(torch.bfloat16)
++    return expected
++
++
++def test_v41_cache_format_tags_are_unambiguous():
++    assert DEEPSEEK_V41_SWA_FORMAT == "fp8_e4m3_ue8m0_g32"
++    assert DEEPSEEK_V41_GLOBAL_FORMAT == "fp4_e2m1_e4m3_g16"
++    assert DEEPSEEK_V41_SWA_ROW_BYTES == 512 + 512 // 32
++    assert DEEPSEEK_V41_GLOBAL_ROW_BYTES == 512 // 2 + 512 // 16
++    assert DEEPSEEK_V41_SWA_PAGE_SIZE == 32
++    assert deepseek_v41_mixed_sparse_workspace_size(1, 8, 512, 128) == (
++        1 * 40 * 8 * 512 * 2 + 1 * 40 * 8 * 4
++    )
++    assert deepseek_v41_mixed_sparse_workspace_size(64, 8, 512, 128) == 64 * 8 * 4
++    assert deepseek_v41_mixed_sparse_workspace_size(0, 8, 512, 128) == 0
++    upper_bound = deepseek_v41_mixed_sparse_workspace_size_upper_bound(
++        32, 8, 128, 512, 512
++    )
++    assert upper_bound == 155 * 8 * 512 * 2 + 155 * 8 * 4
++    for num_tokens in range(1, 33):
++        for swa_topk in range(128, 513, 31):
++            assert (
++                deepseek_v41_mixed_sparse_workspace_size(num_tokens, 8, swa_topk, 512)
++                <= upper_bound
++            )
++    decode_upper_bound = deepseek_v41_mixed_sparse_workspace_size_upper_bound(
++        1, 8, 128, 2048, 512
++    )
++    assert decode_upper_bound == 526336
++    for swa_topk in range(128, 2049):
++        assert (
++            deepseek_v41_mixed_sparse_workspace_size(1, 8, swa_topk, 512)
++            <= decode_upper_bound
++        )
++
++
++@pytest.mark.parametrize("arch", [89, 120])
++@pytest.mark.parametrize("has_global", [False, True])
++def test_v41_triton_offline_compile_uses_bf16_mma_and_int64_offsets(arch, has_global):
++    from flashinfer.mla._deepseek_v41_sparse_triton import (
++        compile_deepseek_v41_mixed_sparse_ptx,
++    )
++
++    ptx, shared_bytes = compile_deepseek_v41_mixed_sparse_ptx(
++        arch,
++        8,
++        3,
++        has_global,
++        128,
++    )
++    assert "mma.sync" in ptx and ".bf16.bf16.f32" in ptx
++    assert "mul.lo.s64" in ptx
++    assert shared_bytes == (51200 if has_global else 33280)
++
++
++@pytest.mark.parametrize("arch", [89, 120])
++def test_v41_triton_unified_tiles_compile_without_fp4_lookup_chain(arch):
++    from flashinfer.mla._deepseek_v41_sparse_triton import (
++        compile_deepseek_v41_mixed_sparse_ptx,
++    )
++
++    ptx, shared_bytes = compile_deepseek_v41_mixed_sparse_ptx(
++        arch,
++        8,
++        20,
++        True,
++        128,
++        unified_tiles=True,
++    )
++    assert "mma.sync" in ptx and ".bf16.bf16.f32" in ptx
++    assert "mul.lo.s64" in ptx
++    assert shared_bytes == 49152
++
++
++@pytest.mark.parametrize("arch", [89, 120])
++def test_v41_triton_merge_offline_compile(arch):
++    from flashinfer.mla._deepseek_v41_sparse_triton import (
++        compile_deepseek_v41_mixed_sparse_merge_ptx,
++    )
++
++    ptx, shared_bytes = compile_deepseek_v41_mixed_sparse_merge_ptx(arch, 3)
++    assert ".entry deepseek_v41_mixed_sparse_merge_kernel" in ptx
++    assert "ld.global" in ptx and "st.global" in ptx
++    assert shared_bytes == 0
++
++
++@pytest.mark.skipif(
++    torch.cuda.device_count() < 2
++    or torch.cuda.get_device_capability(0) not in ((8, 9), (12, 0)),
++    reason="requires two CUDA devices and a supported device 0",
++)
++def test_v41_rejects_cache_on_another_device():
++    kv = torch.zeros(1, 512, dtype=torch.bfloat16, device="cuda:0")
++    write_slots = torch.zeros(1, dtype=torch.int32, device="cuda:0")
++    foreign_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device="cuda:1")
++
++    with pytest.raises(ValueError, match="cache.*kv.device"):
++        deepseek_v41_pack_swa_cache(kv, write_slots, foreign_cache)
++
++    q = kv.view(1, 1, 512).expand(1, 8, 512).contiguous()
++    read_slots = write_slots.view(1, 1)
++    with pytest.raises(ValueError, match="swa_cache.*q.device"):
++        deepseek_v41_mixed_sparse_attention(
++            q,
++            foreign_cache,
++            None,
++            read_slots,
++            None,
++            512**-0.5,
++        )
++
++
++@pytest.mark.skipif(
++    torch.cuda.device_count() < 2
++    or torch.cuda.get_device_capability(1) not in ((8, 9), (12, 0)),
++    reason="requires two CUDA devices and a supported device 1",
++)
++def test_v41_launches_on_q_device_when_it_is_not_current():
++    previous_device = torch.cuda.current_device()
++    try:
++        torch.cuda.set_device(0)
++        q = torch.randn(1, 8, 512, dtype=torch.bfloat16, device="cuda:1")
++        swa_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device="cuda:1")
++        swa_slots = torch.full((1, 32), -1, dtype=torch.int32, device="cuda:1")
++
++        result = deepseek_v41_mixed_sparse_attention(
++            q,
++            swa_cache,
++            None,
++            swa_slots,
++            None,
++            512**-0.5,
++        )
++        torch.cuda.synchronize(1)
++
++        assert result.device == torch.device("cuda:1")
++        assert torch.count_nonzero(result).item() == 0
++    finally:
++        torch.cuda.set_device(previous_device)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_zero_width_global_slots_select_swa_only_path():
++    device = torch.device("cuda")
++    q = torch.randn(1, 8, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device=device)
++    swa_slots = torch.full((1, 1), -1, dtype=torch.int32, device=device)
++    expected = deepseek_v41_mixed_sparse_attention(
++        q, swa_cache, None, swa_slots, None, 512**-0.5
++    )
++    actual = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        torch.zeros(1, 64, 288, dtype=torch.uint8, device=device),
++        swa_slots,
++        torch.empty(1, 0, dtype=torch.int32, device=device),
++        512**-0.5,
++    )
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize(
++    ("compress_ratio", "global_page_size"),
++    [(1, 128), (2, 64)],
++    ids=("c1", "c2"),
++)
++def test_v41_attention_reads_last_row_with_padded_strides(
++    compress_ratio, global_page_size
++):
++    device = torch.device("cuda")
++    prefix = 64
++    swa_row_stride = 544
++    swa_page_stride = 32 * swa_row_stride + 128
++    swa_backing = torch.zeros(
++        prefix + swa_page_stride, dtype=torch.uint8, device=device
++    )
++    swa_cache = swa_backing.as_strided(
++        (1, 32, swa_row_stride),
++        (swa_page_stride, swa_row_stride, 1),
++        storage_offset=prefix,
++    )
++    global_row_stride = 304
++    global_page_stride = global_page_size * global_row_stride + 128
++    global_backing = torch.zeros(
++        prefix + 2 * global_page_stride, dtype=torch.uint8, device=device
++    )
++    global_cache = global_backing.as_strided(
++        (2, global_page_size, global_row_stride),
++        (global_page_stride, global_row_stride, 1),
++        storage_offset=prefix,
++    )
++    assert global_page_size == 128 // compress_ratio
++    swa_kv = torch.linspace(-1, 1, 512, dtype=torch.bfloat16, device=device)[None]
++    global_kv = torch.stack(
++        (
++            torch.linspace(1, -1, 512, dtype=torch.bfloat16, device=device),
++            torch.linspace(-0.5, 0.75, 512, dtype=torch.bfloat16, device=device),
++            torch.linspace(0.25, -1, 512, dtype=torch.bfloat16, device=device),
++        )
++    )
++    deepseek_v41_pack_swa_cache(
++        swa_kv,
++        torch.tensor([31], dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    deepseek_v41_pack_global_cache(
++        global_kv,
++        torch.tensor(
++            [global_page_size - 1, global_page_size, 2 * global_page_size - 1],
++            dtype=torch.int64,
++            device=device,
++        ),
++        global_cache,
++    )
++    swa_slots = torch.tensor([[31]], dtype=torch.int32, device=device)
++    global_slots = torch.tensor(
++        [[global_page_size - 1, global_page_size, 2 * global_page_size - 1]],
++        dtype=torch.int64,
++        device=device,
++    )
++    q = torch.ones(1, 8, 512, dtype=torch.bfloat16, device=device)
++    actual = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        512**-0.5,
++    )
++
++    swa_decoded = _decode_swa(swa_cache[0, 31, :528][None])
++    global_rows = _gather(
++        global_cache,
++        global_slots,
++        global_page_size,
++        global_page_stride,
++        global_row_stride,
++        288,
++    )[0]
++    global_decoded = _decode_global(global_rows)
++    kv = torch.cat((swa_decoded, global_decoded)).to(torch.bfloat16)
++    logits = q[0].float() @ kv.float().T * (512**-0.5)
++    probabilities = logits.softmax(dim=1).to(torch.bfloat16)
++    expected = (probabilities.float() @ kv.float()).to(torch.bfloat16)
++    torch.testing.assert_close(actual[0], expected, rtol=3e-2, atol=3e-2)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("page_size", [64, 128])
++def test_v41_pack_boundaries_and_page_padding(page_size):
++    device = torch.device("cuda")
++    values = torch.zeros(5, 512, dtype=torch.bfloat16, device=device)
++    boundaries = torch.tensor(
++        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.25],
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    values[0, :8] = boundaries
++    values[1, 480:] = torch.linspace(-448, 448, 32, device=device)
++    values[2].fill_(2**-20)
++    values[3, :2] = torch.tensor(
++        [-0.29296875, 1.40625], dtype=torch.bfloat16, device=device
++    )
++    values[4, :2] = torch.tensor(
++        [-0.5859375, 2.8125], dtype=torch.bfloat16, device=device
++    )
++
++    swa_backing = torch.full(
++        (2 * (32 * 544 + 64),), 0xA5, dtype=torch.uint8, device=device
++    )
++    swa = swa_backing.as_strided((2, 32, 544), (32 * 544 + 64, 544, 1))
++    swa_slots = torch.tensor([0, 31, 32, 33, 63], dtype=torch.int32, device=device)
++    deepseek_v41_pack_swa_cache(values, swa_slots, swa)
++    swa_rows = _gather(swa, swa_slots[None], 32, swa.stride(0), 544, 528)[0]
++    swa_dequant = _decode_swa(swa_rows)
++    assert torch.isfinite(swa_dequant).all()
++    swa_amax = values.float().unflatten(-1, (16, 32)).abs().amax(dim=-1)
++    expected_swa_scales = torch.pow(
++        2.0,
++        torch.ceil(torch.log2(torch.clamp_min(swa_amax, 1.0e-4) / 448.0)),
++    ).to(torch.float8_e8m0fnu)
++    assert torch.equal(swa_rows[:, 512:528], expected_swa_scales.view(torch.uint8))
++
++    global_backing = torch.full(
++        (2 * (page_size * 304 + 128),), 0xA5, dtype=torch.uint8, device=device
++    )
++    global_cache = global_backing.as_strided(
++        (2, page_size, 304), (page_size * 304 + 128, 304, 1)
++    )
++    global_slots = torch.tensor(
++        [0, page_size - 1, page_size, 1, 2], dtype=torch.int64, device=device
++    )
++    deepseek_v41_pack_global_cache(values, global_slots, global_cache)
++    global_rows = _gather(
++        global_cache,
++        global_slots[None],
++        page_size,
++        global_cache.stride(0),
++        304,
++        288,
++    )[0]
++    global_dequant = _decode_global(global_rows)
++    assert torch.isfinite(global_dequant).all()
++    global_amax = values.float().unflatten(-1, (32, 16)).abs().amax(dim=-1)
++    expected_global_scales = (torch.clamp_min(global_amax, 6 * 2**-9) / 6).to(
++        torch.float8_e4m3fn
++    )
++    assert torch.equal(
++        global_rows[:, 256:288], expected_global_scales.view(torch.uint8)
++    )
++    assert global_rows[3, 0].item() == 0x7A
++    assert global_rows[4, 0].item() == 0x7A
++    assert torch.all(swa_backing[32 * 544 : 32 * 544 + 64] == 0xA5)
++    assert torch.all(global_backing[page_size * 304 : page_size * 304 + 128] == 0xA5)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("num_heads", [8, 16, 32])
++@pytest.mark.parametrize("with_global", [False, True])
++@pytest.mark.parametrize("num_tokens", [1, 33])
++def test_v41_attention_matches_selected_row_reference(
++    num_heads, with_global, num_tokens
++):
++    torch.manual_seed(7)
++    device = torch.device("cuda")
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    # Make the post-RoPE tail observable rather than statistically incidental.
++    q[..., -32:] = torch.arange(32, device=device) / 32
++    swa_kv = torch.randn(40, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.zeros(2, 32, 528, dtype=torch.uint8, device=device)
++    swa_write_slots = torch.arange(40, dtype=torch.int32, device=device)
++    deepseek_v41_pack_swa_cache(swa_kv, swa_write_slots, swa_cache)
++    swa_slot_pattern = torch.tensor(
++        [[0, 31, 32, -1, 999], [1, 2, 3, 4, -1], [39, 0, -1, -1, -1]],
++        dtype=torch.int32,
++        device=device,
++    )
++    swa_slot_prefix = swa_slot_pattern.repeat((num_tokens + 2) // 3, 1)[:num_tokens]
++    swa_slots = torch.cat(
++        (
++            swa_slot_prefix,
++            torch.full((num_tokens, 125), -1, dtype=torch.int32, device=device),
++        ),
++        dim=1,
++    )
++
++    global_cache = None
++    global_slots = None
++    if with_global:
++        global_kv = torch.randn(70, 512, dtype=torch.bfloat16, device=device)
++        global_cache = torch.zeros(2, 64, 288, dtype=torch.uint8, device=device)
++        deepseek_v41_pack_global_cache(
++            global_kv,
++            torch.arange(70, dtype=torch.int64, device=device),
++            global_cache,
++        )
++        global_slot_pattern = torch.tensor(
++            [[0, 63, 64, -1], [2, 4, 69, 500], [3, -1, -1, -1]],
++            dtype=torch.int64,
++            device=device,
++        )
++        global_slot_prefix = global_slot_pattern.repeat((num_tokens + 2) // 3, 1)[
++            :num_tokens
++        ]
++        global_slots = torch.cat(
++            (
++                global_slot_prefix,
++                torch.full((num_tokens, 66), -1, dtype=torch.int64, device=device),
++            ),
++            dim=1,
++        )
++
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    scale = 1 / math.sqrt(512)
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(
++            num_tokens,
++            num_heads,
++            swa_slots.shape[1],
++            0 if global_slots is None else global_slots.shape[1],
++        ),
++        dtype=torch.uint8,
++        device=device,
++    )
++    actual = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        scale,
++        sinks,
++        workspace=workspace,
++    )
++
++    swa_rows = _gather(swa_cache, swa_slots, 32, swa_cache.stride(0), 528, 528)
++    swa_decoded = _decode_swa(swa_rows.flatten(0, 1)).unflatten(0, swa_slots.shape)
++    if with_global:
++        assert global_cache is not None and global_slots is not None
++        global_rows = _gather(
++            global_cache, global_slots, 64, global_cache.stride(0), 288, 288
++        )
++        global_decoded = _decode_global(global_rows.flatten(0, 1)).unflatten(
++            0, global_slots.shape
++        )
++
++    expected = torch.empty_like(actual)
++    for token in range(num_tokens):
++        valid_swa = (swa_slots[token] >= 0) & (swa_slots[token] < 64)
++        kv = swa_decoded[token, valid_swa].to(torch.bfloat16)
++        if with_global:
++            assert global_slots is not None
++            valid_global = (global_slots[token] >= 0) & (global_slots[token] < 128)
++            kv = torch.cat((kv, global_decoded[token, valid_global].to(torch.bfloat16)))
++        logits = q[token].float() @ kv.float().T * scale
++        logits = torch.cat((logits, sinks[:, None]), dim=1)
++        probs = logits.softmax(dim=1)[:, :-1].to(torch.bfloat16)
++        expected[token] = (probs.float() @ kv.float()).to(torch.bfloat16)
++    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize(
++    ("num_heads", "swa_topk", "global_topk", "global_page_size"),
++    [
++        (8, 128, 0, None),
++        (16, 128, 0, None),
++        (32, 128, 0, None),
++        (8, 128, 31, 128),
++        (16, 128, 32, 64),
++        (32, 128, 33, 128),
++        (8, 128, 63, 64),
++        (16, 128, 64, 128),
++        (32, 128, 65, 64),
++        (8, 31, 31, 128),
++        (16, 32, 32, 64),
++        (32, 33, 33, 128),
++        (8, 63, 63, 64),
++        (16, 64, 64, 128),
++        (32, 65, 65, 64),
++    ],
++    ids=(
++        "c0-h8-swa128",
++        "c0-h16-swa128",
++        "c0-h32-swa128",
++        "mixed-h8-global-before32",
++        "mixed-h16-global-at32",
++        "mixed-h32-global-after32",
++        "mixed-h8-global-before64",
++        "mixed-h16-global-at64",
++        "mixed-h32-global-after64",
++        "c1-before32",
++        "c2-at32",
++        "c1-after32",
++        "c2-before64",
++        "c1-at64",
++        "c2-after64",
++    ),
++)
++def test_v41_prefill_candidate_boundaries_match_reference(
++    num_heads, swa_topk, global_topk, global_page_size
++):
++    torch.manual_seed(29)
++    device = torch.device("cuda")
++    num_tokens = 33
++    swa_capacity = 128
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    q[..., -32:] = torch.arange(32, device=device) / 16
++    swa_kv = torch.randn(swa_capacity, 512, dtype=torch.bfloat16, device=device)
++    swa_row_stride = 541
++    swa_page_stride = 32 * swa_row_stride + 7
++    swa_backing = torch.empty(3 + 4 * swa_page_stride, dtype=torch.uint8, device=device)
++    swa_cache = swa_backing.as_strided(
++        (4, 32, 528),
++        (swa_page_stride, swa_row_stride, 1),
++        storage_offset=3,
++    )
++    deepseek_v41_pack_swa_cache(
++        swa_kv,
++        torch.arange(swa_capacity, dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    swa_slots = torch.stack(
++        [
++            torch.arange(swa_topk, dtype=torch.int32, device=device).roll(token)
++            for token in range(num_tokens)
++        ]
++    )
++    swa_slots[:, 7::17] = -1
++    swa_slots[0, 0] = swa_capacity
++    swa_slots[-1].fill_(-1)
++
++    global_cache = None
++    global_slots = None
++    if global_page_size is not None:
++        global_capacity = 2 * global_page_size
++        global_kv = torch.randn(
++            global_capacity, 512, dtype=torch.bfloat16, device=device
++        )
++        global_row_stride = 301
++        global_page_stride = global_page_size * global_row_stride + 7
++        global_backing = torch.empty(
++            3 + 2 * global_page_stride, dtype=torch.uint8, device=device
++        )
++        global_cache = global_backing.as_strided(
++            (2, global_page_size, 288),
++            (global_page_stride, global_row_stride, 1),
++            storage_offset=3,
++        )
++        deepseek_v41_pack_global_cache(
++            global_kv,
++            torch.arange(global_capacity, dtype=torch.int64, device=device),
++            global_cache,
++        )
++        global_slots = torch.stack(
++            [
++                torch.arange(global_topk, dtype=torch.int64, device=device).roll(
++                    3 * token
++                )
++                for token in range(num_tokens)
++            ]
++        )
++        global_slots[:, 5::13] = -1
++        global_slots[0, 0] = global_capacity
++        global_slots[-1].fill_(-1)
++
++    sinks = torch.linspace(-2, 2, num_heads, dtype=torch.float32, device=device)
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(
++            num_tokens, num_heads, swa_topk, global_topk
++        ),
++        dtype=torch.uint8,
++        device=device,
++    )
++    actual = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        512**-0.5,
++        sinks,
++        workspace=workspace,
++    )
++    expected = _attention_reference(
++        q,
++        swa_cache,
++        swa_slots,
++        sinks,
++        global_cache=global_cache,
++        global_slots=global_slots,
++    )
++
++    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
++    assert torch.count_nonzero(actual[-1]).item() == 0
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("num_heads", [8, 16, 32])
++@pytest.mark.parametrize("num_tokens", [1, 16, 32, 33, 96, 192])
++def test_v41_dense_candidates_cover_decode_splits_and_prefill(num_heads, num_tokens):
++    torch.manual_seed(17)
++    device = torch.device("cuda")
++    swa_rows, global_rows = 128, 512
++    swa_page_stride, swa_row_stride = 32 * 544 + 64, 544
++    global_page_stride, global_row_stride = 128 * 304 + 128, 304
++    swa_backing = torch.full(
++        (4 * swa_page_stride,), 0xA5, dtype=torch.uint8, device=device
++    )
++    swa_cache = swa_backing.as_strided(
++        (4, 32, 544), (swa_page_stride, swa_row_stride, 1)
++    )
++    global_backing = torch.full(
++        (4 * global_page_stride,), 0xA5, dtype=torch.uint8, device=device
++    )
++    global_cache = global_backing.as_strided(
++        (4, 128, 304), (global_page_stride, global_row_stride, 1)
++    )
++    swa_kv = torch.randn(swa_rows, 512, dtype=torch.bfloat16, device=device)
++    global_kv = torch.randn(global_rows, 512, dtype=torch.bfloat16, device=device)
++    deepseek_v41_pack_swa_cache(
++        swa_kv,
++        torch.arange(swa_rows, dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    deepseek_v41_pack_global_cache(
++        global_kv,
++        torch.arange(global_rows, dtype=torch.int64, device=device),
++        global_cache,
++    )
++    swa_slots = torch.stack(
++        [
++            torch.arange(swa_rows, dtype=torch.int32, device=device).roll(t)
++            for t in range(num_tokens)
++        ]
++    )
++    global_slots = torch.stack(
++        [
++            torch.arange(global_rows, dtype=torch.int64, device=device).roll(3 * t)
++            for t in range(num_tokens)
++        ]
++    )
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    q[..., -32:] = torch.arange(32, device=device) / 32
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(
++            num_tokens, num_heads, swa_rows, global_rows
++        ),
++        dtype=torch.uint8,
++        device=device,
++    )
++    actual = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        512**-0.5,
++        sinks,
++        workspace=workspace,
++    )
++
++    swa_pool = _decode_swa(
++        _gather(
++            swa_cache,
++            torch.arange(swa_rows, device=device)[None],
++            32,
++            swa_page_stride,
++            swa_row_stride,
++            528,
++        )[0]
++    )
++    global_pool = _decode_global(
++        _gather(
++            global_cache,
++            torch.arange(global_rows, device=device)[None],
++            128,
++            global_page_stride,
++            global_row_stride,
++            288,
++        )[0]
++    )
++    kv = torch.cat(
++        (swa_pool[swa_slots.long()], global_pool[global_slots.long()]), dim=1
++    ).to(torch.bfloat16)
++    logits = torch.einsum("thd,tkd->thk", q.float(), kv.float()) * (512**-0.5)
++    logits = torch.cat((logits, sinks[None, :, None].expand(num_tokens, -1, -1)), dim=2)
++    probs = logits.softmax(dim=2)[..., :-1].to(torch.bfloat16)
++    expected = torch.einsum("thk,tkd->thd", probs.float(), kv.float()).to(
++        torch.bfloat16
++    )
++    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("num_tokens", [63, 64, 65, 127, 128, 129])
++def test_v41_prefill_token_boundaries(num_tokens):
++    test_v41_dense_candidates_cover_decode_splits_and_prefill(8, num_tokens)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_cuda_graph_changed_inputs_and_sinks_preserve_pointers():
++    torch.manual_seed(31)
++    device = torch.device("cuda")
++    num_tokens, num_heads, topk = 1, 8, 32
++    swa_capacity = 64
++    global_capacity = 64
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    swa_kv = torch.randn(swa_capacity, 512, dtype=torch.bfloat16, device=device)
++    global_kv = torch.randn(global_capacity, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.empty(2, 32, 528, dtype=torch.uint8, device=device)
++    global_cache = torch.empty(1, 64, 288, dtype=torch.uint8, device=device)
++    swa_write_slots = torch.arange(swa_capacity, dtype=torch.int32, device=device)
++    global_write_slots = torch.arange(global_capacity, dtype=torch.int64, device=device)
++    deepseek_v41_pack_swa_cache(swa_kv, swa_write_slots, swa_cache)
++    deepseek_v41_pack_global_cache(global_kv, global_write_slots, global_cache)
++    swa_slots = torch.arange(topk, dtype=torch.int32, device=device)[None]
++    global_slots = torch.arange(topk, dtype=torch.int64, device=device)[None]
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    out_backing = torch.full(
++        (num_tokens + 2, num_heads, 512),
++        123,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    out = out_backing[1:-1]
++    assert out.is_contiguous()
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(num_tokens, num_heads, topk, topk),
++        dtype=torch.uint8,
++        device=device,
++    )
++
++    def run():
++        return deepseek_v41_mixed_sparse_attention(
++            q,
++            swa_cache,
++            global_cache,
++            swa_slots,
++            global_slots,
++            512**-0.5,
++            sinks,
++            out=out,
++            workspace=workspace,
++        )
++
++    assert run().data_ptr() == out.data_ptr()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++
++    tensors = (
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        sinks,
++        out,
++        workspace,
++    )
++    pointers = tuple(tensor.data_ptr() for tensor in tensors)
++    for replay in range(3):
++        q.copy_(torch.randn_like(q))
++        swa_kv.copy_(torch.randn_like(swa_kv))
++        global_kv.copy_(torch.randn_like(global_kv))
++        deepseek_v41_pack_swa_cache(swa_kv, swa_write_slots, swa_cache)
++        deepseek_v41_pack_global_cache(global_kv, global_write_slots, global_cache)
++        swa_pattern = torch.arange(topk, dtype=torch.int32, device=device).roll(
++            replay + 1
++        )
++        global_pattern = torch.arange(topk, dtype=torch.int64, device=device).roll(
++            3 * replay + 1
++        )
++        swa_pattern[0] = -1
++        swa_pattern[1] = swa_capacity
++        global_pattern[0] = -1
++        global_pattern[1] = global_capacity
++        swa_slots.copy_(swa_pattern[None])
++        global_slots.copy_(global_pattern[None])
++        sinks.copy_(
++            torch.linspace(
++                -2 + replay,
++                2 + replay,
++                num_heads,
++                dtype=torch.float32,
++                device=device,
++            )
++        )
++        out.fill_(float("nan"))
++
++        graph.replay()
++        torch.cuda.synchronize()
++
++        expected = _attention_reference(
++            q,
++            swa_cache,
++            swa_slots,
++            sinks,
++            global_cache=global_cache,
++            global_slots=global_slots,
++        )
++        torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
++        assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
++        assert torch.all(out_backing[0] == 123)
++        assert torch.all(out_backing[-1] == 123)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_c0_cuda_graph_replay_valid_all_invalid_valid():
++    torch.manual_seed(37)
++    device = torch.device("cuda")
++    num_tokens, num_heads, topk = 33, 8, 128
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    swa_kv = torch.randn(topk, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.empty(4, 32, 528, dtype=torch.uint8, device=device)
++    write_slots = torch.arange(topk, dtype=torch.int32, device=device)
++    deepseek_v41_pack_swa_cache(swa_kv, write_slots, swa_cache)
++    swa_slots = write_slots.repeat(num_tokens, 1)
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    out = torch.empty_like(q)
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(num_tokens, num_heads, topk),
++        dtype=torch.uint8,
++        device=device,
++    )
++
++    def run():
++        return deepseek_v41_mixed_sparse_attention(
++            q,
++            swa_cache,
++            None,
++            swa_slots,
++            None,
++            512**-0.5,
++            sinks,
++            out=out,
++            workspace=workspace,
++        )
++
++    assert run().data_ptr() == out.data_ptr()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++
++    tensors = (q, swa_cache, swa_slots, sinks, out, workspace)
++    pointers = tuple(tensor.data_ptr() for tensor in tensors)
++    for replay in range(3):
++        q.copy_(torch.randn_like(q))
++        swa_kv.copy_(torch.randn_like(swa_kv))
++        deepseek_v41_pack_swa_cache(swa_kv, write_slots, swa_cache)
++        if replay == 1:
++            swa_slots.fill_(-1)
++        else:
++            pattern = write_slots.roll(replay + 1)
++            swa_slots.copy_(pattern.repeat(num_tokens, 1))
++            swa_slots[:, replay::17] = -1
++        sinks.copy_(
++            torch.linspace(
++                -2 + replay,
++                2 + replay,
++                num_heads,
++                dtype=torch.float32,
++                device=device,
++            )
++        )
++        out.fill_(float("nan"))
++
++        graph.replay()
++        torch.cuda.synchronize()
++
++        expected = _attention_reference(q, swa_cache, swa_slots, sinks)
++        torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
++        assert torch.isfinite(out).all()
++        if replay == 1:
++            assert torch.count_nonzero(out).item() == 0
++        assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_full_multisplit_cuda_graph_overwrites_padded_rows():
++    device = torch.device("cuda")
++    num_tokens, num_heads = 3, 8
++    swa_rows, global_rows = 128, 512
++    swa_page_stride, swa_row_stride = 32 * 544 + 64, 544
++    global_page_stride, global_row_stride = 128 * 304 + 128, 304
++    prefix, suffix = 64, 96
++
++    swa_backing = torch.full(
++        (prefix + 4 * swa_page_stride + suffix,),
++        0xA5,
++        dtype=torch.uint8,
++        device=device,
++    )
++    swa_cache = swa_backing.as_strided(
++        (4, 32, 544),
++        (swa_page_stride, swa_row_stride, 1),
++        storage_offset=prefix,
++    )
++    global_backing = torch.full(
++        (prefix + 4 * global_page_stride + suffix,),
++        0xA5,
++        dtype=torch.uint8,
++        device=device,
++    )
++    global_cache = global_backing.as_strided(
++        (4, 128, 304),
++        (global_page_stride, global_row_stride, 1),
++        storage_offset=prefix,
++    )
++    swa_kv = torch.randn(swa_rows, 512, dtype=torch.bfloat16, device=device)
++    global_kv = torch.randn(global_rows, 512, dtype=torch.bfloat16, device=device)
++    deepseek_v41_pack_swa_cache(
++        swa_kv,
++        torch.arange(swa_rows, dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    deepseek_v41_pack_global_cache(
++        global_kv,
++        torch.arange(global_rows, dtype=torch.int32, device=device),
++        global_cache,
++    )
++    swa_snapshot = swa_backing.clone()
++    global_snapshot = global_backing.clone()
++    deepseek_v41_pack_swa_cache(
++        swa_kv[:1],
++        torch.tensor([swa_rows], dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    deepseek_v41_pack_global_cache(
++        global_kv[:1],
++        torch.tensor([global_rows], dtype=torch.int64, device=device),
++        global_cache,
++    )
++    assert torch.equal(swa_backing, swa_snapshot)
++    assert torch.equal(global_backing, global_snapshot)
++    assert torch.all(swa_backing[:prefix] == 0xA5)
++    assert torch.all(global_backing[:prefix] == 0xA5)
++
++    swa_slots = torch.stack(
++        (
++            torch.arange(swa_rows, dtype=torch.int32, device=device),
++            torch.full((swa_rows,), -1, dtype=torch.int32, device=device),
++            torch.full((swa_rows,), swa_rows, dtype=torch.int32, device=device),
++        )
++    )
++    global_slots = torch.stack(
++        (
++            torch.arange(global_rows, dtype=torch.int64, device=device),
++            torch.full((global_rows,), -1, dtype=torch.int64, device=device),
++            torch.full((global_rows,), global_rows, dtype=torch.int64, device=device),
++        )
++    )
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    out = torch.empty_like(q)
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(
++            num_tokens, num_heads, swa_rows, global_rows
++        ),
++        dtype=torch.uint8,
++        device=device,
++    )
++
++    def run():
++        deepseek_v41_mixed_sparse_attention(
++            q,
++            swa_cache,
++            global_cache,
++            swa_slots,
++            global_slots,
++            512**-0.5,
++            sinks,
++            out=out,
++            workspace=workspace,
++        )
++
++    run()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for replay in range(100):
++        swa_kv.copy_(torch.randn_like(swa_kv))
++        global_kv.copy_(torch.randn_like(global_kv))
++        deepseek_v41_pack_swa_cache(
++            swa_kv,
++            torch.arange(swa_rows, dtype=torch.int32, device=device),
++            swa_cache,
++        )
++        deepseek_v41_pack_global_cache(
++            global_kv,
++            torch.arange(global_rows, dtype=torch.int64, device=device),
++            global_cache,
++        )
++        swa_slots[0].copy_(
++            torch.arange(swa_rows, dtype=torch.int32, device=device).roll(replay + 1)
++        )
++        global_slots[0].copy_(
++            torch.arange(global_rows, dtype=torch.int64, device=device).roll(
++                3 * replay + 1
++            )
++        )
++        q.copy_(torch.randn_like(q))
++        out.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++
++        swa_decoded = _decode_swa(
++            _gather(
++                swa_cache,
++                swa_slots[:1],
++                32,
++                swa_page_stride,
++                544,
++                528,
++            ).flatten(0, 1)
++        )
++        global_decoded = _decode_global(
++            _gather(
++                global_cache,
++                global_slots[:1],
++                128,
++                global_page_stride,
++                304,
++                288,
++            ).flatten(0, 1)
++        )
++        kv = torch.cat((swa_decoded, global_decoded)).to(torch.bfloat16)
++        logits = q[0].float() @ kv.float().T * (512**-0.5)
++        logits = torch.cat((logits, sinks[:, None]), dim=1)
++        probs = logits.softmax(dim=1)[:, :-1].to(torch.bfloat16)
++        expected = (probs.float() @ kv.float()).to(torch.bfloat16)
++        torch.testing.assert_close(out[0], expected, rtol=3e-2, atol=3e-2)
++        assert torch.isfinite(out[1:]).all()
++        assert torch.count_nonzero(out[1:]).item() == 0
++        assert torch.all(swa_backing[:prefix] == 0xA5)
++        assert torch.all(global_backing[:prefix] == 0xA5)
++        assert torch.all(swa_cache[..., 528:] == 0xA5)
++    assert torch.all(global_cache[..., 288:] == 0xA5)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("swa_topk", [32, 96])
++def test_v41_swa_only_all_invalid_returns_zero(swa_topk):
++    device = torch.device("cuda")
++    q = torch.randn(1, 8, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device=device)
++    swa_slots = torch.full((1, swa_topk), -1, dtype=torch.int32, device=device)
++    out = torch.full_like(q, float("nan"))
++    workspace = torch.empty(
++        deepseek_v41_mixed_sparse_workspace_size(1, 8, swa_topk),
++        dtype=torch.uint8,
++        device=device,
++    )
++
++    result = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        None,
++        swa_slots,
++        None,
++        512**-0.5,
++        out=out,
++        workspace=workspace,
++    )
++
++    assert result.data_ptr() == out.data_ptr()
++    assert torch.isfinite(result).all()
++    assert torch.count_nonzero(result).item() == 0
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize(
++    ("num_tokens", "num_heads", "global_page_size", "global_topk"),
++    [(1, 8, None, 0), (16, 16, 64, 33), (33, 32, 128, 65)],
++    ids=("c0-split", "c2-merge", "c1-prefill"),
++)
++def test_v41_fused_inverse_rope_matches_unfused_bf16_boundary(
++    num_tokens, num_heads, global_page_size, global_topk
++):
++    torch.manual_seed(41 + num_tokens)
++    device = torch.device("cuda")
++    swa_topk = 128
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    swa_kv = torch.randn(swa_topk, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.empty(4, 32, 528, dtype=torch.uint8, device=device)
++    deepseek_v41_pack_swa_cache(
++        swa_kv,
++        torch.arange(swa_topk, dtype=torch.int32, device=device),
++        swa_cache,
++    )
++    swa_slots = torch.stack(
++        [
++            torch.arange(swa_topk, dtype=torch.int32, device=device).roll(token)
++            for token in range(num_tokens)
++        ]
++    )
++    swa_slots[:, 7::19] = -1
++
++    global_cache = None
++    global_slots = None
++    if global_page_size is not None:
++        global_capacity = 2 * global_page_size
++        global_kv = torch.randn(
++            global_capacity, 512, dtype=torch.bfloat16, device=device
++        )
++        global_cache = torch.empty(
++            2, global_page_size, 288, dtype=torch.uint8, device=device
++        )
++        deepseek_v41_pack_global_cache(
++            global_kv,
++            torch.arange(global_capacity, dtype=torch.int64, device=device),
++            global_cache,
++        )
++        global_slots = torch.stack(
++            [
++                torch.arange(global_topk, dtype=torch.int64, device=device).roll(
++                    3 * token
++                )
++                for token in range(num_tokens)
++            ]
++        )
++        global_slots[:, 5::17] = -1
++
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
++        num_tokens, num_heads, swa_topk, global_topk
++    )
++    ordinary = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        512**-0.5,
++        sinks,
++        workspace=torch.empty(workspace_bytes, dtype=torch.uint8, device=device),
++    )
++    positions, cos_sin = _make_inverse_rope_inputs(num_tokens, device)
++    groups = num_heads // 8
++    token_offset = 2
++    total_tokens = num_tokens + 5
++    sentinel = 123.0
++    grouped_out = torch.full(
++        (groups, total_tokens, 4096),
++        sentinel,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++
++    actual = _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++        q,
++        swa_cache,
++        global_cache,
++        swa_slots,
++        global_slots,
++        512**-0.5,
++        sinks,
++        positions=positions,
++        cos_sin=cos_sin,
++        grouped_out=grouped_out,
++        token_offset=token_offset,
++        workspace=torch.empty(workspace_bytes, dtype=torch.uint8, device=device),
++    )
++
++    expected = _inverse_rope_grouped_reference(ordinary, positions, cos_sin)
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    assert actual.shape == (num_tokens, groups, 4096)
++    assert actual.stride() == (4096, total_tokens * 4096, 1)
++    assert actual.data_ptr() == grouped_out[:, token_offset:].data_ptr()
++    assert torch.all(grouped_out[:, :token_offset] == sentinel)
++    assert torch.all(grouped_out[:, token_offset + num_tokens :] == sentinel)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_fused_inverse_rope_generic_main_graph_reads_changed_positions():
++    torch.manual_seed(67)
++    device = torch.device("cuda")
++    num_tokens, num_heads, swa_topk = 33, 16, 256
++    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
++    swa_kv = torch.randn(swa_topk, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.empty(8, 32, 528, dtype=torch.uint8, device=device)
++    write_slots = torch.arange(swa_topk, dtype=torch.int32, device=device)
++    deepseek_v41_pack_swa_cache(swa_kv, write_slots, swa_cache)
++    swa_slots = torch.stack(
++        [write_slots.roll(3 * token) for token in range(num_tokens)]
++    )
++    swa_slots[:, 11::23] = -1
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
++        num_tokens, num_heads, swa_topk
++    )
++    ordinary = deepseek_v41_mixed_sparse_attention(
++        q,
++        swa_cache,
++        None,
++        swa_slots,
++        None,
++        512**-0.5,
++        sinks,
++        workspace=torch.empty(workspace_bytes, dtype=torch.uint8, device=device),
++    )
++    positions, cos_sin = _make_inverse_rope_inputs(num_tokens, device)
++    token_offset = 2
++    total_tokens = num_tokens + 4
++    sentinel = 91.0
++    grouped_out = torch.full(
++        (num_heads // 8, total_tokens, 4096),
++        sentinel,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
++
++    def run():
++        return _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q,
++            swa_cache,
++            None,
++            swa_slots,
++            None,
++            512**-0.5,
++            sinks,
++            positions=positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=token_offset,
++            workspace=workspace,
++        )
++
++    run()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++
++    tensors = (
++        q,
++        swa_cache,
++        swa_slots,
++        sinks,
++        positions,
++        cos_sin,
++        grouped_out,
++        workspace,
++    )
++    pointers = tuple(tensor.data_ptr() for tensor in tensors)
++    previous = None
++    for replay in range(3):
++        positions.copy_(
++            (torch.arange(num_tokens, device=device) * (replay + 2) + replay + 1)
++            % cos_sin.shape[0]
++        )
++        grouped_out.fill_(sentinel)
++
++        graph.replay()
++        torch.cuda.synchronize()
++
++        actual = grouped_out[:, token_offset : token_offset + num_tokens].transpose(
++            0, 1
++        )
++        expected = _inverse_rope_grouped_reference(ordinary, positions, cos_sin)
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++        assert torch.all(grouped_out[:, :token_offset] == sentinel)
++        assert torch.all(grouped_out[:, token_offset + num_tokens :] == sentinel)
++        assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
++        if previous is not None:
++            assert not torch.equal(actual, previous)
++        previous = actual.clone()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_v41_fused_inverse_rope_graph_composes_decode_and_prefill_slices():
++    torch.manual_seed(73)
++    device = torch.device("cuda")
++    num_heads, swa_topk = 16, 128
++    decode_tokens, prefill_tokens = 16, 33
++    q_decode = torch.randn(
++        decode_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
++    )
++    q_prefill = torch.randn(
++        prefill_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
++    )
++    swa_kv = torch.randn(swa_topk, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.empty(4, 32, 528, dtype=torch.uint8, device=device)
++    write_slots = torch.arange(swa_topk, dtype=torch.int32, device=device)
++    deepseek_v41_pack_swa_cache(swa_kv, write_slots, swa_cache)
++    decode_slots = write_slots.repeat(decode_tokens, 1)
++    prefill_slots = write_slots.repeat(prefill_tokens, 1)
++    sinks = torch.linspace(-1, 1, num_heads, dtype=torch.float32, device=device)
++    decode_positions, decode_cos_sin = _make_inverse_rope_inputs(decode_tokens, device)
++    prefill_positions, prefill_cos_sin = _make_inverse_rope_inputs(
++        prefill_tokens, device
++    )
++    cos_sin = torch.cat((decode_cos_sin, prefill_cos_sin), dim=0).contiguous()
++    prefill_positions.add_(decode_cos_sin.shape[0])
++
++    groups = num_heads // 8
++    decode_offset = 2
++    prefill_offset = decode_offset + decode_tokens + 1
++    total_tokens = decode_tokens + prefill_tokens + 5
++    sentinel = 77.0
++    grouped_out = torch.full(
++        (groups, total_tokens, 4096),
++        sentinel,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    decode_workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
++        decode_tokens, num_heads, swa_topk
++    )
++    prefill_workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
++        prefill_tokens, num_heads, swa_topk
++    )
++    decode_workspace = torch.empty(
++        decode_workspace_bytes, dtype=torch.uint8, device=device
++    )
++    prefill_workspace = torch.empty(
++        prefill_workspace_bytes, dtype=torch.uint8, device=device
++    )
++    decode_reference_workspace = torch.empty_like(decode_workspace)
++    prefill_reference_workspace = torch.empty_like(prefill_workspace)
++    decode_reference_out = torch.empty_like(q_decode)
++    prefill_reference_out = torch.empty_like(q_prefill)
++
++    def run_fused():
++        decode_result = _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q_decode,
++            swa_cache,
++            None,
++            decode_slots,
++            None,
++            512**-0.5,
++            sinks,
++            positions=decode_positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=decode_offset,
++            workspace=decode_workspace,
++        )
++        prefill_result = _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q_prefill,
++            swa_cache,
++            None,
++            prefill_slots,
++            None,
++            512**-0.5,
++            sinks,
++            positions=prefill_positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=prefill_offset,
++            workspace=prefill_workspace,
++        )
++        return decode_result, prefill_result
++
++    run_fused()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run_fused()
++
++    tensors = (
++        q_decode,
++        q_prefill,
++        swa_cache,
++        decode_slots,
++        prefill_slots,
++        sinks,
++        decode_positions,
++        prefill_positions,
++        cos_sin,
++        grouped_out,
++        decode_workspace,
++        prefill_workspace,
++    )
++    pointers = tuple(tensor.data_ptr() for tensor in tensors)
++    for replay in range(3):
++        q_decode.copy_(torch.randn_like(q_decode))
++        q_prefill.copy_(torch.randn_like(q_prefill))
++        swa_kv.copy_(torch.randn_like(swa_kv))
++        deepseek_v41_pack_swa_cache(swa_kv, write_slots, swa_cache)
++        decode_slots.copy_(write_slots.roll(replay + 1).repeat(decode_tokens, 1))
++        prefill_slots.copy_(write_slots.roll(3 * replay + 1).repeat(prefill_tokens, 1))
++        if replay == 1:
++            decode_slots.fill_(-1)
++        else:
++            decode_slots[:, replay::19] = -1
++        if replay == 2:
++            prefill_slots.fill_(-1)
++        else:
++            prefill_slots[:, replay::17] = -1
++        decode_positions.copy_(
++            (torch.arange(decode_tokens, device=device) * (replay + 2) + replay)
++            % decode_cos_sin.shape[0]
++        )
++        prefill_positions.copy_(
++            (torch.arange(prefill_tokens, device=device) * (replay + 3) + replay)
++            % prefill_cos_sin.shape[0]
++            + decode_cos_sin.shape[0]
++        )
++        sinks.copy_(
++            torch.linspace(
++                -2 + replay,
++                2 + replay,
++                num_heads,
++                dtype=torch.float32,
++                device=device,
++            )
++        )
++        grouped_out.fill_(sentinel)
++
++        graph.replay()
++        torch.cuda.synchronize()
++
++        deepseek_v41_mixed_sparse_attention(
++            q_decode,
++            swa_cache,
++            None,
++            decode_slots,
++            None,
++            512**-0.5,
++            sinks,
++            out=decode_reference_out,
++            workspace=decode_reference_workspace,
++        )
++        deepseek_v41_mixed_sparse_attention(
++            q_prefill,
++            swa_cache,
++            None,
++            prefill_slots,
++            None,
++            512**-0.5,
++            sinks,
++            out=prefill_reference_out,
++            workspace=prefill_reference_workspace,
++        )
++        expected_decode = _inverse_rope_grouped_reference(
++            decode_reference_out, decode_positions, cos_sin
++        )
++        expected_prefill = _inverse_rope_grouped_reference(
++            prefill_reference_out, prefill_positions, cos_sin
++        )
++        actual_decode = grouped_out[
++            :, decode_offset : decode_offset + decode_tokens
++        ].transpose(0, 1)
++        actual_prefill = grouped_out[
++            :, prefill_offset : prefill_offset + prefill_tokens
++        ].transpose(0, 1)
++        torch.testing.assert_close(actual_decode, expected_decode, rtol=0, atol=0)
++        torch.testing.assert_close(actual_prefill, expected_prefill, rtol=0, atol=0)
++        assert torch.all(grouped_out[:, :decode_offset] == sentinel)
++        assert torch.all(
++            grouped_out[:, decode_offset + decode_tokens : prefill_offset] == sentinel
++        )
++        assert torch.all(grouped_out[:, prefill_offset + prefill_tokens :] == sentinel)
++        assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize(
++    ("bad_field", "match"),
++    [
++        ("positions", "positions"),
++        ("cos_sin", "cos_sin"),
++        ("groups", "eight heads per group"),
++        ("token_offset", "token_offset"),
++    ],
++)
++def test_v41_fused_inverse_rope_rejects_invalid_layout(bad_field, match):
++    device = torch.device("cuda")
++    q = torch.zeros(1, 8, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device=device)
++    swa_slots = torch.full((1, 1), -1, dtype=torch.int32, device=device)
++    positions, cos_sin = _make_inverse_rope_inputs(1, device)
++    grouped_out = torch.empty(1, 1, 4096, dtype=torch.bfloat16, device=device)
++    token_offset = 0
++    if bad_field == "positions":
++        positions = positions.int()
++    elif bad_field == "cos_sin":
++        cos_sin = cos_sin[:, :-1].contiguous()
++    elif bad_field == "groups":
++        grouped_out = torch.empty(2, 1, 4096, dtype=torch.bfloat16, device=device)
++    else:
++        token_offset = 1
++
++    with pytest.raises(ValueError, match=match):
++        _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q,
++            swa_cache,
++            None,
++            swa_slots,
++            None,
++            512**-0.5,
++            positions=positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=token_offset,
++        )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("alias", ["q", "workspace"])
++def test_v41_fused_inverse_rope_rejects_grouped_output_input_alias(alias):
++    device = torch.device("cuda")
++    shared = torch.empty(4096, dtype=torch.bfloat16, device=device)
++    grouped_out = shared.view(1, 1, 4096)
++    if alias == "q":
++        q = shared.view(1, 8, 512)
++    else:
++        q = torch.zeros(1, 8, 512, dtype=torch.bfloat16, device=device)
++    swa_cache = torch.zeros(1, 32, 528, dtype=torch.uint8, device=device)
++    swa_slots = torch.full((1, 1), -1, dtype=torch.int32, device=device)
++    positions, cos_sin = _make_inverse_rope_inputs(1, device)
++    workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(1, 8, 1)
++    if alias == "workspace":
++        workspace = grouped_out.view(torch.uint8).flatten()[:workspace_bytes]
++    else:
++        workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
++
++    with pytest.raises(ValueError, match=f"alias {alias}"):
++        _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q,
++            swa_cache,
++            None,
++            swa_slots,
++            None,
++            512**-0.5,
++            positions=positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=0,
++            workspace=workspace,
++        )

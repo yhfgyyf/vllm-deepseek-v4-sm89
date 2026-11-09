@@ -31,14 +31,12 @@ from vllm.scalar_type import scalar_types
 
 
 @pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("input_dtype", [None, torch.float8_e4m3fn])
 @torch.inference_mode()
 def test_streamed_mxfp4_scales_match_original_batched_conversion(
-    monkeypatch, param_dtype, input_dtype
+    param_dtype,
 ):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    monkeypatch.setattr(marlin_fp4, "get_marlin_input_dtype", lambda: input_dtype)
     experts, hidden, intermediate = 4, 256, 128
     shapes = [(experts, 2 * intermediate, hidden), (experts, hidden, intermediate)]
     weights = [
@@ -60,14 +58,17 @@ def test_streamed_mxfp4_scales_match_original_batched_conversion(
                 size_k=k,
                 size_n=n,
                 group_size=32,
-                is_a_8bit=input_dtype is not None,
             )
-            converted.append(
-                marlin_fp4.mxfp4_marlin_process_scales(permuted, input_dtype)
-            )
+            converted.append(marlin_fp4.mxfp4_marlin_process_scales(permuted))
         expected.append(torch.stack(converted))
     result = prepare_moe_mxfp4_layer_for_marlin(
-        SimpleNamespace(params_dtype=param_dtype), *weights, *scales, None, None
+        SimpleNamespace(params_dtype=param_dtype),
+        weights[0],
+        weights[1],
+        scales[0],
+        scales[1],
+        None,
+        None,
     )
     for actual, reference in zip(result[2:4], expected):
         torch.testing.assert_close(

@@ -356,10 +356,10 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Per-row paged-MQA logits kernel optimised for long ``token_count``.
+    """Per-row paged-MQA logits kernel optimised for long `token_count`.
 
-    Each Triton program handles one logical row (``batch * next_n + q_pos``)
-    across a ``BLOCK_N``-wide window of token positions. Q is loaded once per
+    Each Triton program handles one logical row (`batch * next_n + q_pos`)
+    across a `BLOCK_N`-wide window of token positions. Q is loaded once per
     head tile and reused for every K element in the window, which preserves
     L2 / register locality and avoids the M-axis padding waste of the
     generic 2D-tiled kernel at long contexts (mt-bench c=1 MTP=2 num_rows=3
@@ -459,8 +459,8 @@ def fp8_paged_mqa_logits_rowwise_triton(
 ) -> torch.Tensor:
     """Rowwise paged-MQA logits wrapper.
 
-    Pre-condition: ``head_dim % 64 == 0`` and ``num_heads % 4 == 0`` so the
-    ``tl.dot`` inside ``_fp8_paged_mqa_logits_rowwise_kernel`` lands on
+    Pre-condition: `head_dim % 64 == 0` and `num_heads % 4 == 0` so the
+    `tl.dot` inside `_fp8_paged_mqa_logits_rowwise_kernel` lands on
     tensor-core friendly tile shapes. DSv4-Flash (head_dim=128,
     num_heads=64) satisfies both and is the only model that exercises this
     path today; the generic 2D kernel below remains the fallback for

@@ -28,6 +28,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_gemm_nt,
     get_tma_aligned_size,
+    is_deep_gemm_e8m0_used,
     per_block_cast_to_fp8,
     should_use_deepgemm_for_fp8_linear,
 )
@@ -37,8 +38,9 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.import_utils import has_deep_gemm
 
-if current_platform.get_device_capability() < (8, 9):
-    pytest.skip("FP8 Triton requires CUDA 8.9 or higher", allow_module_level=True)
+capability = current_platform.get_device_capability()
+if capability is None or capability < (9, 0):
+    pytest.skip("FP8 Triton requires CUDA 9.0 or higher", allow_module_level=True)
 
 vllm_config = VllmConfig()
 
@@ -69,10 +71,6 @@ def setup_cuda():
     torch.set_default_device("cuda")
 
 
-@pytest.mark.skipif(
-    current_platform.is_fp8_fnuz(),
-    reason="This platform supports e4m3fnuz, not e4m3fn.",
-)
 @pytest.mark.parametrize(
     "num_tokens,d,dtype,group_size,column_major_scales,tma_aligned_scales,seed",
     itertools.product(
@@ -266,11 +264,16 @@ def test_w8a8_block_fp8_matmul_scale_cuda_graph(M, As_dtype, Bs_dtype):
     not current_platform.is_cuda() or not current_platform.has_device_capability(90),
     reason="CUTLASS block FP8 requires SM90 or higher.",
 )
+@pytest.mark.parametrize(
+    # 65/66/67 cover all M%4 residue classes above the SM100 swapAB
+    # threshold (m <= 64); 1026 crosses multiple 128-row SF atoms.
+    "M",
+    [32, 65, 66, 67, 1026],
+)
 @torch.inference_mode()
-def test_w8a8_block_fp8_cutlass_matmul():
+def test_w8a8_block_fp8_cutlass_matmul(M):
     # Test simple case where weight.shape % 128 != 0,
     # like in DSV3 kv_a_proj_with_mqa
-    M = 32
     N = 576
     K = 7168
     block_size = [128, 128]
@@ -396,7 +399,11 @@ def test_w8a8_block_fp8_deep_gemm_matmul(M, N, K, block_size, out_dtype, seed):
     A_fp8, As_fp8 = per_token_group_quant_fp8(
         A_fp32, block_size[1], column_major_scales=True, tma_aligned_scales=True
     )
-    B_fp8, Bs_fp8 = per_block_cast_to_fp8(B_fp32, block_size=block_size)
+    B_fp8, Bs_fp8 = per_block_cast_to_fp8(
+        B_fp32,
+        block_size=block_size,
+        use_ue8m0=is_deep_gemm_e8m0_used(),
+    )
 
     As = As_fp8.to(torch.float32)
     Bs = Bs_fp8.to(torch.float32)
@@ -511,5 +518,7 @@ def test_w8a8_block_fp8_b12x_matmul(M, N, K):
         ref_out.float().flatten(),
         dim=0,
     )
-    assert rel_diff < 0.002
-    assert cosine >= 0.9999
+    # Four-way split-K uses atomic BF16 reductions, so nondeterministic atomic
+    # ordering can flap an output between adjacent BF16 values one ULP apart.
+    assert rel_diff < 0.003
+    assert cosine >= 0.99999

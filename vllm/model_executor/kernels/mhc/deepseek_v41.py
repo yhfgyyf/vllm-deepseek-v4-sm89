@@ -5,7 +5,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
 
 
 @triton.jit
@@ -154,9 +154,11 @@ def mhc_pre_delayed_tilelang(
     )
     sqrsum = torch.empty((splits, tokens), device=residual.device, dtype=torch.float32)
     if use_gemv:
-        from .tilelang import _tilelang_hc_prenorm_gemm
+        from .tilelang_kernels import _HC_PRENORM_GEMM_TILELANG_KERNEL
 
-        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, width // streams, streams)
+        _HC_PRENORM_GEMM_TILELANG_KERNEL(
+            x, fn, mixes, sqrsum, width // streams, streams
+        )
     else:
         _native_hc_prenorm_gemm(x, fn, mixes, sqrsum)
     fields = dict(
@@ -186,6 +188,56 @@ def mhc_pre_delayed_tilelang(
             **fields,
         )
     return outputs
+
+
+def mhc_post_pre_delayed(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse small batches; retain the native TF32x3 projection above 32 tokens."""
+    from .tilelang import mhc_fused_post_pre_delayed_tilelang, mhc_post_tilelang
+
+    args = (
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    if 0 < x.shape[0] <= 32:
+        return mhc_fused_post_pre_delayed_tilelang(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            *args,
+            pre_mix=pre_mix,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )[:5]
+    residual = mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
+    return (
+        residual,
+        *mhc_pre_delayed_tilelang(
+            residual, *args, pre_mix=pre_mix, norm_weight=norm_weight, norm_eps=norm_eps
+        ),
+    )
 
 
 @triton.jit
@@ -257,15 +309,67 @@ def _collapse_fake(x, pre_mix):
     return torch.empty((x.shape[0], x.shape[2]), device=x.device, dtype=x.dtype)
 
 
+def _post_pre_fake(
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    pre_mix=None,
+    norm_weight=None,
+    norm_eps=1e-6,
+):
+    return (
+        torch.empty_like(residual),
+        *_pre_fake(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=pre_mix,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        ),
+    )
+
+
 direct_register_custom_op(
-    op_name="mhc_pre_delayed_tilelang",
+    op_name="deepseek_v41_mhc_pre_delayed",
     op_func=mhc_pre_delayed_tilelang,
     mutates_args=[],
     fake_impl=_pre_fake,
 )
 direct_register_custom_op(
-    op_name="hc_collapse_triton",
+    op_name="deepseek_v41_hc_collapse",
     op_func=hc_collapse_triton,
     mutates_args=[],
     fake_impl=_collapse_fake,
+)
+direct_register_custom_op(
+    op_name="deepseek_v41_mhc_post_pre_delayed",
+    op_func=mhc_post_pre_delayed,
+    mutates_args=[],
+    fake_impl=_post_pre_fake,
+)
+
+mhc_pre_delayed_tilelang = eager_bypass_custom_op(
+    "deepseek_v41_mhc_pre_delayed", mhc_pre_delayed_tilelang
+)
+hc_collapse_triton = eager_bypass_custom_op(
+    "deepseek_v41_hc_collapse", hc_collapse_triton
+)
+mhc_post_pre_delayed = eager_bypass_custom_op(
+    "deepseek_v41_mhc_post_pre_delayed", mhc_post_pre_delayed
 )

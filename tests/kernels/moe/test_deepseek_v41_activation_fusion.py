@@ -94,7 +94,7 @@ def test_v41_activation_fusion_replays_with_fresh_inputs() -> None:
         gate_up.normal_()
         router_weights.uniform_()
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(
             output.float(),
             _reference(gate_up, router_weights, 10.0).float(),

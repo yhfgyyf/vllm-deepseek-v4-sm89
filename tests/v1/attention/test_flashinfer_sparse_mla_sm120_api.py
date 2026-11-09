@@ -9,7 +9,12 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.config import set_current_vllm_config
+from vllm.config import (
+    AttentionConfig,
+    CompilationConfig,
+    ParallelConfig,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import (
     sparse_mla_attention as sparse_attention_module,
@@ -19,11 +24,13 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
     DeepseekV4FlashInferSM120Attention,
     _flashinfer_sparse_mla_config_error,
-    _required_sm120_sparse_topk,
+    required_sm120_sparse_topk,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
-from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as sparse_module
+from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as sm120_module
 from vllm.v1.attention.backends.mla import sparse_swa as sparse_swa_module
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
@@ -33,6 +40,86 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
     _kv_scale_format_for_model,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or current_platform.get_device_capability() not in ((8, 9), (12, 0), (12, 1)),
+    reason="Requires the SM89/SM120 sparse MLA kernels",
+)
+@pytest.mark.parametrize("num_tokens", [1, 64, 96])
+@pytest.mark.parametrize("num_heads", [8, 32])
+def test_glm_nope_packed_cache_decode_and_graph_replay(
+    num_tokens: int, num_heads: int
+) -> None:
+    """The framework adapter preserves inline scales across decode/prefill."""
+    from flashinfer.mla._sparse_mla_sm120_cache import glm_nope_quantize_and_cache
+
+    torch.manual_seed(6)
+    kv = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16) / 10
+    kv[:256].sub_(0.5)
+    kv[256:].add_(0.5)
+    cache = torch.zeros(8, 64, 528, device="cuda", dtype=torch.uint8)
+    glm_nope_quantize_and_cache(
+        kv, cache, torch.arange(512, device="cuda", dtype=torch.int64)
+    )
+    rows = cache.view(512, 528)
+    scales = rows[:, 512:].contiguous().view(torch.float32).view(512, 4, 1)
+    dequant = (
+        rows[:, :512].contiguous().view(torch.float8_e4m3fn).float().view(512, 4, 128)
+        * scales
+    ).reshape(512, 512)
+    q = torch.randn(num_tokens, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(256, (num_tokens, 2176), device="cuda", dtype=torch.int32)
+    indices[:, 2051:] = -1
+    output = torch.empty_like(q)
+    workspace = torch.empty(80 << 20, device="cuda", dtype=torch.uint8)
+
+    def reference():
+        chunks = []
+        for start in range(0, num_tokens, 4):
+            selected = dequant[indices[start : start + 4, :2051].long()]
+            scores = torch.einsum(
+                "bhd,bkd->bhk", q[start : start + 4].float(), selected
+            )
+            chunks.append(
+                torch.einsum("bhk,bkd->bhd", (scores / 512**0.5).softmax(-1), selected)
+            )
+        return torch.cat(chunks).to(torch.bfloat16)
+
+    def run():
+        return fi_utils.flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
+            kv_cache=cache.unsqueeze(1),
+            workspace_buffer=workspace,
+            qk_nope_head_dim=256,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=None,
+            max_seq_len=2176,
+            out=output.unsqueeze(1),
+            bmm1_scale=512**-0.5,
+            bmm2_scale=1.0,
+            sparse_mla_top_k=2176,
+            kv_scale_format="arbitrary_fp32_nope",
+        )
+
+    expected = reference()
+    run()
+    torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
+    indices[:, :2051].add_(256)
+    q.neg_()
+    changed = reference()
+    assert (changed - expected).abs().max().item() > 0.5
+    graph.replay()
+    torch.testing.assert_close(output, changed, atol=5e-2, rtol=5e-2)
 
 
 def _fake_vllm_config(
@@ -57,7 +144,9 @@ def _fake_vllm_config(
                 kv_lora_rank=kv_lora_rank,
             ),
         ),
-        parallel_config=SimpleNamespace(),
+        parallel_config=ParallelConfig(),
+        attention_config=AttentionConfig(),
+        compilation_config=CompilationConfig(),
     )
 
 
@@ -477,26 +566,22 @@ def test_dsv4_swa_metadata_uses_only_supported_flashmla(
     assert len(metadata_calls) == int(flashmla_supported)
 
 
-def test_sm120_kernel_block_sizes_are_glm_config_aware() -> None:
+@pytest.mark.parametrize(
+    ("model_type", "qk_nope_head_dim", "qk_rope_head_dim"),
+    [("glm5_next", 256, 0), ("deepseek_v3", 128, 64), ("glm5_next", 128, 64)],
+)
+def test_sm120_kernel_block_sizes_use_page64_layout(
+    model_type, qk_nope_head_dim, qk_rope_head_dim
+) -> None:
     with set_current_vllm_config(
-        _fake_vllm_config("glm5_next", qk_nope_head_dim=256, qk_rope_head_dim=0)
+        _fake_vllm_config(
+            model_type,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
     ):
         assert FlashInferMLASparseSM120Backend.get_supported_kernel_block_sizes() == [
-            64
-        ]
-
-    with set_current_vllm_config(_fake_vllm_config("deepseek_v3")):
-        assert FlashInferMLASparseSM120Backend.get_supported_kernel_block_sizes() == [
-            64,
-            256,
-        ]
-
-    with set_current_vllm_config(
-        _fake_vllm_config("glm5_next", qk_nope_head_dim=128, qk_rope_head_dim=64)
-    ):
-        assert FlashInferMLASparseSM120Backend.get_supported_kernel_block_sizes() == [
-            64,
-            256,
+            MultipleOf(64)
         ]
 
 
@@ -519,7 +604,7 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
         fi_utils, "has_flashinfer_sparse_mla_sm120_glm_nope", lambda: True
     )
     monkeypatch.setattr(
-        sparse_module,
+        sm120_module,
         "_get_workspace_buffer",
         lambda device: torch.empty(1024, dtype=torch.uint8, device=device),
     )
@@ -537,10 +622,10 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
         convert_call["block_table"] = block_table
         convert_call["topk_indices"] = topk_indices
         convert_call["kwargs"] = kwargs
-        return converted_topk, torch.full((num_tokens,), topk, dtype=torch.int32)
+        return converted_topk
 
     monkeypatch.setattr(
-        sparse_module,
+        sm120_module,
         "triton_convert_req_index_to_global_index",
         fake_convert_req_index_to_global_index,
     )
@@ -555,11 +640,8 @@ def test_sm120_forward_uses_actual_topk_capacity_and_528_byte_geometry(
             device=kwargs["query"].device,
         )
 
-    monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
-    monkeypatch.setitem(
-        sys.modules,
-        "flashinfer.decode",
-        SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=fake_decode),
+    monkeypatch.setattr(
+        fi_utils, "flashinfer_trtllm_batch_decode_with_kv_cache_mla", fake_decode
     )
 
     topk_indices = torch.arange((num_tokens + 1) * topk, dtype=torch.int32).reshape(
@@ -888,10 +970,10 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
     )
 
-    assert _required_sm120_sparse_topk(causal, 128) == 128
-    assert _required_sm120_sparse_topk(dspark, 128) == 192
-    assert _required_sm120_sparse_topk(vision, 128) == 512
-    assert _required_sm120_sparse_topk(vision, 512) == 1024
+    assert required_sm120_sparse_topk(causal, 128) == 128
+    assert required_sm120_sparse_topk(dspark, 128) == 192
+    assert required_sm120_sparse_topk(vision, 128) == 512
+    assert required_sm120_sparse_topk(vision, 512) == 1024
 
 
 def test_sm89_dsv4_does_not_require_sm120_dispatch_entry(monkeypatch) -> None:
@@ -909,11 +991,12 @@ def test_sm89_dsv4_does_not_require_sm120_dispatch_entry(monkeypatch) -> None:
         )
         is None
     )
-    assert "SM120 requires" in _flashinfer_sparse_mla_config_error(
+    error = _flashinfer_sparse_mla_config_error(
         DeviceCapability(12, 0),
         num_q_heads=8,
         top_k=128,
     )
+    assert error is not None and "SM120 requires" in error
 
 
 @torch.no_grad()

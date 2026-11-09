@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.router.base_router import get_moe_padding_mask
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
@@ -64,6 +65,7 @@ if current_platform.is_cuda():
         correction_bias_ptr,
         correction_bias_vl_ptr,
         input_tokens_ptr,
+        is_padding_ptr,
         topk_weights_ptr,
         topk_ids_ptr,
         routed_scaling_factor,
@@ -72,6 +74,7 @@ if current_platform.is_cuda():
         TOP_K: tl.constexpr,
         BLOCK_N: tl.constexpr,
         HAS_VL_BIAS: tl.constexpr,
+        HAS_PADDING: tl.constexpr,
         launch_pdl: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64)
@@ -131,6 +134,10 @@ if current_platform.is_cuda():
         )
         output_mask = topk_offsets < TOP_K
         output_offsets = row * TOP_K + topk_offsets
+        if HAS_PADDING:
+            is_padding = tl.load(is_padding_ptr + row)
+            selected_weights = tl.where(is_padding, 0.0, selected_weights)
+            selected_ids = tl.where(is_padding, -1, selected_ids)
 
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
@@ -148,6 +155,7 @@ def deepseek_v41_topk(
     topk: int,
     correction_bias_vl: torch.Tensor | None = None,
     input_tokens: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not can_use_deepseek_v41_topk(
         gating_output,
@@ -163,6 +171,15 @@ def deepseek_v41_topk(
         )
 
     num_tokens, num_experts = gating_output.shape
+    if is_padding is not None and (
+        is_padding.dtype != torch.bool
+        or is_padding.device != gating_output.device
+        or is_padding.shape != (num_tokens,)
+        or not is_padding.is_contiguous()
+    ):
+        raise ValueError(
+            "Padding mask must be contiguous bool [tokens] on the logits device."
+        )
     shape = (num_tokens, topk)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
@@ -173,12 +190,13 @@ def deepseek_v41_topk(
         correction_bias if correction_bias_vl is None else correction_bias_vl
     )
     input_tokens_arg = input_tokens if input_tokens is not None else topk_ids[:, 0]
-    with torch.cuda.device(gating_output.device):
+    with torch.accelerator.device_index(gating_output.device.index):
         _deepseek_v41_topk_kernel[(num_tokens,)](
             gating_output,
             correction_bias,
             correction_bias_vl_arg,
             input_tokens_arg,
+            is_padding,
             topk_weights,
             topk_ids,
             routed_scaling_factor,
@@ -187,6 +205,7 @@ def deepseek_v41_topk(
             TOP_K=topk,
             BLOCK_N=triton.next_power_of_2(num_experts),
             HAS_VL_BIAS=correction_bias_vl is not None,
+            HAS_PADDING=is_padding is not None,
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )
@@ -219,7 +238,7 @@ class DeepseekV41TopKBiasRouter(FusedTopKBiasRouter):
         del hidden_states
         if self.e_score_correction_bias is None:
             raise ValueError("DeepSeek V4.1 routing requires a correction bias.")
-        if self.e_score_correction_bias_vl is not None and input_ids is None:
+        if self.bias_vl is not None and input_ids is None:
             raise ValueError(
                 "DeepSeek V4.1 mixed text/image routing requires input_ids."
             )
@@ -232,11 +251,10 @@ class DeepseekV41TopKBiasRouter(FusedTopKBiasRouter):
             self.routed_scaling_factor,
             topk=self.top_k,
             correction_bias_vl=(
-                self.e_score_correction_bias_vl.data
-                if self.e_score_correction_bias_vl is not None
-                else None
+                self.bias_vl.data if self.bias_vl is not None else None
             ),
             input_tokens=input_ids,
+            is_padding=get_moe_padding_mask(router_logits.shape[0]),
         )
 
         if self.num_fused_shared_experts > 0:

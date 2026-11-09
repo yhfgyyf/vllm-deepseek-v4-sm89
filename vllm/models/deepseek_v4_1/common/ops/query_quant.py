@@ -115,6 +115,7 @@ def fused_q_kv_rmsnorm_quant(
     scales = torch.empty(scale_shape, dtype=torch.uint8, device=qr.device)
     if tokens:
         block = triton.next_power_of_2(max(q_size, kv_size))
+        launch_pdl = current_platform.is_arch_support_pdl()
         _q_kv_norm_quant_kernel[(padded_tokens, 2)](
             qr,
             kv,
@@ -130,9 +131,10 @@ def fused_q_kv_rmsnorm_quant(
             q_size,
             kv_size,
             block,
-            current_platform.is_arch_support_pdl(),
+            launch_pdl,
             row_major_scales,
             num_warps=8 if block >= 2048 else 4,
+            launch_pdl=launch_pdl,
             enable_fp_fusion=False,
         )
     return QuantizedActivation(qo, scales, qr.dtype, qr.shape, kMxfp8Dynamic), kvo

@@ -287,6 +287,7 @@ def test_last_stage_dspark_embedding_is_real_and_loads_checkpoint_values(
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf, dtype=torch.bfloat16),
         quant_config=None,
+        engram_config=None,
         parallel_config=parallel,
         kernel_config=SimpleNamespace(moe_backend="auto"),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
@@ -323,7 +324,6 @@ def test_last_stage_dspark_embedding_is_real_and_loads_checkpoint_values(
     monkeypatch.setattr(
         model_module, "get_tensor_model_parallel_world_size", lambda: tp
     )
-    monkeypatch.setattr(model_module, "get_tensor_model_parallel_rank", lambda: 0)
     model = DeepseekV4Model(vllm_config=vllm_config)
     if not dspark or draft_tp != tp:
         assert isinstance(model.embed_tokens, PPMissingLayer)

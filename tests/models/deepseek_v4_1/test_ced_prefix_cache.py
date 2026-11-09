@@ -7,15 +7,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
 from vllm.models.deepseek_v4_1.attention import DeepseekV41SWACache
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_request_block_hasher,
-    group_and_unify_kv_cache_specs,
     init_none_hash,
 )
 from vllm.v1.core.sched.scheduler import Scheduler, _cap_ced_replay_chunk
@@ -138,25 +140,41 @@ def test_ced_prefix_hit_reuses_only_cacheable_groups(replay_window, expected_hit
     )
 
 
+def _grouping_config():
+    config = VllmConfig(
+        cache_config=CacheConfig(),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            disable_hybrid_kv_cache_manager=False,
+        ),
+    )
+    resolve_kv_cache_layout(config, [["BLHNC"]])
+    return config
+
+
 def test_ced_swa_grouping_keeps_cacheability_distinct():
-    grouped = group_and_unify_kv_cache_specs(
+    grouped = get_kv_cache_groups(
+        _grouping_config(),
         {
             "global": _mla_spec(),
             "encoder_swa": _swa_spec(cacheable=True),
             "decoder_swa": _swa_spec(cacheable=False),
-        }
+        },
     )
 
     assert grouped is not None
     assert len(grouped) == 3
-    assert [group.prefix_cacheable for group in grouped] == [True, True, False]
+    assert [group.kv_cache_spec.prefix_cacheable for group in grouped] == [
+        True,
+        True,
+        False,
+    ]
 
     worker_config = KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(list(group.kv_cache_specs), group) for group in grouped
-        ],
+        kv_cache_groups=grouped,
     )
     scheduler_config = generate_scheduler_kv_cache_config([worker_config])
     assert [
@@ -166,14 +184,15 @@ def test_ced_swa_grouping_keeps_cacheability_distinct():
 
 
 def test_ced_swa_grouping_keeps_replay_retention_distinct():
-    grouped = group_and_unify_kv_cache_specs(
+    grouped = get_kv_cache_groups(
+        _grouping_config(),
         {
             "global": _mla_spec(),
             "decoder_swa": replace(
                 _swa_spec(cacheable=False), extra_retained_tokens=512
             ),
             "dspark_swa": _swa_spec(cacheable=False),
-        }
+        },
     )
     assert grouped is not None
     assert len(grouped) == 3
@@ -182,10 +201,7 @@ def test_ced_swa_grouping_keeps_replay_retention_distinct():
             KVCacheConfig(
                 num_blocks=128,
                 kv_cache_tensors=[],
-                kv_cache_groups=[
-                    KVCacheGroupSpec(list(group.kv_cache_specs), group)
-                    for group in grouped
-                ],
+                kv_cache_groups=grouped,
             )
         ]
     )

@@ -31,7 +31,6 @@ def validate_ced_config(vllm_config: Any, use_sequence_parallel: bool) -> None:
     parallel = vllm_config.parallel_config
     unsupported = []
     for condition, name in (
-        (not vllm_config.use_v2_model_runner, "model runner v1"),
         (
             parallel.pipeline_parallel_size not in (1, 2, 4),
             "pipeline parallelism other than PP1/PP2/PP4",
@@ -384,7 +383,6 @@ def clamp_replay_swa(
 ) -> None:
     """Exclude unbuilt SWA keys to the left of a decoder replay window."""
     decode = metadata.num_decode_tokens
-    mm_prefix_query_ranges = getattr(metadata, "mm_prefix_query_ranges", None)
     for slots, lengths, rows in (
         (metadata.decode_swa_indices, metadata.decode_swa_lens, slice(0, decode)),
         (
@@ -398,11 +396,11 @@ def clamp_replay_swa(
         view = slots[:, 0] if slots.ndim == 3 else slots
         pos = positions[rows]
         first = (pos - window + 1).clamp_min(0)
-        if mm_prefix_query_ranges is not None:
-            spans = mm_prefix_query_ranges[rows].to(device=pos.device, dtype=pos.dtype)
-            span_start, span_end = spans.unbind(dim=1)
-            in_span = (span_start >= 0) & (span_start <= pos) & (pos <= span_end)
-            first = torch.where(in_span, torch.minimum(first, span_start), first)
+        if rows.start == decode and slots is metadata.prefill_swa_indices:
+            left_visible = metadata.prefill_left_visible
+            if left_visible is not None:
+                left = left_visible[rows].to(device=pos.device, dtype=pos.dtype)
+                first = torch.minimum(first, (pos - left).clamp_min(0))
         logical_keys = first[:, None] + torch.arange(view.shape[1], device=pos.device)
         view.masked_fill_(logical_keys < replay_starts[rows, None], -1)
         if lengths is not None:

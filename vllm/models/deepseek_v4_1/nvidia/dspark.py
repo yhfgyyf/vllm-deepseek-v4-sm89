@@ -4,7 +4,7 @@
 
 See: qwen3_dspark.py for base architecture. This one is specialized to the
 DSV4.1 DSpark, which reuses the target model's architecture similarly to MTP.
-Its weights ship in the target checkpoint under the ``mtp.{0,1,2}.*`` prefix.
+Its weights ship in the target checkpoint under the `mtp.{0,1,2}.*` prefix.
 
 To implement non-causal attention, we leverage the sparse attention implementation to
 include the future query tokens in the top-k indices for each query token.
@@ -18,10 +18,6 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.deepseek_v41 import (
@@ -32,7 +28,10 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -49,7 +48,9 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v4.nvidia.dspark import _duplicate_context_wkv_weights
 from vllm.models.deepseek_v4_1.common.ops import fused_q_rope_swa_insert
+from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -121,6 +122,16 @@ class DSparkDeepseekV4Model(nn.Module):
             ]
         )
 
+        self.context_wkv_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.head_dim] * self.num_dspark_layers,
+            bias=False,
+            return_bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "context_wkv_proj"),
+            disable_tp=True,
+        )
+
         # Heads: final norm, and the Markov + confidence heads.
         # Loaded from the "final" MTP layer weights (mtp.*) in the target
         # checkpoint. v4.1 has no learned hc_head: the hc copies are
@@ -149,7 +160,7 @@ class DSparkDeepseekV4Model(nn.Module):
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux hidden states)).
 
-        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
+        `aux_hidden_states` is [T, hidden_size * len(target_layer_ids)].
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
 
@@ -163,24 +174,25 @@ class DSparkDeepseekV4Model(nn.Module):
         """Insert the sliding-window context KV for every draft layer.
 
         Mirrors the reference DSparkAttention: each layer derives its context KV
-        from the SAME projected target hidden ``main_x``, via that layer's own
-        ``wkv`` + ``kv_norm`` + RoPE + quant, then writes it at the
+        from the SAME projected target hidden `main_x`, via that layer's own
+        `wkv` + `kv_norm` + RoPE + quant, then writes it at the
         layer's context slots.
 
-        ``context_slot_mappings`` is a per-layer list (each entry is the context
+        `context_slot_mappings` is a per-layer list (each entry is the context
         slot mapping for that layer's kv-cache group, since the hybrid manager may
-        place draft layers in different groups). ``None`` (or a ``None`` entry)
+        place draft layers in different groups). `None` (or a `None` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
+        all_kv = self.context_wkv_proj(main_x).view(
+            main_x.shape[0], self.num_dspark_layers, self.config.head_dim
+        )
+        for i, (layer, kv) in enumerate(
+            zip(self.layers, all_kv.unbind(1), strict=True)
+        ):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
@@ -204,7 +216,7 @@ class DSparkDeepseekV4Model(nn.Module):
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hidden_states = hc_expand(inputs_embeds, self.hc_mult)
 
         residual = post_mix = res_mix = pre_mix = None
         for layer in self.layers:
@@ -218,15 +230,14 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-            pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference forward_head applies (hc_pre with the
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
         assert pre_mix is not None
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         return hidden_states
 
 
@@ -238,8 +249,7 @@ def _insert_context_kv(
 ) -> None:
     """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV.
 
-    The native V4.1 writer also processes a query; context tokens have no query,
-    so pass zeros and discard the rotated result.
+    Zero query heads schedule only the cache-write part of the native kernel.
     """
     swa_cache = attn.swa_cache_layer.kv_cache
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
@@ -248,8 +258,8 @@ def _insert_context_kv(
     if swa_cache.shape[-1] != 528:
         raise ValueError("V4.1 DSpark SWA cache rows must contain 528 bytes.")
     n_ctx = kv.shape[0]
-    dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
+    dummy_q = torch.empty(
+        (n_ctx, 0, attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
@@ -338,6 +348,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This TP rank's vocab shard of compute_draft_logits, not gathered."""
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
@@ -357,13 +373,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     # --- Weight loading ----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
+        """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
 
         Matching TP layouts alias the target embedding/head. Different TP
         layouts load their own shards from the target checkpoint.
         """
         first_layer = self.model.layers[0]
-        use_mega_moe = first_layer.ffn.use_mega_moe
+        use_native_mega_moe = first_layer.ffn.use_native_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
         # backbone's (see DeepseekV4MoE and the reference
         # ModelArgs.get_moe_config).
@@ -371,7 +387,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts
         )
-        if use_mega_moe:
+        if use_native_mega_moe:
             expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
         else:
             expert_mapping = fused_moe_make_expert_params_mapping(
@@ -399,12 +415,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         loaded_confidence_head = False
 
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        n_local_head = self.config.num_attention_heads // tp_size
-        head_start = n_local_head * tp_rank
-        head_end = n_local_head * (tp_rank + 1)
-
+        weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
         for name, loaded_weight in weights:
             if self.has_own_embed_tokens and name in ("embed.weight", "head.weight"):
                 target = (
@@ -437,6 +448,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
                 )
+
+            if name.startswith("model.context_wkv_proj."):
+                param = params_dict[name]
+                param.weight_loader(param, loaded_weight, loaded_weight.shard_id)
+                loaded_params.add(name)
+                continue
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
@@ -476,17 +493,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if "attn_sink" in name:
-                    narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
-                    loaded_params.add(name)
-                    continue
-                if name.endswith(".ffn.gate.bias_vl"):
-                    name = name.replace(
-                        ".ffn.gate.bias_vl",
-                        ".ffn.gate.e_score_correction_bias_vl",
-                    )
-                elif name.endswith(".ffn.gate.bias"):
+                if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )
@@ -502,22 +509,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             and not {"model.embed_tokens.weight", "lm_head.weight"} <= loaded_params
         ):
             raise ValueError("Cross-TP DSpark requires target embedding/head weights")
-        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
-
-    def process_weights_after_loading(self) -> None:
-        self._finalize_moe()
-
     def _remap_dspark_name(self, name: str) -> str | None:
-        """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
+        """Map a checkpoint `mtp.{i}.*` name to this model's parameter path.
 
         Returns None for non-mtp weights (owned by the target model).
         """
+        if name.startswith("context_wkv_proj."):
+            return f"model.{name}"
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None

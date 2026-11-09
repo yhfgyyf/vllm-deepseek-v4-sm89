@@ -3,9 +3,9 @@
 """Portable SM89/SM120 MXFP4 kernels for the DeepSeek V4.1 indexer.
 
 On SM120 the logits kernel feeds the packed e2m1 bytes and ue8m0 scales of q and K
-straight into the block-scaled FP4 tensor-core MMA through ``tl.dot_scaled``
-(``mma.sync.m16n8k64.kind::mxf4nvf4.block_scale``); nothing is decoded. Other
-architectures keep the inline decode to BF16 and ``tl.dot``. Products are exact in
+straight into the block-scaled FP4 tensor-core MMA through `tl.dot_scaled`
+(`mma.sync.m16n8k64.kind::mxf4nvf4.block_scale`); nothing is decoded. Other
+architectures keep the inline decode to BF16 and `tl.dot`. Products are exact in
 both paths (e2m1 times a power of two is representable), so the two differ only in
 fp32 accumulation order; the top-k sets they produce are identical on the shapes
 covered by the tests."""
@@ -158,10 +158,7 @@ def _mxfp4_indexer_logits_kernel(
         req = row // ROW_REPEAT
         end = tl.load(row_ends + row)
         first_col = 0
-        if USE_CANDIDATES:
-            stop = width
-        else:
-            stop = tl.minimum(end, width)
+        stop = width if USE_CANDIDATES else tl.minimum(end, width)
     first_tile_of_row = first_col // BLOCK_N
     stop = tl.maximum(stop, first_tile_of_row * BLOCK_N)
     last_tile = (stop + BLOCK_N - 1) // BLOCK_N
@@ -235,8 +232,12 @@ def _mxfp4_indexer_logits_kernel(
                 tile_req = req
             else:
                 packed_col = cols
-                valid = (packed_col >= start) & (packed_col < end) & (packed_col < width)
-                tile_req = tl.load(token_to_seq + packed_col, mask=valid, other=0).to(tl.int64)
+                valid = (
+                    (packed_col >= start) & (packed_col < end) & (packed_col < width)
+                )
+                tile_req = tl.load(token_to_seq + packed_col, mask=valid, other=0).to(
+                    tl.int64
+                )
                 req_start = tl.load(cu_seq_lens + tile_req, mask=valid, other=0)
                 token = packed_col - req_start
         else:
@@ -300,7 +301,9 @@ def _mxfp4_indexer_logits_kernel(
                 + block_offset[None, :] * _SCALES_PER_HEAD
                 + (dims[:, None] // _SCALE_GROUP_SIZE)
             )
-            k_scale_bytes = tl.load(k_cache + scale_offsets, mask=valid[None, :], other=0)
+            k_scale_bytes = tl.load(
+                k_cache + scale_offsets, mask=valid[None, :], other=0
+            )
             k = _decode_e2m1(k_nibbles) * tl.exp2(k_scale_bytes.to(tl.float32) - 127.0)
 
             head_scores = tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16))
@@ -321,14 +324,20 @@ def _mxfp4_indexer_logits_kernel(
         num_tail = (width - tail_start + fill_step - 1) // fill_step
         for i in range(0, num_tail):
             cols = tail_start + i * fill_step + fill_cols
-            tl.store(logits + row * logits_stride_row + cols, neg_inf, mask=cols < width)
+            tl.store(
+                logits + row * logits_stride_row + cols, neg_inf, mask=cols < width
+            )
         if PREFILL:
             head_stop = first_tile_of_row * BLOCK_N
             head_start = first_tile * _FILL_BLOCK
             num_head = (head_stop - head_start + fill_step - 1) // fill_step
             for i in range(0, num_head):
                 cols = head_start + i * fill_step + fill_cols
-                tl.store(logits + row * logits_stride_row + cols, neg_inf, mask=cols < head_stop)
+                tl.store(
+                    logits + row * logits_stride_row + cols,
+                    neg_inf,
+                    mask=cols < head_stop,
+                )
 
 
 @triton.jit
@@ -390,7 +399,11 @@ def _use_q_predecode(device: torch.device) -> bool:
     """
     if device.type != "cuda":
         return False
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
     return _q_predecode_for_device(index)
 
 
@@ -488,9 +501,16 @@ def _use_fp4_dot(device: torch.device) -> bool:
     Triton would emulate it by upcasting, which is slower than the inline decode.
     VLLM_DSV41_INDEXER_FP4_DOT=0 forces the decode path for bisecting.
     """
-    if device.type != "cuda" or os.environ.get("VLLM_DSV41_INDEXER_FP4_DOT", "1") == "0":
+    if (
+        device.type != "cuda"
+        or os.environ.get("VLLM_DSV41_INDEXER_FP4_DOT", "1") == "0"
+    ):
         return False
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
     return _fp4_dot_for_device(index)
 
 
@@ -503,7 +523,9 @@ def _logits_config(device: torch.device) -> tuple[bool, int, int]:
     return False, _LOGITS_BLOCK_N, _LOGITS_NUM_STAGES
 
 
-def _logits_launch_grid(rows: int, width: int, block_n: int = _LOGITS_BLOCK_N) -> tuple[int, int]:
+def _logits_launch_grid(
+    rows: int, width: int, block_n: int = _LOGITS_BLOCK_N
+) -> tuple[int, int]:
     col_tiles = triton.cdiv(width, block_n)
     per_row = max(_LOGITS_MIN_TILE_PROGRAMS, _LOGITS_TARGET_PROGRAMS // max(rows, 1))
     tile_programs = max(1, min(col_tiles, per_row, _CUDA_GRID_Y_LIMIT))

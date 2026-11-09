@@ -828,12 +828,12 @@ class Glm5NextModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (
+                for (
                     param_name,
                     weight_name,
                     expert_id,
                     expert_shard_id,
-                ) in enumerate(expert_params_mapping):
+                ) in expert_params_mapping:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
@@ -1110,8 +1110,8 @@ def _dequant_fp8_block(
 ) -> torch.Tensor:
     """Dequantize a block-FP8 (e4m3) weight with per-block scale to BF16.
 
-    Unlike ``scaled_dequantize`` this tolerates a non-divisible (partial last
-    block) shape by zero-padding to a multiple of ``block_size`` before the
+    Unlike `scaled_dequantize` this tolerates a non-divisible (partial last
+    block) shape by zero-padding to a multiple of `block_size` before the
     scale broadcast and trimming back afterwards (e.g. kv_a_proj_with_mqa is
     576 rows = 4*128 + 64).
     """
@@ -1151,10 +1151,10 @@ def _try_load_fp8_attn_proj(
     """Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on load.
 
     The FP8 checkpoint stores these as block-FP8 (weight + weight_scale_inv),
-    but the model holds them in BF16 (``fused_qkv_a_proj`` is always BF16 via
-    DeepSeekV2FusedQkvAProjLinear; ``o_proj`` is excluded by
+    but the model holds them in BF16 (`fused_qkv_a_proj` is always BF16 via
+    DeepSeekV2FusedQkvAProjLinear; `o_proj` is excluded by
     modules_to_not_convert). When the model target is BF16 (no
-    ``weight_scale_inv`` param) we dequantize; otherwise we return False so the
+    `weight_scale_inv` param) we dequantize; otherwise we return False so the
     normal stacked/direct path loads the FP8 tensor as-is.
     """
     matched = None

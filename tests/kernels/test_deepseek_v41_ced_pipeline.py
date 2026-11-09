@@ -53,7 +53,7 @@ IMAGE_TOKEN_ID = 129264
 
 
 def logical_swa_slots(positions, replay_start, image_span=None):
-    """Build logical ``(causal SWA) OR (same image span)`` cache slots."""
+    """Build logical `(causal SWA) OR (same image span)` cache slots."""
     first = (positions - 127).clamp_min(0)
     end = positions + 1
     width = 128
@@ -105,6 +105,7 @@ class PackedAttention(nn.Module):
         q = kv[:, None].expand(-1, 8, -1).contiguous()
         q = fused_q_rope_swa_insert(q, kv, positions, self.cs, self.cache, positions)
         metadata = get_forward_context().attn_metadata
+        assert isinstance(metadata, dict)
         swa = logical_swa_slots(
             positions, metadata["replay_start"], metadata.get("image_span")
         )
@@ -351,10 +352,12 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
             assert torch.count_nonzero(actual) == 0
             assert not actual_model.layers[20].attn.rows_seen
             if dspark:
+                assert step.draft_context is not None
                 assert step.draft_context.aux_hidden_states == []
         else:
             torch.testing.assert_close(actual[-1], expected[-1], rtol=0.005, atol=0.005)
             if dspark:
+                assert step.draft_context is not None
                 for actual_aux, ref_aux in zip(
                     step.draft_context.aux_hidden_states, expected_aux
                 ):
@@ -405,6 +408,7 @@ def test_ced_chunked_decoder_matches_independent_bounded_replay(
         )
     if dspark:
         actual_next, _ = actual_next
+        assert decode_step.draft_context is not None
         assert len(decode_step.draft_context.aux_hidden_states) == 3
     torch.testing.assert_close(actual_next, expected_next, rtol=0.005, atol=0.005)
     for layer in islice(actual_model.layers, 20, 40):
@@ -457,6 +461,14 @@ def check_draft_context(step):
         )
         layer.attn = attn
         draft.layers.append(layer)
+    draft.num_dspark_layers = len(draft.layers)
+    draft.config = SimpleNamespace(head_dim=512)
+    draft.context_wkv_proj = nn.Linear(
+        HIDDEN, 3 * 512, bias=False, device="cuda", dtype=torch.bfloat16
+    )
+    draft.context_wkv_proj.weight.copy_(
+        torch.cat([layer.attn.fused_wqa_wkv.weight[16:] for layer in draft.layers])
+    )
     wrapper = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.model = draft
@@ -474,7 +486,7 @@ def check_draft_context(step):
     batch = SimpleNamespace(
         num_reqs=1, num_tokens=1, seq_lens=torch.tensor([end], device="cuda")
     )
-    runner._precompute_context_kv(
+    runner.prepare_context_kv_outside_graph(
         batch,
         {CED_METADATA_KEY: step},
         torch.zeros(1, HIDDEN, device="cuda"),

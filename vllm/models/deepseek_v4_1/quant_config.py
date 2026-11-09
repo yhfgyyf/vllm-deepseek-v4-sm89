@@ -49,7 +49,7 @@ from vllm.models.deepseek_v4.quant_config import (
 
 @register_weight_loader_v2_supported_method
 class DeepseekV41WoALinearMethod(LinearMethodBase):
-    """Load checkpoint MXFP8 ``wo_a`` once into its official BF16 form."""
+    """Load checkpoint MXFP8 `wo_a` once into its official BF16 form."""
 
     def __init__(self) -> None:
         self.unquantized_method = UnquantizedLinearMethod()

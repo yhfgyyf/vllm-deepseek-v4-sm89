@@ -30,8 +30,7 @@ def speculator(num_reqs=3, device="cpu"):
             torch.arange(4, 4 + num_reqs * 256).view(num_reqs, 256),
             torch.arange(20, 20 + num_reqs * 128).view(num_reqs, 128),
         ],
-        kernel_block_sizes=[4, 8],
-        block_sizes=[16, 16],
+        block_sizes=[4, 8],
     )
     spec.sample_idx_mapping = torch.arange(num_reqs).repeat_interleave(5).int()
     spec.input_buffers = SimpleNamespace(seq_lens=torch.full((num_reqs,), 999))
@@ -72,7 +71,7 @@ def test_compact_context_preserves_128_replay_rows_and_masks_rejected_decode():
     )
     query_ptr = spec.block_tables.slot_mappings.data_ptr()
     sample_ptr = spec.sample_idx_mapping.data_ptr()
-    spec._precompute_context_kv(
+    spec.prepare_context_kv_outside_graph(
         batch,
         {CED_METADATA_KEY: make_step(context)},
         torch.zeros(68, 2),
@@ -87,7 +86,7 @@ def test_compact_context_preserves_128_replay_rows_and_masks_rejected_decode():
     torch.testing.assert_close(actual_positions, positions)
     assert projected.shape[0] == 131  # not the68 current target rows or final1
     for layer, gid in enumerate([1, 0, 1]):
-        block_size = spec.block_tables.kernel_block_sizes[gid]
+        block_size = spec.block_tables.block_sizes[gid]
         expected = spec.block_tables.input_block_tables[gid][
             reqs, positions // block_size
         ]
@@ -108,7 +107,7 @@ def test_intermediate_prefill_publishes_no_context_and_has_inert_draft_queries()
     context = CEDDraftContext(
         torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64), (), []
     )
-    spec._precompute_context_kv(
+    spec.prepare_context_kv_outside_graph(
         SimpleNamespace(num_reqs=3),
         {CED_METADATA_KEY: make_step(context)},
         torch.zeros(100, 2),
@@ -143,7 +142,7 @@ def test_split_null_pages_and_out_of_range_positions_never_become_context_slots(
 def test_non_ced_dspark_preserves_normal_dense_auxiliary_context(dummy_run):
     spec = speculator()
     aux = [torch.arange(8).view(4, 2).float()]
-    spec._precompute_context_kv(
+    spec.prepare_context_kv_outside_graph(
         SimpleNamespace(num_tokens=4),
         {},
         torch.zeros(4, 2),

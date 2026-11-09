@@ -10,7 +10,11 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
+from vllm.config.multimodal import (
+    BaseDummyOptions,
+    ImageDummyOptions,
+    VideoDummyOptions,
+)
 from vllm.inputs import MultiModalDataDict, MultiModalHashes
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
@@ -34,7 +38,7 @@ from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    MultiModalPromptUpdates,
+    MultiModalProcessingResult,
     PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
@@ -443,7 +447,7 @@ class DeepseekV4VisionDummyInputsBuilder(
                 width=image_size.width,
                 height=image_size.height,
                 num_images=mm_counts.get("image", 0),
-                overrides=mm_options.get("image"),
+                overrides=cast(ImageDummyOptions | None, mm_options.get("image")),
             ),
             "video": self._get_dummy_videos(
                 width=image_size.width,
@@ -592,9 +596,9 @@ class DeepseekV4VisionMultiModalProcessor(
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> "BatchFeature":
-        del hf_processor_mm_kwargs
+        del hf_kwargs
 
         from transformers.feature_extraction_utils import BatchFeature
 
@@ -927,15 +931,8 @@ class DeepseekV4VisionMultiModalProcessor(
     def _maybe_apply_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
-        prompt_ids: list[int],
-        mm_kwargs: MultiModalKwargsOptionalItems,
-        mm_prompt_updates: MultiModalPromptUpdates,
+        mm_res: MultiModalProcessingResult,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
-        prompt_ids, placeholders = super()._maybe_apply_prompt_updates(
-            mm_items,
-            prompt_ids,
-            mm_kwargs,
-            mm_prompt_updates,
-        )
-        self._inject_token_metadata(mm_kwargs, placeholders)
+        prompt_ids, placeholders = super()._maybe_apply_prompt_updates(mm_items, mm_res)
+        self._inject_token_metadata(mm_res.kwargs, placeholders)
         return prompt_ids, placeholders

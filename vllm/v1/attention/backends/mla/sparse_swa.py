@@ -4,20 +4,23 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, cast
 
 import torch
+from transformers import DeepseekV4Config
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.warmup.jit_warmup import (
     WarmupIntRange,
+    kernel_launcher,
+    zip_inputs,
 )
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
     VllmTritonJitKernel,
-    kernel_launcher,
 )
 from vllm.platforms import current_platform
+from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
@@ -26,19 +29,18 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import (
-    fill_mm_prefix_query_ranges,
-    split_decodes_and_prefills,
-)
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     get_mla_metadata,
     is_flashmla_sparse_supported,
 )
+from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -56,7 +58,7 @@ _LAYER_TYPE_C128A = "c128a"
 # v4.1 ratio-1 / ratio-2 indexer layers: same indexer-path shape as C4A, but
 # their compressed page block is block_size // ratio, so each gets its own plan.
 # v4.1 builders classify layer types themselves (ratio 0 is SWA-only there); see
-# deepseek_v4_1/sparse_mla.py.
+# deepseek_v41/sparse_mla.py.
 _LAYER_TYPE_C1A = "c1a"
 _LAYER_TYPE_C2A = "c2a"
 
@@ -91,21 +93,31 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         cache_config: CacheConfig,
         backend_cls: "type[AttentionBackend] | None" = None,
         block_size: int = 64,
+        packed_bytes_per_token: int = 584,
+        packed_page_alignment: int = 576,
+        packed_block_stride_alignment: int | None = None,
+        bounded_replay: bool = False,
     ):
         super().__init__()
         self.backend_cls = backend_cls or DeepseekSparseSWABackend
+        # DeepseekV4.1 SWA bounded replay.
+        self.bounded_replay = bounded_replay
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.window_size = window_size
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.packed_bytes_per_token = packed_bytes_per_token
+        self.packed_page_alignment = packed_page_alignment
+        self.packed_block_stride_alignment = packed_block_stride_alignment
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # Preserve V4's 64-token page; V4.1 supplies its own 32-token backend.
+        # Any multiple of 32; the sparse decode kernels take the page size at
+        # runtime.
         self.block_size = block_size
         # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:
         # contiguous full-cache layout.
@@ -116,20 +128,30 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.kv_cache = kv_cache.squeeze(1)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous
-        # bf16/fp8 cache uses the natural element-size page.
-        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
+        # fp8_ds_mla's UE8M0 paged layout rounds its page up to the decode
+        # kernel's TMA stride; contiguous bf16/fp8 cache uses the natural
+        # element-size page.
+        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+        )
         return SlidingWindowMLASpec(
+            bounded_replay=self.bounded_replay,
             block_size=self.block_size,
             num_kv_heads=1,
+            max_tp_shards=1,
             head_size=self.head_dim,
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            # DeepseekV4 fp8_ds_mla: 584B per token (448B NoPE + 128B RoPE + 8B scales)
-            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
-            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            state_content_bytes=(
+                self.packed_bytes_per_token if uses_fp8_ds_mla_layout else None
+            ),
+            # Packed page alignment; 512B for FlashInfer sparse (#44577).
+            alignment=self.packed_page_alignment if uses_fp8_ds_mla_layout else 512,
+            block_stride_alignment=(
+                self.packed_block_stride_alignment if uses_fp8_ds_mla_layout else None
+            ),
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
         )
@@ -146,8 +168,8 @@ class DeepseekSparseSWABackend(AttentionBackend):
         return "DEEPSEEK_SPARSE_SWA"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(64)]
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        return [MultipleOf(32)]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -169,6 +191,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
             )
 
             return DeepseekV4ROCMAiterSparseSWAMetadataBuilder
+        if current_platform.is_cpu():
+            from vllm.models.deepseek_v4.cpu.cpu_mla import (
+                DeepseekV4CPUSparseSWAMetadataBuilder,
+            )
+
+            return DeepseekV4CPUSparseSWAMetadataBuilder
         return DeepseekSparseSWAMetadataBuilder
 
 
@@ -189,10 +217,22 @@ class DeepseekSparseSWAMetadata:
     decode_swa_width: int = 0
     # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
     prefill_swa_indices: torch.Tensor | None = (
-        None  # [num_prefill_tokens, 1, window_size]
+        None  # [num_prefill_tokens, 1, prefill_index_width]
     )
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
-    mm_prefix_query_ranges: torch.Tensor | None = None  # [num_actual_tokens, 2]
+    # In-image bidirectional visibility (vision variant): per-token counts of
+    # extra visible tokens to the left/right inside an image span. Indexed by
+    # absolute (decode-first) token position; only prefill rows are written.
+    # None when the model is text-only or the batch has no image spans.
+    prefill_left_visible: torch.Tensor | None = None
+    prefill_right_visible: torch.Tensor | None = None
+    # SWA bounded replay: [num_reqs] lower bound of the positions a request's
+    # window attention may read (SWA bounded replay);
+    # zeros when nothing replays.
+    replay_start: torch.Tensor | None = None
+    # PCP cache writes use the gathered slots; queries use rank-local slots.
+    cache_slot_mapping: torch.Tensor | None = None
+    cache_positions: torch.Tensor | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -200,6 +240,8 @@ class DeepseekSparseSWAMetadata:
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
     max_decode_query_len: int = 1
+    flashinfer_decode_topk_lens: torch.Tensor | None = None
+    flashinfer_decode_seq_lens: torch.Tensor | None = None
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
@@ -249,10 +291,12 @@ class DeepseekSparseSWAMetadata:
             has_compressed = compress_ratio > 1
 
         # query_len <= max_num_batched_tokens and
-        # gather_len = query_len + min(prefix_len, window_size - 1), so the
-        # worst-case gathered width is bounded by
-        # max_num_batched_tokens + window_size - 1. The compressed prefix pool
-        # is bounded by ceil(max_model_len / compress_ratio).
+        # gather_len <= query_len + min(prefix_len, window_size - 1) (a replay
+        # boundary only shrinks it), so the worst-case gathered width is
+        # bounded by max_num_batched_tokens + window_size - 1. The compressed
+        # prefix pool is bounded by ceil(max_model_len / compress_ratio). The
+        # CPU gather lengths below are this upper bound, for chunk planning
+        # only; the kernels use the exact per-request values.
         max_workspace_area = prefill_chunk_size * (
             (cdiv(self.prefill_max_model_len, compress_ratio) if has_compressed else 0)
             + self.prefill_window_size
@@ -324,6 +368,7 @@ class ComputePrefillMetadataKernel(
         # Inputs
         seq_lens_ptr,
         query_start_loc_ptr,
+        replay_start_ptr,
         num_prefills,
         num_decodes,
         window_size,
@@ -345,7 +390,10 @@ class ComputePrefillMetadataKernel(
 
         query_len = qsl_end - qsl_start
         prefix_len = seq_len - query_len
-        gather_len = query_len + tl.minimum(prefix_len, window_size - 1)
+        # Context below replay_start has no window KV (SWA bounded replay).
+        replay_start = tl.load(replay_start_ptr + num_decodes + safe_offset, mask=mask)
+        visible_prefix = tl.maximum(prefix_len - replay_start, 0)
+        gather_len = query_len + tl.minimum(visible_prefix, window_size - 1)
 
         tl.store(prefill_gather_lens_ptr + offset, gather_len, mask=mask)
 
@@ -377,6 +425,7 @@ class ComputePrefillMetadataKernel(
             prefill_gather_lens=int32_ptr,
             seq_lens=int32_ptr,
             query_start_loc=int32_ptr,
+            replay_start=int32_ptr,
             num_prefills=compile_key.block_size,
             num_decodes=0,
             window_size=1,
@@ -388,6 +437,7 @@ class ComputePrefillMetadataKernel(
         prefill_gather_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
+        replay_start: torch.Tensor,
         num_prefills: int,
         num_decodes: int,
         window_size: int,
@@ -433,24 +483,28 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
         # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at that width.
-        spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
-        )
-        self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        # the prefill path and the decode/prefill split stays at the widest
+        # decode.
+        self.decode_threshold = max_decode_query_len(self.vllm_config)
         self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
         self.window_size = hf_config.sliding_window
-        self.swa_index_width = (
-            _get_mm_prefix_swa_index_width(hf_config, self.window_size)
-            if self.vllm_config.model_config.is_mm_prefix_lm
-            else self.window_size
+
+        # V4 vision variant: image spans (up to vision_max_n_token tokens) are
+        # visible bidirectionally, so prefill index rows widen from
+        # window_size to window_size + max_image_tokens. V4.1 image tokens use
+        # the plain causal window, and text-only models keep
+        # max_image_tokens == 0 everywhere.
+        self.max_image_tokens = (
+            getattr(hf_config, "vision_max_n_token", 0)
+            if isinstance(hf_config, DeepseekV4Config)
+            and getattr(hf_config, "vision_n_layers", 0) > 0
+            else 0
         )
+        self.prefill_index_width = self.window_size + self.max_image_tokens
 
         # Detect which DeepseekV4 layer types this model uses so we only build a
         # FlashMLA tile-scheduler plan for types that will actually be called.
@@ -468,7 +522,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.swa_index_width,
+            self.window_size,
             dtype=torch.int32,
             device=self.device,
         )
@@ -477,32 +531,50 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Decode and prefill partition the same token budget. Their metadata
-        # stays live together, so build() assigns disjoint rows of one buffer.
-        self.prefill_swa_indices = self.decode_swa_indices
+        # Allocated unconditionally — consumer picks paged-direct vs dequant
+        # at call time.
+        self.prefill_swa_indices = (
+            self.decode_swa_indices
+            if self.max_image_tokens == 0
+            else torch.zeros(
+                max_tokens,
+                1,
+                self.prefill_index_width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        )
         self.prefill_swa_lens = torch.zeros(
             max_tokens,
             dtype=torch.int32,
             device=self.device,
         )
+        # In-image visibility side buffers (vision variant only). The span
+        # CSR is uploaded per step from mm_req_doc_ranges; span capacity is
+        # bounded by max_tokens since each span holds at least one token.
+        if self.max_image_tokens > 0:
+            self.left_visible = torch.zeros(
+                max_tokens, dtype=torch.int32, device=self.device
+            )
+            self.right_visible = torch.zeros(
+                max_tokens, dtype=torch.int32, device=self.device
+            )
+            self.span_indptr = torch.zeros(
+                self.vllm_config.scheduler_config.max_num_seqs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.span_starts = torch.zeros(
+                max_tokens, dtype=torch.int32, device=self.device
+            )
+            self.span_ends = torch.zeros(
+                max_tokens, dtype=torch.int32, device=self.device
+            )
         self.is_valid_token = torch.zeros(
             max_tokens,
             dtype=torch.bool,
             device=self.device,
         )
-        self.mm_prefix_query_ranges_cpu: torch.Tensor | None = None
-        self.mm_prefix_query_ranges_gpu: torch.Tensor | None = None
-        if self.vllm_config.model_config.is_mm_prefix_lm:
-            self.mm_prefix_query_ranges_cpu = torch.empty(
-                (max_tokens, 2),
-                dtype=torch.int32,
-                pin_memory=True,
-            )
-            self.mm_prefix_query_ranges_gpu = torch.empty(
-                (max_tokens, 2),
-                dtype=torch.int32,
-                device=self.device,
-            )
 
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
@@ -520,17 +592,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
+        # replay_start when no group replays: no lower bound.
+        self.no_replay_start = torch.zeros(
+            self.vllm_config.scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def _get_layer_compress_ratios(self, default_ratio: int = 1) -> list[int]:
-        compress_ratios = getattr(
-            self.vllm_config.model_config.hf_config, "compress_ratios", None
-        )
-        if not compress_ratios:
+        ratios = get_compress_ratios(self.vllm_config.model_config.hf_config)
+        if not ratios:
             return [default_ratio] * len(self.layer_names)
-        layer_indices = [extract_layer_index(name) for name in self.layer_names]
         return [
-            compress_ratios[index] if index < len(compress_ratios) else default_ratio
-            for index in layer_indices
+            ratios[index] if index < len(ratios) else default_ratio
+            for index in (extract_layer_index(name) for name in self.layer_names)
         ]
 
     def build(
@@ -538,6 +613,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
     ) -> DeepseekSparseSWAMetadata:
         """Build SWA metadata for mixed decode/prefill batches.
 
@@ -546,6 +622,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         separate window_topk_idxs for each portion.
 
         For prefill, we use chunked prefill to align with the indexer's chunking.
+
+        `replay_start` ([num_reqs], SWA bounded replay): the position from
+        which each request holds window KV; the model state passes it for every
+        batch of a replaying group, graph captures pass nothing.
         """
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
@@ -568,16 +648,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        torch.ge(slot_mapping, 0, out=is_valid_token)
+        if replay_start is None:
+            # Graph captures build without it; their dummy batches replay nothing.
+            replay_start = self.no_replay_start
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (
-            self.noncausal_index_width if non_causal else self.swa_index_width
+            self.noncausal_index_width if non_causal else self.window_size
         )
         decode_swa_indices = self.decode_swa_indices
-        mm_prefix_query_ranges = self._build_mm_prefix_query_ranges(
-            common_attn_metadata
-        )
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
             if non_causal:
@@ -594,6 +674,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                         device=self.device,
                     )
                 decode_swa_indices = self.decode_swa_indices_noncausal
+                # No replay_start: decode rows sit above the hit, so a
+                # request's replayed window never reaches them.
                 _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL(
                     decode_swa_indices,
                     self.decode_swa_lens,
@@ -605,8 +687,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     is_valid_token,
                     block_table,
                     self.block_size,
-                    mm_prefix_query_ranges,
-                    mm_prefix_query_ranges is not None,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
@@ -615,43 +695,69 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     decode_swa_indices,
                     self.decode_swa_lens,
                     self.window_size,
-                    self.swa_index_width,
+                    decode_swa_indices.shape[-1],
+                    self.decode_swa_lens,  # unused (HAS_IMAGE=False)
+                    self.decode_swa_lens,  # unused (HAS_IMAGE=False)
                     query_start_loc,
                     seq_lens,
                     token_to_req_indices,
                     is_valid_token,
                     block_table,
                     self.block_size,
-                    mm_prefix_query_ranges,
-                    mm_prefix_query_ranges is not None,
+                    replay_start,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
 
+        # Vision variant: per-token in-image visibility for prefill tokens.
+        # Decode tokens are always past the image spans (spans are prefilled
+        # atomically), so the decode path above never needs them.
+        prefill_left_visible: torch.Tensor | None = None
+        prefill_right_visible: torch.Tensor | None = None
+        mm_ranges = common_attn_metadata.mm_req_doc_ranges
+        if (
+            self.max_image_tokens > 0
+            and num_prefill_tokens > 0
+            and mm_ranges
+            and any(mm_ranges.values())
+        ):
+            prefill_left_visible, prefill_right_visible = self._build_image_visibility(
+                common_attn_metadata.num_reqs,
+                mm_ranges,
+                num_decode_tokens,
+                num_prefill_tokens,
+                seq_lens,
+                query_start_loc,
+                token_to_req_indices,
+            )
+
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
-        prefill_swa_indices = None
+        prefill_offset = num_decode_tokens if self.max_image_tokens == 0 else 0
         if num_prefill_tokens > 0:
+            has_image = prefill_left_visible is not None
             prefill_swa_indices = self.prefill_swa_indices[
-                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                prefill_offset : prefill_offset + num_prefill_tokens
             ]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
                 prefill_swa_indices,
                 prefill_swa_lens,
                 self.window_size,
-                self.swa_index_width,
+                self.prefill_index_width,
+                prefill_left_visible if has_image else prefill_swa_lens,
+                prefill_right_visible if has_image else prefill_swa_lens,
                 query_start_loc,
                 seq_lens,
                 token_to_req_indices,
                 is_valid_token,
                 block_table,
                 self.block_size,
-                mm_prefix_query_ranges,
-                mm_prefix_query_ranges is not None,
+                replay_start,
                 num_tokens=num_prefill_tokens,
                 token_offset=num_decode_tokens,
+                has_image=has_image,
             )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
@@ -662,6 +768,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            replay_start,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -681,13 +788,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             decode_swa_width=decode_swa_width,
-            prefill_swa_indices=prefill_swa_indices,
+            prefill_swa_indices=(
+                self.prefill_swa_indices[
+                    prefill_offset : prefill_offset + num_prefill_tokens
+                ]
+                if num_prefill_tokens > 0
+                else None
+            ),
             prefill_swa_lens=(
                 self.prefill_swa_lens[:num_prefill_tokens]
                 if num_prefill_tokens > 0
                 else None
             ),
-            mm_prefix_query_ranges=mm_prefix_query_ranges,
+            prefill_left_visible=prefill_left_visible,
+            prefill_right_visible=prefill_right_visible,
+            replay_start=replay_start,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -708,11 +823,56 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             **deepseek_v4_fields,  # type: ignore[arg-type]
         )
 
+    def _build_image_visibility(
+        self,
+        num_reqs: int,
+        mm_ranges: dict[int, list[tuple[int, int]]],
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Upload image spans and compute per-token in-image visibility.
+
+        Returns (left, right) int32 tensors indexed by absolute (decode-first)
+        token position; only prefill rows are meaningful.
+        """
+        indptr = [0] * (num_reqs + 1)
+        starts: list[int] = []
+        ends: list[int] = []
+        for req_idx in range(num_reqs):
+            for span_start, span_end in mm_ranges.get(req_idx, ()):
+                starts.append(span_start)
+                ends.append(span_end)
+            indptr[req_idx + 1] = len(starts)
+        num_spans = len(starts)
+        assert num_spans <= self.span_starts.shape[0]
+        self.span_indptr[: num_reqs + 1].copy_(torch.tensor(indptr, dtype=torch.int32))
+        if num_spans > 0:
+            self.span_starts[:num_spans].copy_(torch.tensor(starts, dtype=torch.int32))
+            self.span_ends[:num_spans].copy_(torch.tensor(ends, dtype=torch.int32))
+        _compute_image_visibility_kernel[(num_prefill_tokens,)](
+            self.left_visible,
+            self.right_visible,
+            self.span_indptr,
+            self.span_starts,
+            self.span_ends,
+            query_start_loc,
+            seq_lens,
+            token_to_req_indices,
+            self.max_image_tokens,
+            token_offset=num_decode_tokens,
+        )
+        end = num_decode_tokens + num_prefill_tokens
+        return self.left_visible[:end], self.right_visible[:end]
+
     def update_draft_decode_metadata(
         self,
         metadata: DeepseekSparseSWAMetadata,
     ) -> None:
-        if metadata.num_decode_tokens == 0:
+        num_tokens = metadata.num_decode_tokens
+        if num_tokens == 0:
             return
         assert metadata.query_start_loc is not None
         assert metadata.seq_lens is not None
@@ -720,23 +880,57 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         assert metadata.is_valid_token is not None
         assert metadata.decode_swa_indices is not None
         assert metadata.decode_swa_lens is not None
+        assert metadata.replay_start is not None
 
-        _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
-            metadata.decode_swa_indices,
-            metadata.decode_swa_lens,
-            self.window_size,
-            metadata.decode_swa_indices.shape[-1],
+        # Recompute the validity mask and token->request map from the device
+        # buffers. Their padding differs from the dummy batch the graph was
+        # captured with.
+        torch.ge(metadata.slot_mapping, 0, out=metadata.is_valid_token)
+        compute_token_to_req_indices(
             metadata.query_start_loc,
-            metadata.seq_lens,
             metadata.token_to_req_indices,
-            metadata.is_valid_token,
-            metadata.block_table,
-            self.block_size,
-            metadata.mm_prefix_query_ranges,
-            metadata.mm_prefix_query_ranges is not None,
-            num_tokens=metadata.num_decode_tokens,
-            token_offset=0,
+            num_tokens,
+            num_tokens,
         )
+
+        # build() points non-causal (DSpark draft) metadata at its own buffer.
+        noncausal = self.decode_swa_indices_noncausal
+        if (
+            noncausal is not None
+            and metadata.decode_swa_indices.data_ptr() == noncausal.data_ptr()
+        ):
+            _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL(
+                metadata.decode_swa_indices,
+                metadata.decode_swa_lens,
+                self.window_size,
+                self.noncausal_index_width,
+                metadata.query_start_loc,
+                metadata.seq_lens,
+                metadata.token_to_req_indices,
+                metadata.is_valid_token,
+                metadata.block_table,
+                self.block_size,
+                num_tokens=num_tokens,
+                token_offset=0,
+            )
+        else:
+            _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
+                metadata.decode_swa_indices,
+                metadata.decode_swa_lens,
+                metadata.decode_swa_indices.shape[-1],
+                metadata.decode_swa_indices.shape[-1],
+                metadata.decode_swa_lens,  # unused (HAS_IMAGE=False)
+                metadata.decode_swa_lens,  # unused (HAS_IMAGE=False)
+                metadata.query_start_loc,
+                metadata.seq_lens,
+                metadata.token_to_req_indices,
+                metadata.is_valid_token,
+                metadata.block_table,
+                self.block_size,
+                metadata.replay_start,
+                num_tokens=metadata.num_decode_tokens,
+                token_offset=0,
+            )
         tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
         metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
         metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
@@ -748,17 +942,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     def build_tile_scheduler(
         self, num_decode_tokens: int
     ) -> dict[str, FlashMLASchedMeta | None]:
-        """Allocate one empty ``FlashMLASchedMeta`` per present DeepseekV4 layer type.
+        """Allocate one empty `FlashMLASchedMeta` per present DeepseekV4 layer type.
 
-        Returned instances have ``tile_scheduler_metadata`` / ``num_splits``
-        set to ``None``; the FlashMLA C++ decode path will allocate them and
-        run the tile-scheduler planner on the first ``flash_mla_with_kvcache``
+        Returned instances have `tile_scheduler_metadata` / `num_splits`
+        set to `None`; the FlashMLA C++ decode path will allocate them and
+        run the tile-scheduler planner on the first `flash_mla_with_kvcache`
         call of each type. Subsequent same-type calls reuse the plan because
-        the tensors (and ``have_initialized``) are populated on the struct.
+        the tensors (and `have_initialized`) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step or
-        sparse FlashMLA is unsupported, so ``_forward_decode`` sees a clean
-        sentinel.
+        Returns all-`None` when there are no decode tokens or sparse FlashMLA
+        is unsupported, so `_forward_decode` sees a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
@@ -777,34 +970,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             out[layer_type] = get_mla_metadata()[0]
         return out
 
-    def _build_mm_prefix_query_ranges(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-    ) -> torch.Tensor | None:
-        mm_ranges = common_attn_metadata.mm_req_doc_ranges
-        if mm_ranges is None or self.mm_prefix_query_ranges_cpu is None:
-            return None
-
-        assert common_attn_metadata.seq_lens_cpu_upper_bound is not None, (
-            "DeepSeek V4 sparse MLA mm_prefix requires seq_lens_cpu_upper_bound"
-        )
-        assert self.mm_prefix_query_ranges_gpu is not None
-        num_mm_tokens = fill_mm_prefix_query_ranges(
-            self.mm_prefix_query_ranges_cpu.numpy(),
-            mm_ranges,
-            common_attn_metadata.query_start_loc_cpu,
-            common_attn_metadata.seq_lens_cpu_upper_bound,
-        )
-        if num_mm_tokens == 0:
-            return None
-
-        mm_prefix_query_ranges = self.mm_prefix_query_ranges_gpu[:num_mm_tokens]
-        mm_prefix_query_ranges.copy_(
-            self.mm_prefix_query_ranges_cpu[:num_mm_tokens],
-            non_blocking=True,
-        )
-        return mm_prefix_query_ranges
-
     def _build_deepseek_v4_metadata(
         self,
         num_decodes: int,
@@ -813,6 +978,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        replay_start: torch.Tensor,
     ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
@@ -834,6 +1000,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 pfx_gather_lens,
                 seq_lens,
                 query_start_loc,
+                replay_start,
                 num_prefills,
                 num_decodes,
                 self.window_size,
@@ -853,7 +1020,142 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         return result
 
 
+@triton.jit(do_not_specialize=["token_offset"])
+def _compute_image_visibility_kernel(
+    left_visible_ptr,
+    right_visible_ptr,
+    span_indptr_ptr,
+    span_starts_ptr,
+    span_ends_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    max_image_tokens,
+    token_offset,
+):
+    """Per-token in-image visible counts (port of `get_image_visible`).
+
+    One program per prefill token. A token at position pos inside a span
+    [span_start, span_end] sees min(pos - span_start, max_image_tokens - 1)
+    extra tokens to its left and min(span_end - pos, max_image_tokens) to its
+    right; tokens outside every span get 0/0 (plain causal window).
+    """
+    pid = tl.program_id(0)
+    token_idx = pid + token_offset
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    pos = seq_len - (query_end - query_start) + token_idx - query_start
+
+    span_lo = tl.load(span_indptr_ptr + req_idx)
+    span_hi = tl.load(span_indptr_ptr + req_idx + 1)
+    left = tl.zeros((), dtype=tl.int32)
+    right = tl.zeros((), dtype=tl.int32)
+    for i in range(span_lo, span_hi):
+        span_start = tl.load(span_starts_ptr + i)
+        span_end = tl.load(span_ends_ptr + i)
+        in_span = (pos >= span_start) & (pos <= span_end)
+        left = tl.where(
+            in_span, tl.minimum(pos - span_start, max_image_tokens - 1), left
+        )
+        right = tl.where(in_span, tl.minimum(span_end - pos, max_image_tokens), right)
+    tl.store(left_visible_ptr + token_idx, left)
+    tl.store(right_visible_ptr + token_idx, right)
+
+
 # TODO(ben): unify this kernel to reduce duplication
+
+
+@triton.jit(
+    do_not_specialize=[
+        "swa_indices_stride",
+        "block_table_stride",
+        "token_offset",
+    ]
+)
+def _compute_swa_indices_and_lens_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    index_width,
+    left_visible_ptr,
+    right_visible_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    replay_start_ptr,
+    token_offset,
+    HAS_IMAGE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    token_idx = pid + token_offset
+    is_valid = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid:
+        tl.store(swa_lens_ptr + pid, 0)
+        # Clear the row so a padded token cannot gather through stale indices.
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < index_width,
+            )
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+
+    pos = prefix_len + token_idx - query_start
+    if HAS_IMAGE:
+        # In-image bidirectional visibility widens the window: the window
+        # starts up to max(left - (window - 1), 0) positions earlier and
+        # extends `right` positions past the query token.
+        left = tl.load(left_visible_ptr + token_idx)
+        right = tl.load(right_visible_ptr + token_idx)
+    else:
+        left = 0
+        right = 0
+    left_add = tl.maximum(left - (window_size - 1), 0)
+    start_pos = tl.maximum(pos - (window_size - 1) - left_add, 0)
+    # SWA bounded replay: no window KV exists below the request's replay start.
+    start_pos = tl.maximum(start_pos, tl.load(replay_start_ptr + req_idx))
+    end_pos = pos + right + 1
+
+    swa_len = end_pos - start_pos
+    tl.store(swa_lens_ptr + pid, swa_len)
+
+    for i in range(0, index_width, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+
+        pos_offset = start_pos + offset
+        block_indices = pos_offset // block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=pos_offset < end_pos,
+        )
+        block_offsets = pos_offset % block_size
+        slot_ids = block_numbers * block_size + block_offsets
+
+        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
+        tl.store(
+            swa_indices_ptr + pid * swa_indices_stride + offset,
+            slot_ids,
+            mask=offset < index_width,
+        )
 
 
 class ComputeSWAIndicesAndLensKernel(
@@ -863,102 +1165,18 @@ class ComputeSWAIndicesAndLensKernel(
     class CompileKey:
         window_size: int
         index_width: int
+        has_image: int
         block_size: int
         triton_block_size: int
 
-    @staticmethod
-    @triton.jit(
-        do_not_specialize=[
-            "swa_indices_stride",
-            "block_table_stride",
-            "token_offset",
-        ]
-    )
-    def kernel(
-        swa_indices_ptr,
-        swa_indices_stride,
-        swa_lens_ptr,
-        window_size,
-        index_width,
-        query_start_loc_ptr,
-        seq_lens_ptr,
-        token_to_req_indices_ptr,
-        is_valid_token_ptr,
-        block_table_ptr,
-        block_table_stride,
-        block_size,
-        mm_prefix_query_ranges_ptr,
-        HAS_MM_PREFIX: tl.constexpr,
-        token_offset,
-        TRITON_BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        token_idx = pid + token_offset
-        is_valid = tl.load(is_valid_token_ptr + token_idx)
-        if not is_valid:
-            tl.store(swa_lens_ptr + pid, 0)
-            # Clear the row so a padded token cannot gather through stale indices.
-            for i in range(0, index_width, TRITON_BLOCK_SIZE):
-                offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-                tl.store(
-                    swa_indices_ptr + pid * swa_indices_stride + offset,
-                    -1,
-                    mask=offset < index_width,
-                )
-            return
-
-        req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-
-        query_start = tl.load(query_start_loc_ptr + req_idx)
-        query_end = tl.load(query_start_loc_ptr + req_idx + 1)
-        query_len = query_end - query_start
-
-        seq_len = tl.load(seq_lens_ptr + req_idx)
-        prefix_len = seq_len - query_len
-
-        pos = prefix_len + token_idx - query_start
-        start_pos = tl.maximum(pos - window_size + 1, 0)
-        end_pos = pos + 1
-        if HAS_MM_PREFIX:
-            mm_start = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2)
-            mm_end = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2 + 1)
-            in_mm_span = (mm_start >= 0) & (mm_start <= mm_end)
-            start_pos = tl.where(in_mm_span, tl.minimum(start_pos, mm_start), start_pos)
-            end_pos = tl.where(in_mm_span, mm_end + 1, end_pos)
-
-        swa_len = end_pos - start_pos
-        tl.store(swa_lens_ptr + pid, swa_len)
-
-        for i in range(0, index_width, TRITON_BLOCK_SIZE):
-            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-
-            pos_offset = start_pos + offset
-            block_indices = pos_offset // block_size
-            block_numbers = tl.load(
-                block_table_ptr + req_idx * block_table_stride + block_indices,
-                mask=pos_offset < end_pos,
-            )
-            block_offsets = pos_offset % block_size
-            slot_ids = block_numbers * block_size + block_offsets
-
-            slot_ids = tl.where(offset < swa_len, slot_ids, -1)
-            tl.store(
-                swa_indices_ptr + pid * swa_indices_stride + offset,
-                slot_ids,
-                mask=offset < index_width,
-            )
+    kernel = staticmethod(_compute_swa_indices_and_lens_kernel)
 
     def dispatch(  # type: ignore[override]
         self,
-        *,
-        window_size: int,
-        index_width: int,
-        block_size: int,
+        **compile_key_fields: int,
     ) -> CompileKey:
         return self.CompileKey(
-            window_size=window_size,
-            index_width=index_width,
-            block_size=block_size,
+            **compile_key_fields,
             triton_block_size=1024,
         )
 
@@ -967,10 +1185,25 @@ class ComputeSWAIndicesAndLensKernel(
         *,
         window_size: int,
         block_size: int,
+        max_image_tokens: int = 0,
     ) -> list[CompileKey]:
+        # Decode rows always use the plain causal window. Vision models widen
+        # prefill rows by max_image_tokens and additionally need the in-image
+        # bidirectional variant for batches that contain image spans.
+        width_has_image = [(window_size, 0)]
+        if max_image_tokens > 0:
+            width_has_image += [
+                (window_size + max_image_tokens, 0),
+                (window_size + max_image_tokens, 1),
+            ]
         return self._trace_dispatch(self.dispatch)(
+            zip_inputs(
+                *(
+                    dict(index_width=index_width, has_image=has_image)
+                    for index_width, has_image in width_has_image
+                )
+            ),
             window_size=window_size,
-            index_width=window_size,
             block_size=block_size,
         )
 
@@ -981,16 +1214,18 @@ class ComputeSWAIndicesAndLensKernel(
             swa_lens=int32_ptr,
             window_size=compile_key.window_size,
             index_width=compile_key.index_width,
+            left_visible=int32_ptr,
+            right_visible=int32_ptr,
             query_start_loc=int32_ptr,
             seq_lens=int32_ptr,
             token_to_req_indices=int32_ptr,
             is_valid_token=TritonWarmupTensor(torch.bool),
             block_table=TritonWarmupTensor(torch.int32, shape=(1, 1), strides=(1, 1)),
             block_size=compile_key.block_size,
-            mm_prefix_query_ranges=int32_ptr,
-            has_mm_prefix=False,
+            replay_start=int32_ptr,
             num_tokens=1,
             token_offset=0,
+            has_image=bool(compile_key.has_image),
         )
 
     @kernel_launcher
@@ -1000,22 +1235,24 @@ class ComputeSWAIndicesAndLensKernel(
         swa_lens: torch.Tensor,
         window_size: int,
         index_width: int,
+        left_visible: torch.Tensor,
+        right_visible: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
         token_to_req_indices: torch.Tensor,
         is_valid_token: torch.Tensor,
         block_table: torch.Tensor,
         block_size: int,
-        mm_prefix_query_ranges: torch.Tensor | None,
-        has_mm_prefix: bool,
+        replay_start: torch.Tensor,
         *,
         num_tokens: int,
         token_offset: int,
+        has_image: bool = False,
     ) -> LaunchSpec:
         return (num_tokens,), dict(
             swa_indices_stride=swa_indices.stride(0),
             block_table_stride=block_table.stride(0),
-            HAS_MM_PREFIX=has_mm_prefix,
+            HAS_IMAGE=has_image,
             TRITON_BLOCK_SIZE=1024,
         )
 
@@ -1051,8 +1288,6 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         block_table_ptr,
         block_table_stride,
         block_size,
-        mm_prefix_query_ranges_ptr,
-        HAS_MM_PREFIX: tl.constexpr,
         token_offset,
         TRITON_BLOCK_SIZE: tl.constexpr,
     ):
@@ -1088,12 +1323,6 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         # Block-anchored window (shared by every token in the block) + full block.
         start_pos = tl.maximum(prefix_len - window_size, 0)
         end_pos = seq_len
-        if HAS_MM_PREFIX:
-            mm_start = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2)
-            mm_end = tl.load(mm_prefix_query_ranges_ptr + token_idx * 2 + 1)
-            in_mm_span = (mm_start >= 0) & (mm_start <= mm_end)
-            start_pos = tl.where(in_mm_span, tl.minimum(start_pos, mm_start), start_pos)
-            end_pos = tl.where(in_mm_span, mm_end + 1, end_pos)
 
         swa_len = end_pos - start_pos
         tl.store(swa_lens_ptr + pid, swa_len)
@@ -1157,8 +1386,6 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
             is_valid_token=TritonWarmupTensor(torch.bool),
             block_table=TritonWarmupTensor(torch.int32, shape=(1, 1), strides=(1, 1)),
             block_size=compile_key.block_size,
-            mm_prefix_query_ranges=int32_ptr,
-            has_mm_prefix=False,
             num_tokens=1,
             token_offset=0,
         )
@@ -1176,8 +1403,6 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         is_valid_token: torch.Tensor,
         block_table: torch.Tensor,
         block_size: int,
-        mm_prefix_query_ranges: torch.Tensor | None,
-        has_mm_prefix: bool,
         *,
         num_tokens: int,
         token_offset: int,
@@ -1185,7 +1410,6 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         return (num_tokens,), dict(
             swa_indices_stride=swa_indices.stride(0),
             block_table_stride=block_table.stride(0),
-            HAS_MM_PREFIX=has_mm_prefix,
             TRITON_BLOCK_SIZE=1024,
         )
 

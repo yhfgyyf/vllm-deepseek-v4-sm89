@@ -38,14 +38,14 @@ def fused_save_compress_norm(
     attention layer schedules on separate streams.
 
     Ratio 2 keeps one ring block per request holding the open group's rows:
-    position ``p`` lives in row ``p % capacity`` and ``slot_mapping`` encodes
-    ``block * capacity + p % capacity``. The grid has one program per request
+    position `p` lives in row `p % capacity` and `slot_mapping` encodes
+    `block * capacity + p % capacity`. The grid has one program per request
     followed by one per pair of packed tokens. A request program handles the
     group that the chunk's first token closes with its predecessor's ring row,
-    then stores the chunk's last ``capacity`` rows to the ring; because the
+    then stores the chunk's last `capacity` rows to the ring; because the
     same program does both, ring reads and writes never race. A pair program
     handles the group that ends inside its pair, reading both rows from the
-    raw input. Ratio 1 has no ring and one program per token; ``slot_mapping``
+    raw input. Ratio 1 has no ring and one program per token; `slot_mapping`
     then only marks valid tokens.
 
     Args:
@@ -59,6 +59,7 @@ def fused_save_compress_norm(
         rms_norm_eps: RMSNorm epsilon.
         compress_ratio: Group size, either 1 or 2.
         latent_out: BF16 [tokens, 512], written only at valid group boundaries.
+
     """
     assert compress_ratio in (1, 2)
     assert kv_score.dtype == torch.float32
