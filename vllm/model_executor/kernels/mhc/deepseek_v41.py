@@ -8,13 +8,15 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-@triton.jit
+# The token count is a runtime argument exempt from value specialization
+# (==1, %16), so every prefill size reuses one compiled variant per SPLITS.
+@triton.jit(do_not_specialize=["tokens"])
 def _prenorm_project_kernel(
     x,
     weight,
     mixed,
     squared,
-    TOKENS: tl.constexpr,
+    tokens,
     K: tl.constexpr,
     N: tl.constexpr,
     SPLITS: tl.constexpr,
@@ -29,19 +31,19 @@ def _prenorm_project_kernel(
     sumsq = tl.zeros((BM,), tl.float32)
     for i in range(K // SPLITS // BK):
         ks = split * (K // SPLITS) + i * BK + offsets
-        a = tl.load(x + rows[:, None] * K + ks[None, :], rows[:, None] < TOKENS, 0)
+        a = tl.load(x + rows[:, None] * K + ks[None, :], rows[:, None] < tokens, 0)
         b = tl.load(weight + cols[None, :] * K + ks[:, None], cols[None, :] < N, 0)
         a = a.to(tl.float32)
         # FN is FP32: TF32x3 retains its precision without a BF16 weight copy.
         acc = tl.dot(a, b, acc, input_precision="tf32x3")
         sumsq += tl.sum(a * a, 1)
-    base = split.to(tl.int64) * TOKENS
+    base = split.to(tl.int64) * tokens
     tl.store(
         mixed + (base + rows[:, None]) * N + cols[None, :],
         acc,
-        (rows[:, None] < TOKENS) & (cols[None, :] < N),
+        (rows[:, None] < tokens) & (cols[None, :] < N),
     )
-    tl.store(squared + base + rows, sumsq, rows < TOKENS)
+    tl.store(squared + base + rows, sumsq, rows < tokens)
 
 
 def _native_hc_prenorm_gemm(x, fn, mixes, sqrsum):

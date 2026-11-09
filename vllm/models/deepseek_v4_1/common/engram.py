@@ -561,7 +561,9 @@ def _engram_head_shard_weight_loader(
     param.data.copy_(shard)
 
 
-@triton.jit
+# Row count and grid size follow the batch size: both are runtime arguments
+# exempt from value specialization (==1, %16), so all sizes share one variant.
+@triton.jit(do_not_specialize=["num_rows", "grid_size"])
 def _engram_lookup_kernel(
     weight,
     scales,
@@ -572,13 +574,13 @@ def _engram_lookup_kernel(
     num_rows,
     ids_stride_t,
     ids_stride_h,
+    grid_size,
     HEAD_START: tl.constexpr,
     LOCAL_HEADS: tl.constexpr,
     TOTAL_HEADS: tl.constexpr,
     DIM: tl.constexpr,
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    GRID: tl.constexpr,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
@@ -587,7 +589,7 @@ def _engram_lookup_kernel(
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
-    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
+    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, grid_size * BLOCK_R):
         rows = base + tl.arange(0, BLOCK_R)
         valid = rows < num_rows
         head = HEAD_START + rows % LOCAL_HEADS
@@ -738,13 +740,13 @@ class ParallelEngramEmbedding(nn.Module):
             rows,
             indices.stride(0),
             indices.stride(1),
+            grid,
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
             DIM=self.dim,
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
-            GRID=grid,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
