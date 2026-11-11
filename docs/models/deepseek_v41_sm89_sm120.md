@@ -13,6 +13,12 @@ The historical `vision11` wheels and container use the older vLLM 0.28 / Torch
 2.13 / FlashInfer 0.6.18 stack. They do not contain this framework upgrade.
 Their full-model validation and benchmark results do not validate this source.
 
+The 2026-11-11 [L20 baseline Q](deepseek_v41_l20_baseline.md) adds SM89
+K1/K2/K3 launch tuning and enables the existing decode PCIe IPC all-reduce
+in the L20 launch example. The published `vision12` / FlashInfer `vision3`
+wheels predate that tuning. Build both current sources for Q; the release
+validation recorded below remains specific to the published wheels.
+
 ## Build the current source
 
 Use a new Linux x86_64 Python 3.12 environment, CUDA 13.2 toolkit, GCC 13 or
@@ -64,11 +70,11 @@ git apply --check \
 git apply \
   "$vllm_source/tools/recipes/patches/flashinfer-0.7.3-sm89-glm-compat.patch"
 uv pip install --python "$vllm_source/.venv/bin/python" -r requirements.txt
-BUILD_NVEP=0 FLASHINFER_LOCAL_VERSION=glm53.dsv41.vision3.sm89sm120.cu130.pt214 \
+BUILD_NVEP=0 FLASHINFER_LOCAL_VERSION=glm53.dsv41.l20q20261111.sm89sm120.cu130.pt214 \
   uv build --wheel --no-build-isolation \
   --python "$vllm_source/.venv/bin/python" --out-dir dist
 uv pip install --python "$vllm_source/.venv/bin/python" --no-deps \
-  dist/flashinfer_python-0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214-py3-none-any.whl
+  dist/flashinfer_python-0.7.3+glm53.dsv41.l20q20261111.sm89sm120.cu130.pt214-py3-none-any.whl
 cd "$vllm_source"
 uv pip check
 uv run --no-project python -c \
@@ -79,8 +85,11 @@ Build the FlashInfer wheel before installing it: its build backend invokes
 `uv` for compiler wheels, which can wait on the parent installer's environment
 lock during a combined `uv pip install --no-build-isolation .` invocation.
 `BUILD_NVEP=0` disables an optional, unrelated NVEP build. The nine additive
-files come from this fork's FlashInfer source revision
-`b89cb3bad8f375f2dafcdb58620dcd4e70ad9c31` and include their kernel tests. A second additive patch retains 30 files for
+files originate from this fork's FlashInfer source revision
+`b89cb3bad8f375f2dafcdb58620dcd4e70ad9c31`, with the K1 SM89 launch tuning
+and regression tests added in the current recipe patch. The `l20q20261111`
+local version above distinguishes this source build from the published
+`vision3` wheel; it is not a new published release. A second additive patch retains 30 files for
 SM89 legacy DeepSeek sparse MLA and GLM NoPE cache/attention compatibility
 from the same revision. Kernel symbols and JIT paths use an isolated namespace;
 SM120 continues to use the official 0.7.3 attention kernels. The vLLM adapter
@@ -89,11 +98,17 @@ translates the former NoPE scale-format name to the current API.
 ## Serving configuration
 
 Keep the documented default target TP4 / PP2, DSpark TP4, and
-`--max-num-seqs 4`. Optional target TP2 / PP4 uses
+`--max-num-seqs 4`. Baseline Q uses an 8192-token batch budget, 2 GiB KV per
+worker, `FULL_AND_PIECEWISE` graphs capped at 48 rows, and
+`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`. K1/K2/K3 select the tuned kernels
+automatically for the supported SM89 shapes. See the
+[baseline configuration](deepseek_v41_l20_baseline.md#configuration) for the
+remaining settings and PCIe IPC scope. Optional target TP2 / PP4 uses
 `VLLM_PP_LAYER_PARTITION=10,10,10,10` and
 `"draft_tensor_parallel_size":4` in `--speculative-config`; its draft group
 spans the final four GPUs. Clear the partition override when switching back
-to TP4 / PP2. The native attention selector accepts the existing
+to TP4 / PP2. Leave PCIe IPC disabled for the optional TP2 / PP4 configuration,
+which is outside Q's multi-GPU validation. The native attention selector accepts the existing
 `FLASHINFER_MLA_SPARSE_DSV41` name and the explicit
 `FLASHINFER_MLA_SPARSE_DSV41_NATIVE` name.
 

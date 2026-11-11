@@ -378,13 +378,14 @@ stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接�
 以下配置面向 **8 张 48GB SM89 GPU**，不适用于普通 24GB 版 RTX 4090。
 默认主模型 TP4×PP2（20/20 层）、DSpark TP4、`max-num-seqs=4`，可选主模型
 TP2×PP4（10/10/10/10 层）。保留 EP、FP8 KV、Engram CPU offload、CED 图片输入、
-DSpark 5 adaptive 和 FULL CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
+DSpark 5 adaptive 和 FULL_AND_PIECEWISE CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
 内存，不能只按 GPU 权重大小估算整机内存需求。
 
-本节使用 `vision12` wheel 或更新后的 `main` 源码。两种配置均通过 8×L20
-LongSWE 40 条、每条输出 1,024 tokens 的四并发验证；完成时间为 323.89 / 321.31 秒，
-输出吞吐为 126.46 / 127.48 tokens/s，单次测量基本持平。
-容量与吞吐需按实际 GPU 和负载检查。在该环境中启动：
+2026-11-11 最新基线 **Q = TP4×PP2 + K1 Attention + K2 mHC + K3 Linear + decode
+PCIe IPC all-reduce**。需要当前 `main` 的 vLLM 源码和更新后的 FlashInfer recipe patch；
+已发布的 `vision12` / FlashInfer `vision3` wheel 不包含此次 K1/K2/K3 调优。
+构建方法、源码哈希、验证结果和边界见 [L20 基线说明](docs/models/deepseek_v41_l20_baseline.md)。
+以下命令对应已验证的 8192-token 调度预算、每 worker 2 GiB KV 和最多 48 行图捕获配置：
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -392,6 +393,7 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
+export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
 # 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
@@ -408,10 +410,12 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --moe-backend auto \
   --kv-cache-dtype fp8 \
   --block-size 128 \
-  --max-model-len auto \
+  --max-model-len 1048576 \
   --max-num-seqs 4 \
-  --max-num-batched-tokens 4096 \
-  --gpu-memory-utilization 0.98 \
+  --max-num-batched-tokens 8192 \
+  --prefill-schedule-interval 1 \
+  --gpu-memory-utilization 0.93 \
+  --kv-cache-memory-bytes 2147483648 \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
@@ -424,23 +428,23 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
-  --compilation-config '{"cudagraph_mode":"FULL"}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
 - 可选 **TP2×PP4，DSpark TP4**：启动前设置
   `export VLLM_PP_LAYER_PARTITION=10,10,10,10`，将并行参数改为
-  `--tensor-parallel-size 2 --pipeline-parallel-size 4`，并在原
-  `--speculative-config` JSON 中增加 `"draft_tensor_parallel_size":4`，其余不变。
-  草稿模型使用后四张卡的独立 TP4/EP4 组。切回默认 TP4×PP2 时清除该层分配环境变量。
-- 若需要降低 prefill 峰值显存，将 `--max-num-batched-tokens 4096` 替换为
-  `--max-num-batched-tokens 2048`，其余参数不变。此调整也会影响工作区、图捕获
-  阶段显存和长输入分块数量，不能假设显存或吞吐按同一比例变化。
-- **不设置显式 KV 字节预算**，由 `gpu-memory-utilization=0.98` 自动分配 KV。
-  当前实现会先扣除常驻占用、临时峰值余量和 CUDA Graph 估算；剩余 2% 不是
-  Graph 专用区，也不是运行时显存硬上限。
-- `max-model-len=auto` 可能因容量不足而下调。若目标是 1M 上下文，确认启动日志
-  最终长度为 `1048576`，且实际输入（含图片 tokens）与输出之和不超过该长度。
+  `--tensor-parallel-size 2 --pipeline-parallel-size 4`，保留 draft TP4，并设置
+  `unset VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`。该可选布局不属于 Q 的 PCIe IPC
+  验收范围；草稿模型使用后四张卡的独立 TP4/EP4 组。
+  切回默认 TP4×PP2 时清除层分配环境变量并恢复 PCIe IPC 开关。
+- PCIe IPC 在这组配置中接管连续 BF16 `[rows,5120]`、最多 48 行的小消息；
+  已测 prefill 和更大消息沿用原通信后端。该开关仅在本示例显式开启，库默认值不变。
+- 若需降低 prefill 峰值显存，可将调度预算降至 4096 或 2048；改变 KV 预算、
+  图捕获范围或调度参数后，应重新验证目标负载，不沿用 Q 的性能数字。
+- `--kv-cache-memory-bytes 2147483648` 显式固定每 worker 的 KV 大小，并优先于
+  `--gpu-memory-utilization` 的自动 KV 分配。确认实际输入（含图片 tokens）与输出
+  之和不超过配置的 `1048576`。
   `max-num-seqs=4` 是调度上限，不保证能同时容纳 4 条各 1M 的请求。
 - 部署时按实际长请求和目标混合并发检查 OOM、KV 抢占重算、时延及输出质量。
 
