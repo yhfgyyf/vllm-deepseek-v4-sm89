@@ -370,16 +370,18 @@ The following configuration is for **eight 48 GB SM89 GPUs**, excluding
 standard 24 GB RTX 4090 cards. The default target uses TP4×PP2 (20/20 layers),
 with DSpark TP4 and `max-num-seqs=4`; target TP2×PP4 (10/10/10/10 layers) is
 optional. It retains EP, FP8 KV, Engram CPU offload, CED image input,
-DSpark 5 adaptive, and FULL CUDA Graph. Engram CPU offload and checkpoint
+DSpark 5 adaptive, and FULL_AND_PIECEWISE CUDA Graph. Engram CPU offload and checkpoint
 loading both require sufficient host memory, so do not size host memory from
 the GPU weight footprint alone.
 
-Use the `vision12` wheels or updated `main` source for these PP/DSpark configurations.
-Both layouts passed 40 LongSWE requests with 1,024 outputs each at concurrency
-four on 8x L20. Completion times were 323.89 / 321.31 seconds, with output
-throughput of 126.46 / 127.48 tokens/s: similar results in this single-batch
-comparison. Check capacity and throughput on your actual GPUs and workload.
-Configure the SM89 toolchain and launch in that environment:
+The latest baseline, accepted on 2026-11-11, is **Q: TP4×PP2 + K1 Attention +
+K2 mHC + K3 Linear + decode PCIe IPC all-reduce**. Build vLLM from current
+`main` and FlashInfer with the updated recipe patch; the published `vision12`
+and FlashInfer `vision3` wheels do not include this K1/K2/K3 tuning.
+See the [L20 baseline](docs/models/deepseek_v41_l20_baseline.md) for build
+instructions, source hashes, results, and validation limits. This command
+matches the tested 8192-token batch budget, 2 GiB KV allocation per worker,
+and graph capture sizes up to 48 rows:
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -387,6 +389,7 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
+export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
 # Only historical vision11 artifacts need VLLM_USE_V2_MODEL_RUNNER=1.
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
@@ -403,10 +406,12 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --moe-backend auto \
   --kv-cache-dtype fp8 \
   --block-size 128 \
-  --max-model-len auto \
+  --max-model-len 1048576 \
   --max-num-seqs 4 \
-  --max-num-batched-tokens 4096 \
-  --gpu-memory-utilization 0.98 \
+  --max-num-batched-tokens 8192 \
+  --prefill-schedule-interval 1 \
+  --gpu-memory-utilization 0.93 \
+  --kv-cache-memory-bytes 2147483648 \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
@@ -419,31 +424,28 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
-  --compilation-config '{"cudagraph_mode":"FULL"}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
 - For optional **target TP2×PP4 with DSpark TP4**, set
   `export VLLM_PP_LAYER_PARTITION=10,10,10,10`, change the parallel options to
-  `--tensor-parallel-size 2 --pipeline-parallel-size 4`, and add
-  `"draft_tensor_parallel_size":4` to the existing `--speculative-config`
-  JSON. Keep the other parameters. The draft uses an independent TP4/EP4 group
-  on the last four GPUs. Unset the layer-partition variable when returning to
-  the default TP4×PP2 layout.
-- To reduce peak prefill memory, replace `--max-num-batched-tokens 4096` with
-  `--max-num-batched-tokens 2048` and leave the other parameters unchanged.
-  This also affects workspace use, graph-capture memory, and the number of
-  chunks for long inputs; do not assume that memory or throughput changes in
-  the same proportion.
-- Do not set an explicit KV-cache byte budget. With
-  `--gpu-memory-utilization 0.98`, vLLM sizes the KV cache automatically after
-  subtracting resident allocations, transient-peak headroom, and its CUDA
-  Graph estimate. The remaining 2% is neither graph-only space nor a hard
-  runtime memory limit.
-- `--max-model-len auto` may resolve to a lower value when capacity is
-  insufficient. If a full 1M-token context is required, confirm that the
-  startup log resolves it to `1048576`; each request's input, including image
-  tokens, plus output must remain within that limit. `--max-num-seqs 4` is a
+  `--tensor-parallel-size 2 --pipeline-parallel-size 4`, retain draft TP4, and
+  run `unset VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`. This optional layout is
+  outside Q's PCIe IPC validation scope. The draft uses an independent TP4/EP4
+  group on the last four GPUs. Unset the partition override and restore the
+  PCIe IPC flag when returning to TP4×PP2.
+- With this configuration, PCIe IPC handles contiguous BF16 `[rows,5120]`
+  messages up to 48 rows. Observed prefill and larger messages use the existing
+  communication backend. The flag is explicit in this example; its library
+  default remains off.
+- If needed, reduce the prefill batch budget to 4096 or 2048. Revalidate the
+  workload after changing KV allocation, graph sizes, or scheduling settings;
+  Q's measurements do not cover those changes.
+- `--kv-cache-memory-bytes 2147483648` fixes each worker's KV allocation and
+  takes precedence over automatic KV sizing from `--gpu-memory-utilization`.
+  Each request's input, including image tokens, plus output must remain within
+  `1048576` tokens. `--max-num-seqs 4` is a
   scheduling limit, not a guarantee that four simultaneous 1M-token requests
   will fit.
 - Check OOMs, KV preemption/recomputation, latency, and output quality using

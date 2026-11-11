@@ -149,6 +149,13 @@ def mhc_pre_delayed_tilelang(
         return outputs
     use_gemv = tokens <= 32
     splits = 1 if use_gemv else 16 if tokens <= 128 else 4 if tokens <= 1024 else 1
+    ada_split_gemv = (
+        use_gemv
+        and width == 20480
+        and torch.cuda.get_device_capability(residual.device) == (8, 9)
+    )
+    if ada_split_gemv:
+        splits = 8
     mixes = torch.empty(
         (splits, tokens, mix_size), device=residual.device, dtype=torch.float32
     )
@@ -157,7 +164,15 @@ def mhc_pre_delayed_tilelang(
         from .tilelang_kernels import _HC_PRENORM_GEMM_TILELANG_KERNEL
 
         _HC_PRENORM_GEMM_TILELANG_KERNEL(
-            x, fn, mixes, sqrsum, width // streams, streams
+            x,
+            fn,
+            mixes,
+            sqrsum,
+            width // streams,
+            streams,
+            tile_n=4 if ada_split_gemv else 12,
+            n_thr=128 if ada_split_gemv else 512,
+            n_splits=splits,
         )
     else:
         _native_hc_prenorm_gemm(x, fn, mixes, sqrsum)

@@ -1072,7 +1072,7 @@ diff --git a/flashinfer/mla/deepseek_v41.py b/flashinfer/mla/deepseek_v41.py
 new file mode 100644
 --- /dev/null
 +++ b/flashinfer/mla/deepseek_v41.py
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,920 @@
 +"""Native mixed sparse MLA for DeepSeek-V4.1 Flash."""
 +
 +from __future__ import annotations
@@ -1239,12 +1239,28 @@ new file mode 100644
 +
 +
 +def _attention_num_splits(
-+    num_tokens: int, num_heads: int, swa_topk: int, global_topk: int
++    num_tokens: int,
++    num_heads: int,
++    swa_topk: int,
++    global_topk: int,
++    compute_capability: tuple[int, int] | None = None,
 +) -> int:
-+    if _attention_uses_unified_tiles(num_tokens, num_heads, swa_topk, global_topk):
++    if _attention_uses_unified_tiles(
++        num_tokens, num_heads, swa_topk, global_topk, compute_capability
++    ):
 +        return (swa_topk + _UNIFIED_CANDIDATE_TILE - 1) // _UNIFIED_CANDIDATE_TILE + (
 +            global_topk + _UNIFIED_CANDIDATE_TILE - 1
 +        ) // _UNIFIED_CANDIDATE_TILE
++    if compute_capability == (8, 9):
++        if (num_tokens, num_heads, swa_topk, global_topk) == (5, 16, 192, 0):
++            return 8
++        if (
++            num_heads == 32
++            and 5 <= num_tokens <= 8
++            and swa_topk == 128
++            and global_topk == 512
++        ):
++            return 16
 +    if num_tokens > 32:
 +        return 1
 +    swa_tiles = (swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
@@ -1256,8 +1272,18 @@ new file mode 100644
 +
 +
 +def _attention_uses_unified_tiles(
-+    num_tokens: int, num_heads: int, swa_topk: int, global_topk: int
++    num_tokens: int,
++    num_heads: int,
++    swa_topk: int,
++    global_topk: int,
++    compute_capability: tuple[int, int] | None = None,
 +) -> bool:
++    # Profiled Ada decode shapes; keep the existing dispatch on other devices.
++    if compute_capability == (8, 9) and swa_topk == 128 and global_topk == 512:
++        if num_heads == 16 and 1 <= num_tokens <= 8:
++            return True
++        if num_heads == 32 and 1 <= num_tokens <= 4:
++            return True
 +    total_tiles = (swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE + (
 +        global_topk + _CANDIDATE_TILE - 1
 +    ) // _CANDIDATE_TILE
@@ -1270,14 +1296,17 @@ new file mode 100644
 +    swa_topk: int,
 +    global_topk: int = 0,
 +) -> int:
-+    """Return workspace bytes for the native attention launch."""
++    """Return workspace bytes sufficient for every supported architecture."""
 +    if num_tokens < 0 or swa_topk < 0 or global_topk < 0:
 +        raise ValueError("token and candidate counts must be non-negative")
 +    if num_heads not in (8, 16, 32):
 +        raise ValueError("num_heads must be one of {8,16,32}")
 +    if num_tokens == 0:
 +        return 0
-+    num_splits = _attention_num_splits(num_tokens, num_heads, swa_topk, global_topk)
++    num_splits = max(
++        _attention_num_splits(num_tokens, num_heads, swa_topk, global_topk, arch)
++        for arch in (None, (8, 9))
++    )
 +    lse_bytes = num_tokens * num_splits * num_heads * 4
 +    if num_splits == 1:
 +        return lse_bytes
@@ -1308,6 +1337,10 @@ new file mode 100644
 +    min_tiles = (min_swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
 +    max_tiles = (max_swa_topk + _CANDIDATE_TILE - 1) // _CANDIDATE_TILE
 +    swa_topks = {min_swa_topk, max_swa_topk}
++    # SM89 tuning has exact-width boundaries inside the generic tile ranges.
++    swa_topks.update(
++        width for width in (128, 192) if min_swa_topk <= width <= max_swa_topk
++    )
 +    for num_tiles in range(min_tiles, min(max_tiles, 32) + 1):
 +        representative = 0 if num_tiles == 0 else (num_tiles - 1) * _CANDIDATE_TILE + 1
 +        if min_swa_topk <= representative <= max_swa_topk:
@@ -1685,7 +1718,8 @@ new file mode 100644
 +        or q.shape[1] not in (8, 16, 32)
 +    ):
 +        raise ValueError("q must be contiguous CUDA storage with H in {8,16,32}")
-+    if torch.cuda.get_device_capability(q.device) not in ((8, 9), (12, 0)):
++    compute_capability = torch.cuda.get_device_capability(q.device)
++    if compute_capability not in ((8, 9), (12, 0)):
 +        raise ValueError("DeepSeek-V4.1 mixed sparse attention requires SM89 or SM120")
 +    if inverse_rope_output is not None:
 +        _validate_inverse_rope_layout(inverse_rope_output, q)
@@ -1765,12 +1799,14 @@ new file mode 100644
 +        int(q.shape[1]),
 +        int(swa_slots.shape[1]),
 +        global_topk,
++        compute_capability,
 +    )
 +    unified_tiles = _attention_uses_unified_tiles(
 +        int(q.shape[0]),
 +        int(q.shape[1]),
 +        int(swa_slots.shape[1]),
 +        global_topk,
++        compute_capability,
 +    )
 +    workspace_bytes = deepseek_v41_mixed_sparse_workspace_size(
 +        int(q.shape[0]),
@@ -3029,7 +3065,7 @@ diff --git a/tests/attention/test_deepseek_v41_mixed_sparse.py b/tests/attention
 new file mode 100644
 --- /dev/null
 +++ b/tests/attention/test_deepseek_v41_mixed_sparse.py
-@@ -0,0 +1,1656 @@
+@@ -0,0 +1,1713 @@
 +"""DeepSeek-V4.1 mixed sparse cache and attention contracts."""
 +
 +from __future__ import annotations
@@ -3221,6 +3257,23 @@ new file mode 100644
 +            deepseek_v41_mixed_sparse_workspace_size(1, 8, swa_topk, 512)
 +            <= decode_upper_bound
 +        )
++
++
++@pytest.mark.parametrize("num_heads", [16, 32])
++@pytest.mark.parametrize("global_topk", [0, 512])
++def test_v41_workspace_bound_covers_sm89_exact_width_dispatch(num_heads, global_topk):
++    # Neither tuned width is an endpoint or the first element of a 32-wide tile.
++    bound = deepseek_v41_mixed_sparse_workspace_size_upper_bound(
++        48, num_heads, 100, 200, global_topk
++    )
++    for rows in range(1, 49):
++        for width in range(100, 201):
++            assert (
++                deepseek_v41_mixed_sparse_workspace_size(
++                    rows, num_heads, width, global_topk
++                )
++                <= bound
++            )
 +
 +
 +@pytest.mark.parametrize("arch", [89, 120])
@@ -3747,7 +3800,7 @@ new file mode 100644
 +
 +@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 +@pytest.mark.parametrize("num_heads", [8, 16, 32])
-+@pytest.mark.parametrize("num_tokens", [1, 16, 32, 33, 96, 192])
++@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 6, 8, 9, 16, 32, 33, 96, 192])
 +def test_v41_dense_candidates_cover_decode_splits_and_prefill(num_heads, num_tokens):
 +    torch.manual_seed(17)
 +    device = torch.device("cuda")
@@ -4226,8 +4279,15 @@ new file mode 100644
 +@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 +@pytest.mark.parametrize(
 +    ("num_tokens", "num_heads", "global_page_size", "global_topk"),
-+    [(1, 8, None, 0), (16, 16, 64, 33), (33, 32, 128, 65)],
-+    ids=("c0-split", "c2-merge", "c1-prefill"),
++    [
++        (1, 8, None, 0),
++        (16, 16, 64, 33),
++        (33, 32, 128, 65),
++        (2, 16, 64, 512),
++        (8, 16, 128, 512),
++        (4, 32, 64, 512),
++        (8, 32, 128, 512),
++    ],
 +)
 +def test_v41_fused_inverse_rope_matches_unfused_bf16_boundary(
 +    num_tokens, num_heads, global_page_size, global_topk
@@ -4254,12 +4314,13 @@ new file mode 100644
 +    global_cache = None
 +    global_slots = None
 +    if global_page_size is not None:
-+        global_capacity = 2 * global_page_size
++        global_pages = max(2, math.ceil(global_topk / global_page_size))
++        global_capacity = global_pages * global_page_size
 +        global_kv = torch.randn(
 +            global_capacity, 512, dtype=torch.bfloat16, device=device
 +        )
 +        global_cache = torch.empty(
-+            2, global_page_size, 288, dtype=torch.uint8, device=device
++            global_pages, global_page_size, 288, dtype=torch.uint8, device=device
 +        )
 +        deepseek_v41_pack_global_cache(
 +            global_kv,
@@ -4325,12 +4386,44 @@ new file mode 100644
 +    assert torch.all(grouped_out[:, :token_offset] == sentinel)
 +    assert torch.all(grouped_out[:, token_offset + num_tokens :] == sentinel)
 +
++    graph = torch.cuda.CUDAGraph()
++    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
++    with torch.cuda.graph(graph):
++        replayed = _deepseek_v41_mixed_sparse_attention_with_inv_rope(
++            q,
++            swa_cache,
++            global_cache,
++            swa_slots,
++            global_slots,
++            512**-0.5,
++            sinks,
++            positions=positions,
++            cos_sin=cos_sin,
++            grouped_out=grouped_out,
++            token_offset=token_offset,
++            workspace=workspace,
++        )
++    q.mul_(0.875)
++    positions.copy_(positions.flip(0))
++    graph.replay()
++    ordinary = deepseek_v41_mixed_sparse_attention(
++        q, swa_cache, global_cache, swa_slots, global_slots, 512**-0.5, sinks
++    )
++    expected = _inverse_rope_grouped_reference(ordinary, positions, cos_sin)
++    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
++    assert torch.all(grouped_out[:, :token_offset] == sentinel)
++    assert torch.all(grouped_out[:, token_offset + num_tokens :] == sentinel)
++
 +
 +@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-+def test_v41_fused_inverse_rope_generic_main_graph_reads_changed_positions():
++@pytest.mark.parametrize(
++    ("num_tokens", "num_heads", "swa_topk"), [(33, 16, 256), (5, 16, 192)]
++)
++def test_v41_fused_inverse_rope_generic_main_graph_reads_changed_positions(
++    num_tokens, num_heads, swa_topk
++):
 +    torch.manual_seed(67)
 +    device = torch.device("cuda")
-+    num_tokens, num_heads, swa_topk = 33, 16, 256
 +    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
 +    swa_kv = torch.randn(swa_topk, 512, dtype=torch.bfloat16, device=device)
 +    swa_cache = torch.empty(8, 32, 528, dtype=torch.uint8, device=device)

@@ -24,6 +24,7 @@ nav:
       - TPU: https://docs.vllm.ai/projects/tpu/en/latest/
     - Models:
       - models/supported_models.md
+      - models/deepseek_v41_l20_baseline.md
       - models/generative_models.md
       - Pooling Models: models/pooling_models
       - models/structured_decisions_models.md

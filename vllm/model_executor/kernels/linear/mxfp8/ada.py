@@ -169,6 +169,24 @@ class AdaMxfp8LinearKernel(Mxfp8LinearKernel):
             return 16
         return 32
 
+    @classmethod
+    def _launch_config(
+        cls, rows: int, input_size: int, output_size: int
+    ) -> tuple[int, int, int]:
+        # Profiled SM89 decode shapes; preserve the generic grid elsewhere.
+        if 0 < rows <= 32:
+            split_k = {
+                (1280, 4096): 4,
+                (1280, 8192): 2,
+                (2048, 5120): 4,
+                (6144, 6400): 4,
+            }.get((input_size, output_size))
+            if split_k is not None:
+                return 32, 64, split_k
+            if rows <= 8 and input_size == 5120 and output_size in (1152, 1792):
+                return 16, 64, 8
+        return 32, 64, cls._split_k(rows, output_size)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         output_size, input_size = weight.shape
@@ -240,10 +258,8 @@ class AdaMxfp8LinearKernel(Mxfp8LinearKernel):
         xq, x_scale, output_dtype, input_shape = self._quantize_input(x, input_size)
         rows = xq.shape[0]
         output = torch.empty((rows, output_size), dtype=output_dtype, device=xq.device)
-        block_m = 32
-        block_n = 64
+        block_m, block_n, split_k = self._launch_config(rows, input_size, output_size)
         output_tiles = triton.cdiv(rows, block_m) * triton.cdiv(output_size, block_n)
-        split_k = self._split_k(rows, output_size)
         partial = (
             output
             if split_k == 1
