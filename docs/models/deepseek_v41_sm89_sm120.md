@@ -19,8 +19,8 @@ in the L20 launch example. The published `vision12` / FlashInfer `vision3`
 wheels predate that tuning. Build both current sources for Q; the release
 validation recorded below remains specific to the published wheels.
 
-The 2026-11-12 L20 example selects TP8/PP1, draft TP8 and conventional automatic
-KV at 0.96, retaining Q's optimizations. SM120 has separate
+The 2026-11-12 L20 example selects TP8/PP1, draft TP8, DSpark7 and conventional
+automatic KV at 0.96, retaining Q's optimizations. SM120 has separate
 [explicit B12X adapters](deepseek_v41_sm120_b12x.md) for measured small-batch
 shapes; their GPU integration and full-model qualification remain pending.
 
@@ -102,8 +102,13 @@ translates the former NoPE scale-format name to the current API.
 
 ## Serving configuration
 
-Keep the documented default target TP4 / PP2, DSpark TP4, and
-`--max-num-seqs 4`. Baseline Q uses an 8192-token batch budget, 2 GiB KV per
+The current L20 command uses target TP8 / PP1, draft TP8, DSpark7,
+`--max-num-seqs 4`, an 8192-token batch budget and automatic KV at 0.96.
+Keep `--no-enable-extensible-kv-cache` and the remaining settings in the
+[README command](../../README_EN.md#33-sm89-848-gb-gpus-l20--rtx-4090-48-gb).
+
+Historical baseline Q uses target TP4 / PP2, draft TP4, DSpark5,
+an 8192-token batch budget, 2 GiB KV per
 worker, `FULL_AND_PIECEWISE` graphs capped at 48 rows, and
 `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`. K1/K2/K3 select the tuned kernels
 automatically for the supported SM89 shapes. See the

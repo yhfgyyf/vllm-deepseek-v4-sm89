@@ -1,18 +1,28 @@
 # DeepSeek V4.1 L20: current TP8 and historical Q
 
-The selected service configuration as of 2026-11-12 is **TP8/PP1 + draft TP8**,
-retaining Q's K1/K2/K3 and decode PCIe IPC. Both README commands retain the
-service parameters, except for the user's requested memory-utilization change
-from 0.98 to 0.96: 8192 batched tokens, 4 sequences, K5 adaptive, 1,048,576 context
+The selected launch example as of 2026-11-12 is **TP8/PP1 + draft TP8 + DSpark7**,
+retaining Q's K1/K2/K3 and decode PCIe IPC. Both README commands use the
+requested K7 default, retaining the other TP8 parameters:
+8192 batched tokens, 4 sequences, adaptive verification, 1,048,576 context
 limit, `FULL_AND_PIECEWISE` with capture48, `--gpu-memory-utilization 0.96`, and
 `--no-enable-extensible-kv-cache`, without a fixed KV byte limit.
 
-The recorded 0.98 launch allocated **5.107793 GiB KV per worker**; the latest
-0.96 startup receipt records **4.160247 GiB** on each of the eight workers.
-The change followed an OOM on a 17,630-token input in the Engram TP all-gather
-prefill path. This publication reuses that startup receipt and does not restart
-the service or qualify long-running stability. Eight-rank IPC
-numerical, repeated-call and changed-input Graph checks passed; all eight
+At 0.96, the recorded K7 launch allocated **4.291170 GiB KV per worker**, versus
+historical K5's **4.160247 GiB**. The earlier 0.98/K5 launch allocated
+**5.107793 GiB**; its later OOM on a 17,630-token input in the Engram TP all-gather
+prefill path prompted the change to 0.96. This documentation update reuses those
+receipts and does not restart the service or qualify long-running stability.
+
+The workspace record `k7-high-accept-16k-20261112/REPORT.md` and its three saved
+trials provide the K7 inference results now shown in both READMEs: synthetic
+copying, 17,630 input / 2,641 output tokens, zero prefix hits, normal stops and
+exact output. Median prefill/decode were **7,849.510 / 395.850 tokens/s**;
+accepted/proposed was **6,807 / 7,812 = 87.135177%**, below 90%. The K5 reference
+is historical, without a return measurement or interleaved A/B/A; it also had
+a different automatic KV capacity. The test used the validated vision12/vision3
+environment with the exact Q operator overlays, not a newly built source wheel.
+
+Eight-rank IPC numerical, repeated-call and changed-input Graph checks passed; all eight
 workers loaded the accepted K1/K2/K3 modules. The bounded novel C4 observation
 at 0.98 was 288.979 aggregate output tokens/s for the complete batch and 402.005
 tokens/s during a continuous four-request decode interval. It differs from
@@ -25,6 +35,30 @@ numbers and fixed 2 GiB allocation must not be relabeled as TP8 measurements.
 No new wheel was published for either configuration. The new
 [SM120 opt-in adapters](deepseek_v41_sm120_b12x.md) have separate qualification
 limits and do not change L20 execution.
+
+## K7 single-request measurement
+
+The same synthetic copying input contained 17,630 tokens and produced 2,641
+tokens in each of three requests, with `temperature=0`, `reasoning_effort=none`,
+zero prefix hits, normal stop and exact copied output.
+
+| Configuration | Median prefill tokens/s | Median decode tokens/s | Accepted/proposed | Acceptance length including bonus | Actual KV per worker |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Historical K5 / 0.96 | 7,948.998 | 360.886 | 99.773243% | 5.988662 | 4.160247 GiB |
+| K7 / 0.96 | 7,849.510 | 395.850 | 87.135177% | 7.099462 | 4.291170 GiB |
+
+Prefill is input tokens divided by server prefill seconds. Decode is
+`(output tokens - 1) / server decode seconds`, excluding prefill; neither rate
+is aggregate concurrent throughput or a client-TTFT approximation. K7 accepted
+6,807 of 7,812 proposed tokens across 1,116 draft steps. Its prefill/decode
+sample standard deviations were 55.025 / 0.562 tokens/s.
+
+Relative to historical K5, the observed median decode rate was 9.688% higher
+and prefill was 1.252% lower. The runs differ in automatic KV allocation and
+include restarts and initial JIT work; no return test or interleaved A/B/A was
+performed. This synthetic C1 observation does not establish general-task
+quality, complete C4 performance or long-term stability. Matching phase
+timelines and Top10 analyses remain unavailable for this measurement.
 
 ## Historical Q
 
