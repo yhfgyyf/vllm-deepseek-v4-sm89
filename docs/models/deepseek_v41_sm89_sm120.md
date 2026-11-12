@@ -19,6 +19,11 @@ in the L20 launch example. The published `vision12` / FlashInfer `vision3`
 wheels predate that tuning. Build both current sources for Q; the release
 validation recorded below remains specific to the published wheels.
 
+The 2026-11-12 L20 example selects TP8/PP1, draft TP8 and conventional automatic
+KV at 0.96, retaining Q's optimizations. SM120 has separate
+[explicit B12X adapters](deepseek_v41_sm120_b12x.md) for measured small-batch
+shapes; their GPU integration and full-model qualification remain pending.
+
 ## Build the current source
 
 Use a new Linux x86_64 Python 3.12 environment, CUDA 13.2 toolkit, GCC 13 or

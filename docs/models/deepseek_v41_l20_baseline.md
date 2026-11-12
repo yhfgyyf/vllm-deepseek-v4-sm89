@@ -1,4 +1,32 @@
-# DeepSeek V4.1 L20 baseline Q
+# DeepSeek V4.1 L20: current TP8 and historical Q
+
+The selected service configuration as of 2026-11-12 is **TP8/PP1 + draft TP8**,
+retaining Q's K1/K2/K3 and decode PCIe IPC. Both README commands retain the
+service parameters, except for the user's requested memory-utilization change
+from 0.98 to 0.96: 8192 batched tokens, 4 sequences, K5 adaptive, 1,048,576 context
+limit, `FULL_AND_PIECEWISE` with capture48, `--gpu-memory-utilization 0.96`, and
+`--no-enable-extensible-kv-cache`, without a fixed KV byte limit.
+
+The recorded 0.98 launch allocated **5.107793 GiB KV per worker**; the latest
+0.96 startup receipt records **4.160247 GiB** on each of the eight workers.
+The change followed an OOM on a 17,630-token input in the Engram TP all-gather
+prefill path. This publication reuses that startup receipt and does not restart
+the service or qualify long-running stability. Eight-rank IPC
+numerical, repeated-call and changed-input Graph checks passed; all eight
+workers loaded the accepted K1/K2/K3 modules. The bounded novel C4 observation
+at 0.98 was 288.979 aggregate output tokens/s for the complete batch and 402.005
+tokens/s during a continuous four-request decode interval. It differs from
+historical Q in cache hits, accepted drafts, output lengths and draft TP;
+these are workload observations, not an isolated speedup or a global optimum.
+One of four stories did not meet its requested 10,000-character length.
+
+Q below remains the frozen, controlled historical experiment. Its performance
+numbers and fixed 2 GiB allocation must not be relabeled as TP8 measurements.
+No new wheel was published for either configuration. The new
+[SM120 opt-in adapters](deepseek_v41_sm120_b12x.md) have separate qualification
+limits and do not change L20 execution.
+
+## Historical Q
 
 The accepted 2026-11-11 baseline is **TP4/PP2 + K1 Attention + K2 mHC +
 K3 Linear + decode FlashInfer PCIe IPC all-reduce** on eight L20 GPUs.
@@ -14,8 +42,9 @@ modules overlaid; no new complete wheel was built for Q.
 
 ## Configuration
 
-The complete launch command is in the [English README](../../README_EN.md#33-sm89-848-gb-gpus-l20--rtx-4090-48-gb)
+The current TP8 command is in the [English README](../../README_EN.md#33-sm89-848-gb-gpus-l20--rtx-4090-48-gb)
 and [Chinese README](../../README.md#33-sm89848gb-gpul20--rtx-4090-48gb).
+The table below preserves Q's historical configuration.
 
 | Setting | Accepted value |
 | --- | --- |

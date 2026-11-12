@@ -6,6 +6,7 @@ import importlib.metadata
 
 import torch
 
+from vllm.model_executor.kernels import deepseek_v41_b12x
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -65,6 +66,11 @@ def _deepseek_v41_sm120_mxfp8_impl(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
+    output = deepseek_v41_b12x.try_mxfp8(
+        input_mxfp8, weight, input_scale, weight_scale, out_dtype
+    )
+    if output is not None:
+        return output
     tactic = _deepseek_v41_engram_mxfp8_tactic(
         input_mxfp8.shape[0], weight.shape[0], weight.shape[1]
     )
@@ -159,6 +165,11 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             and current_platform.is_device_capability(120)
             and _has_deepseek_v41_sm120_mxfp8_tactics()
         )
+        self._deepseek_v41_b12x_enabled = (
+            c.model_profile == "deepseek_v41"
+            and c.weight_shape in ((1152, 5120), (1792, 5120))
+            and deepseek_v41_b12x.enabled()
+        )
 
     supports_pre_processed_weights = True
 
@@ -232,7 +243,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             self._deepseek_v41_engram_tactics_enabled
             and (N, K) == _DEEPSEEK_V41_ENGRAM_MXFP8_SHAPE
         )
-        if not use_deepseek_v41_engram_tactics:
+        if not (use_deepseek_v41_engram_tactics or self._deepseek_v41_b12x_enabled):
             output = vllm_flashinfer.mm_mxfp8(
                 input_mxfp8,
                 weight.t(),

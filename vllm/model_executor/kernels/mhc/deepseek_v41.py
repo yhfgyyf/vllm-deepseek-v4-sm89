@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.model_executor.kernels import deepseek_v41_b12x
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
 
@@ -129,6 +130,31 @@ def mhc_pre_delayed_tilelang(
         or not norm_weight.is_contiguous()
     ):
         raise ValueError("mHC input normalization weight must be BF16 [hidden].")
+    if (
+        deepseek_v41_b12x.enabled()
+        and 0 < tokens <= 32
+        and hidden == 5120
+        and width == streams * hidden
+        and x.data_ptr() == residual.data_ptr()
+        and pre_mix is not None
+        and norm_weight is not None
+        and hc_pre_eps == hc_sinkhorn_eps
+        and hc_post_mult_value == 2.0
+        and sinkhorn_repeat == 20
+    ):
+        result = deepseek_v41_b12x.try_mhc(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            norm_eps,
+        )
+        if result is not None:
+            return result
     next_pre = torch.empty(
         (tokens, streams), device=residual.device, dtype=torch.float32
     )

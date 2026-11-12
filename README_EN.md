@@ -34,6 +34,12 @@ the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
 
 ## Changelog
 
+### 2026-11-12
+
+- Update the L20 example to TP8/PP1, draft TP8, 0.96 automatic KV and capture48, retaining all Q optimizations.
+- Add opt-in SM120 B12X small-batch Attention/mHC/Linear adapters with native fallbacks; GPU integration qualification is pending.
+- This is a source update, not a new wheel or Docker release.
+
 ### 2026-11-09
 
 - Merge official main, adapting model registration, the GPU runner, speculative
@@ -204,10 +210,12 @@ docker run --rm --gpus all --ipc=host \
 
 ## 3. DeepSeek-V4.1-Flash launch command
 
-The following text-serving configuration was validated on 4× RTX PRO 6000
-96 GB. It uses TP=4, expert parallelism, FP8 KV, Engram CPU offload, DSpark 5 (adaptive),
-and experimental CED prefill. CPU offload also requires sufficient host memory.
-V4.1 uses Model Runner V2; switching to the legacy V1 runner is unsupported:
+This is the current-source launch template for **4× RTX PRO 6000 96 GB / TP4**,
+with EP, FP8 KV, Engram CPU offload, DSpark5 adaptive and CED. CPU offload
+requires sufficient host memory. Historical SM120 full-model validation does
+not cover the newly wired B12X operators; see the [SM120 adapter](docs/models/deepseek_v41_sm120_b12x.md)
+for its explicit switch, pinned version, component evidence and pending integration tests.
+The current 8×L20 TP8 command is in Section 3.3. V4.1 requires Model Runner V2:
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -223,27 +231,31 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --port 8000 \
   --trust-remote-code \
   --tensor-parallel-size 4 \
+  --pipeline-parallel-size 1 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
   --kv-cache-dtype fp8 \
   --block-size 128 \
-  --max-model-len auto \
-  --max-num-seqs 20 \
+  --max-model-len 1048576 \
+  --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.90 \
+  --no-enable-extensible-kv-cache \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
-  --safetensors-load-strategy lazy \
+  --safetensors-load-strategy prefetch \
+  --safetensors-prefetch-num-threads 2 \
+  --limit-mm-per-prompt '{"image":2}' \
   --tokenizer-mode deepseek_v41 \
   --reasoning-parser deepseek_v41 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
-  --compilation-config '{"cudagraph_mode":"FULL"}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
 Use `vllm serve` from the new environment above and replace the model path
@@ -366,22 +378,20 @@ quality evaluation.
 
 ### 3.3 SM89: 8×48 GB GPUs (L20 / RTX 4090 48 GB)
 
-The following configuration is for **eight 48 GB SM89 GPUs**, excluding
-standard 24 GB RTX 4090 cards. The default target uses TP4×PP2 (20/20 layers),
-with DSpark TP4 and `max-num-seqs=4`; target TP2×PP4 (10/10/10/10 layers) is
-optional. It retains EP, FP8 KV, Engram CPU offload, CED image input,
-DSpark 5 adaptive, and FULL_AND_PIECEWISE CUDA Graph. Engram CPU offload and checkpoint
-loading both require sufficient host memory, so do not size host memory from
-the GPU weight footprint alone.
+The configuration below targets **eight 48 GB SM89 GPUs**, excluding standard
+24 GB RTX 4090 cards. The selected 2026-11-12 configuration is **TP8/PP1,
+DSpark TP8, K1 Attention + K2 mHC + K3 Linear + decode PCIe IPC all-reduce**.
+It retains EP, CED, Engram CPU offload and K5 adaptive verification.
+Q/TP4/PP2 remains a historical comparison. TP8 is the user's selected starting
+point for the current workload, not a universal performance optimum.
 
-The latest baseline, accepted on 2026-11-11, is **Q: TP4×PP2 + K1 Attention +
-K2 mHC + K3 Linear + decode PCIe IPC all-reduce**. Build vLLM from current
-`main` and FlashInfer with the updated recipe patch; the published `vision12`
-and FlashInfer `vision3` wheels do not include this K1/K2/K3 tuning.
-See the [L20 baseline](docs/models/deepseek_v41_l20_baseline.md) for build
-instructions, source hashes, results, and validation limits. This command
-matches the tested 8192-token batch budget, 2 GiB KV allocation per worker,
-and graph capture sizes up to 48 rows:
+Build current `main` and FlashInfer with the updated recipe patch: the published
+`vision12` / FlashInfer `vision3` wheels predate K1/K2/K3. See the
+[L20 baseline](docs/models/deepseek_v41_l20_baseline.md) for build instructions,
+runtime identity and measurement limits. This command retains the recorded L20
+service parameters, changing only memory utilization from 0.98 to the requested
+0.96: 8192 batched tokens, 4 sequences, conventional automatic KV and graph
+capture up to 48 rows. Engram offload and loading require sufficient host memory.
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -399,8 +409,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --pipeline-parallel-size 2 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 1 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
@@ -410,8 +420,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --prefill-schedule-interval 1 \
-  --gpu-memory-utilization 0.93 \
-  --kv-cache-memory-bytes 2147483648 \
+  --gpu-memory-utilization 0.96 \
+  --no-enable-extensible-kv-cache \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
@@ -424,32 +434,32 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":8}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
-- For optional **target TP2×PP4 with DSpark TP4**, set
-  `export VLLM_PP_LAYER_PARTITION=10,10,10,10`, change the parallel options to
-  `--tensor-parallel-size 2 --pipeline-parallel-size 4`, retain draft TP4, and
-  run `unset VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`. This optional layout is
-  outside Q's PCIe IPC validation scope. The draft uses an independent TP4/EP4
-  group on the last four GPUs. Unset the partition override and restore the
-  PCIe IPC flag when returning to TP4×PP2.
-- With this configuration, PCIe IPC handles contiguous BF16 `[rows,5120]`
-  messages up to 48 rows. Observed prefill and larger messages use the existing
-  communication backend. The flag is explicit in this example; its library
-  default remains off.
-- If needed, reduce the prefill batch budget to 4096 or 2048. Revalidate the
-  workload after changing KV allocation, graph sizes, or scheduling settings;
-  Q's measurements do not cover those changes.
-- `--kv-cache-memory-bytes 2147483648` fixes each worker's KV allocation and
-  takes precedence over automatic KV sizing from `--gpu-memory-utilization`.
-  Each request's input, including image tokens, plus output must remain within
-  `1048576` tokens. `--max-num-seqs 4` is a
-  scheduling limit, not a guarantee that four simultaneous 1M-token requests
-  will fit.
-- Check OOMs, KV preemption/recomputation, latency, and output quality using
-  actual long requests and the target mixed concurrency during deployment.
+- KV is no longer fixed at 2 GiB. `--gpu-memory-utilization 0.98` produced
+  **5.108 GiB per worker**; the latest **0.96** launch recorded **4.160 GiB**.
+  Allocation depends on the host, workload and build. Earlier capacity and
+  throughput measurements must not be relabeled as results for the new setting.
+- Keep `--no-enable-extensible-kv-cache`: conventional automatic sizing avoids
+  two current CED incompatibilities in the extensible-KV warmup. Adding
+  `--max-logprobs 0` is not required and does not fix both incompatibilities.
+- Target TP8 requires draft TP8; target TP8 with draft TP4 is unsupported.
+  To restore historical Q, use TP4/PP2, draft TP4,
+  `--gpu-memory-utilization 0.93 --kv-cache-memory-bytes 2147483648`, and clear
+  the layer-partition override.
+- IPC handles eligible small messages; larger or unsupported messages retain
+  the existing backend. Its library default remains off. TP8 has eight-rank
+  numerical, repeated-call, changed-input Graph and live service-path evidence.
+- Four sequence slots do not guarantee residency for four full 1M requests.
+  Although a bounded C4 run completed at 0.98, a later 17,630-token input hit
+  OOM in the Engram TP all-gather prefill path; the service then changed to
+  0.96. Long-running, multimodal and full-context stability remain unqualified.
+- **RTX PRO 6000 / SM120** uses the TP4 template above. Newly wired B12X
+  small-batch operators have a separate explicit switch; see the
+  [SM120 adapter](docs/models/deepseek_v41_sm120_b12x.md) for the pinned version,
+  supported shapes and pending validation. SM89 tile settings are not applied to SM120.
 
 ## 4. DeepSeek-V4-Flash launch commands
 

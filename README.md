@@ -29,6 +29,12 @@
 
 ## Changelog
 
+### 2026-11-12
+
+- L20 当前示例更新为 TP8/PP1、draft TP8、0.96 自动 KV 和 capture48，保留全部 Q 优化。
+- 加入显式启用的 SM120 B12X 小批 Attention/mHC/Linear 适配；原生回退保留，GPU 集成验收待补。
+- 本次为源码更新，未发布包含这些改动的新 wheel 或 Docker 镜像。
+
 ### 2026-11-09
 
 - 合入完整官方 main 框架，迁移模型注册、GPU runner、推测解码、缓存与 Engram 接口。
@@ -231,9 +237,11 @@ docker run --rm --gpus all --ipc=host \
 
 ## 3. DeepSeek-V4.1-Flash 启动命令
 
-以下为 4× RTX PRO 6000 96GB 上验证过的文本服务配置。它使用 TP=4、EP、
-FP8 KV、Engram CPU offload、DSpark 5（adaptive）和实验性 CED prefill；CPU offload
-还需预留充足的主机内存。V4.1 使用 Model Runner V2，不支持切换到旧 V1 runner：
+以下为 **4× RTX PRO 6000 96GB / TP4** 的当前源码启动模板，保留 EP、FP8 KV、
+Engram CPU offload、DSpark5 adaptive 和 CED；CPU offload 需要充足的主机内存。
+历史 SM120 整模型验收不覆盖本轮新接入的 B12X 算子。其显式开关、固定版本、
+已测组件与待测集成见 [SM120 说明](docs/models/deepseek_v41_sm120_b12x.md)。
+8×L20 的当前 TP8 命令见 3.3。V4.1 使用 Model Runner V2，不支持旧 V1 runner：
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -249,27 +257,31 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --port 8000 \
   --trust-remote-code \
   --tensor-parallel-size 4 \
+  --pipeline-parallel-size 1 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
   --kv-cache-dtype fp8 \
   --block-size 128 \
-  --max-model-len auto \
-  --max-num-seqs 20 \
+  --max-model-len 1048576 \
+  --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.90 \
+  --no-enable-extensible-kv-cache \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
-  --safetensors-load-strategy lazy \
+  --safetensors-load-strategy prefetch \
+  --safetensors-prefetch-num-threads 2 \
+  --limit-mm-per-prompt '{"image":2}' \
   --tokenizer-mode deepseek_v41 \
   --reasoning-parser deepseek_v41 \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}' \
-  --compilation-config '{"cudagraph_mode":"FULL"}'
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
 使用上述新环境中的 `vllm serve`，并将模型路径替换为自己的 checkpoint。
@@ -376,16 +388,16 @@ stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接�
 ### 3.3 SM89：8×48GB GPU（L20 / RTX 4090 48GB）
 
 以下配置面向 **8 张 48GB SM89 GPU**，不适用于普通 24GB 版 RTX 4090。
-默认主模型 TP4×PP2（20/20 层）、DSpark TP4、`max-num-seqs=4`，可选主模型
-TP2×PP4（10/10/10/10 层）。保留 EP、FP8 KV、Engram CPU offload、CED 图片输入、
-DSpark 5 adaptive 和 FULL_AND_PIECEWISE CUDA Graph。Engram CPU offload 与 checkpoint 加载还需要充足的主机
-内存，不能只按 GPU 权重大小估算整机内存需求。
+2026-11-12 当前选择为 **TP8/PP1、DSpark TP8、K1 Attention + K2 mHC + K3 Linear +
+decode PCIe IPC all-reduce**，保留 EP、CED、Engram CPU offload 和 K5 adaptive。
+TP4/PP2 的 Q 作为历史对照保留；TP8 是当前用户负载的选定起点，不表示所有负载的全局最优。
 
-2026-11-11 最新基线 **Q = TP4×PP2 + K1 Attention + K2 mHC + K3 Linear + decode
-PCIe IPC all-reduce**。需要当前 `main` 的 vLLM 源码和更新后的 FlashInfer recipe patch；
-已发布的 `vision12` / FlashInfer `vision3` wheel 不包含此次 K1/K2/K3 调优。
-构建方法、源码哈希、验证结果和边界见 [L20 基线说明](docs/models/deepseek_v41_l20_baseline.md)。
-以下命令对应已验证的 8192-token 调度预算、每 worker 2 GiB KV 和最多 48 行图捕获配置：
+需要当前 `main` 的 vLLM 和更新后的 FlashInfer recipe patch；已发布的 `vision12` /
+FlashInfer `vision3` wheel 早于 K1/K2/K3。构建、运行身份及测量边界见
+[L20 基线说明](docs/models/deepseek_v41_l20_baseline.md)。以下命令沿用当前 L20 服务
+参数，仅按最新要求将显存利用率从 0.98 改为 0.96：8192-token 调度预算、
+4 条序列、常规自动 KV、最多 48 行图捕获。
+Engram CPU offload 与 checkpoint 加载仍需充足的主机内存。
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -403,8 +415,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --pipeline-parallel-size 2 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 1 \
   --distributed-executor-backend mp \
   --enable-expert-parallel \
   --moe-backend auto \
@@ -414,8 +426,8 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --prefill-schedule-interval 1 \
-  --gpu-memory-utilization 0.93 \
-  --kv-cache-memory-bytes 2147483648 \
+  --gpu-memory-utilization 0.96 \
+  --no-enable-extensible-kv-cache \
   --enable-prefix-caching \
   --engram-config '{"cpu_offload":true}' \
   --load-format safetensors \
@@ -428,25 +440,26 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --hf-overrides '{"ced_prefill":true}' \
   --speculative-config \
-  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":4}' \
+  '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true,"draft_tensor_parallel_size":8}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
-- 可选 **TP2×PP4，DSpark TP4**：启动前设置
-  `export VLLM_PP_LAYER_PARTITION=10,10,10,10`，将并行参数改为
-  `--tensor-parallel-size 2 --pipeline-parallel-size 4`，保留 draft TP4，并设置
-  `unset VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`。该可选布局不属于 Q 的 PCIe IPC
-  验收范围；草稿模型使用后四张卡的独立 TP4/EP4 组。
-  切回默认 TP4×PP2 时清除层分配环境变量并恢复 PCIe IPC 开关。
-- PCIe IPC 在这组配置中接管连续 BF16 `[rows,5120]`、最多 48 行的小消息；
-  已测 prefill 和更大消息沿用原通信后端。该开关仅在本示例显式开启，库默认值不变。
-- 若需降低 prefill 峰值显存，可将调度预算降至 4096 或 2048；改变 KV 预算、
-  图捕获范围或调度参数后，应重新验证目标负载，不沿用 Q 的性能数字。
-- `--kv-cache-memory-bytes 2147483648` 显式固定每 worker 的 KV 大小，并优先于
-  `--gpu-memory-utilization` 的自动 KV 分配。确认实际输入（含图片 tokens）与输出
-  之和不超过配置的 `1048576`。
-  `max-num-seqs=4` 是调度上限，不保证能同时容纳 4 条各 1M 的请求。
-- 部署时按实际长请求和目标混合并发检查 OOM、KV 抢占重算、时延及输出质量。
+- 不再固定 2 GiB KV。`--gpu-memory-utilization 0.98` 在该次 L20 启动中得到每卡
+  **5.108 GiB** 实际 KV；最新 **0.96** 启动记录为每卡 **4.160 GiB**。
+  不同主机、负载或构建的分配可能不同，不把旧容量或速度归到新参数。
+- `--no-enable-extensible-kv-cache` 保留常规自动预算，避开当前可扩展 KV 与 CED
+  额外预热的两处不兼容。不要删掉此参数，也不需要加 `--max-logprobs 0`。
+- TP8 的 draft 也必须为 8；当前实现不支持 target TP8 + draft TP4。
+  若恢复历史 Q，使用 TP4/PP2、draft TP4、`--gpu-memory-utilization 0.93` 和
+  `--kv-cache-memory-bytes 2147483648`，并清除层分配覆盖。
+- IPC 在适用的小消息上启用，较大或不支持的消息走原通信后端；库默认仍关闭。
+  TP8 已有八 rank 数值、重复调用、改变输入的 Graph 和实际服务路径验证。
+- `max-num-seqs=4` 不保证四条满 1M 请求同时驻留。0.98 虽完成过有限四并发测试，
+  后续 17,630-token 输入在 Engram TP all-gather 的 prefill 路径 OOM，随后改为 0.96。
+  长上下文、图片和长期运行的完整稳定性仍待验证。
+- **RTX PRO 6000 / SM120** 继续使用上面的 TP4 模板；新接入的 B12X 小批算子
+  通过独立显式开关选择，版本、适用形状和未完成验证见
+  [SM120 适配说明](docs/models/deepseek_v41_sm120_b12x.md)。SM89 的 tile 参数不会直接套到 SM120。
 
 ## 4. DeepSeek-V4-Flash 启动命令
 

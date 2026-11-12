@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.kernels import deepseek_v41_b12x
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import (
     compute_global_topk_indices_and_lens,
@@ -37,7 +38,23 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
-def _native_mixed_attention(*args, **kwargs) -> torch.Tensor | None:
+def _native_mixed_attention(
+    q, swa_cache, global_cache, swa_slots, global_slots, scale, **kwargs
+) -> torch.Tensor | None:
+    if deepseek_v41_b12x.try_attention(
+        q,
+        swa_cache,
+        global_cache,
+        swa_slots,
+        global_slots,
+        scale,
+        kwargs["sinks"],
+        kwargs["positions"],
+        kwargs["cos_sin"],
+        kwargs["grouped_out"],
+        kwargs["token_offset"],
+    ):
+        return None
     try:
         from flashinfer.mla.deepseek_v41 import (
             _deepseek_v41_mixed_sparse_attention_with_inv_rope,
@@ -48,7 +65,9 @@ def _native_mixed_attention(*args, **kwargs) -> torch.Tensor | None:
             "mixed sparse attention with inverse-RoPE API; no FP8 or FlashMLA "
             "fallback is permitted."
         ) from exc
-    return _deepseek_v41_mixed_sparse_attention_with_inv_rope(*args, **kwargs)
+    return _deepseek_v41_mixed_sparse_attention_with_inv_rope(
+        q, swa_cache, global_cache, swa_slots, global_slots, scale, **kwargs
+    )
 
 
 def _native_workspace_size(

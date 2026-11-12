@@ -25,6 +25,7 @@ nav:
     - Models:
       - models/supported_models.md
       - models/deepseek_v41_l20_baseline.md
+      - models/deepseek_v41_sm120_b12x.md
       - models/generative_models.md
       - Pooling Models: models/pooling_models
       - models/structured_decisions_models.md
