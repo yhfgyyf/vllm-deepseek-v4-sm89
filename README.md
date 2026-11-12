@@ -1,46 +1,145 @@
-# DeepSeek V4.1 / V4 / Vision 与 GLM-5.3 on SM89 / SM120
+# DeepSeek-V4.1-Flash、DeepSeek-V4-Flash / Vision 与 GLM-5.3-Flash on SM89 / SM120 — vLLM fork
 
 <!-- markdownlint-disable MD060 -->
 
-[English](README_EN.md)
+> English version: [`README_EN.md`](README_EN.md)
+>
+> 本仓库基于 [vllm-project/vllm](https://github.com/vllm-project/vllm)，用于在
+> SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4.1-Flash、
+> DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
-基于 [vLLM](https://github.com/vllm-project/vllm) 的推理服务，支持
-DeepSeek-V4.1-Flash、DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp 和
-GLM-5.3-Flash，可通过 OpenAI 兼容 API 调用。
+当前源码已合入 2026-11-09 核对的官方 main
+`3213796cd32df625a0669e9423acb397b627b790`，使用 Torch 2.14 / FlashInfer 0.7.3
+并保留 SM89/SM120、CED、PP 与 DSpark 适配。新发布的 `vision12` wheel 见
+[Release](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/tag/v0.33.0-vision12-sm89-sm120-cu130)，安装命令见下文。
 
-## 1. 环境要求
+新版已通过 8×L20 的 V4.1 TP4/PP2 整模型、图片/OCR、中文、工具调用与近 1M
+上下文验证；最终 wheel 的 8K/32K/128K→512 解码均值较旧版提高约 7.8%/13.0%/8.9%，预填充基本持平。
+完整配置与测量见[验证记录](docs/models/deepseek_v41_sm89_sm120.md#validation-scope)。
+下列历史支持矩阵与 `vision11` 制品仍属于旧版 vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18。
 
-| 项目 | 配置 |
-| --- | --- |
-| 系统 / Python | Linux x86_64 / Python 3.12 |
-| SM89 示例 | L20、RTX 4090 48GB；V4.1 使用 8 张卡 |
-| SM120 示例 | RTX PRO 6000 Blackwell 96GB，4 张卡 |
-| 当前运行栈 | PyTorch 2.14.0+cu130、Triton 3.8.0、Transformers 5.22.2 |
-| FlashInfer | 本项目配套的 0.7.3 扩展，不能直接用上游包替代 |
-| CUDA | 源码构建使用 13.2；下方服务示例的本地 JIT 使用 13.0 |
+## 历史发布版本支持矩阵
 
-模型路径须指向完整 checkpoint。Engram CPU offload 和模型加载需要充足的
-主机内存；48GB GPU 示例不适用于普通 24GB 版 RTX 4090。
+| GPU 架构 | 已验证 GPU | DeepSeek-V4.1-Flash | DeepSeek-V4-Flash | DeepSeek-V4-Flash-Vision-Exp | GLM-5.3-Flash |
+|---|---|---:|---:|---:|---:|
+| SM89 / Ada | 8× RTX 4090 48GB | 是 | 是 | 是 | 是 |
+| SM120 / RTX Blackwell | 4× RTX PRO 6000 96GB | 是 | 是 | 是 | 是 |
 
-## 2. 安装
+---
 
-### 2.1 当前源码
+## Changelog
 
-使用下方 L20 TP8 配置或 SM120 可选 B12X 算子时，请安装当前 `main`，
-并应用配套的 FlashInfer recipe patch：
+### 2026-11-12
 
-```bash
-git clone https://github.com/yhfgyyf/vllm-deepseek-v4-sm89.git
-cd vllm-deepseek-v4-sm89
-```
+- L20 启动示例：TP8/PP1、draft TP8、DSpark7、0.96 自动 KV 和 capture48。
+- 加入显式启用的 SM120 B12X 小批 Attention/mHC/Linear 适配；原生回退保留，GPU 集成验收待补。
+- 本次为源码更新，未发布包含这些改动的新 wheel 或 Docker 镜像。
 
-然后按[源码构建说明](docs/models/deepseek_v41_sm89_sm120.md#build-the-current-source)
-安装 vLLM 和 FlashInfer。使用新的 Python 3.12 环境，不复用 Torch 2.13 的扩展。
+### 2026-11-09
 
-### 2.2 预编译 wheel
+- 合入完整官方 main 框架，迁移模型注册、GPU runner、推测解码、缓存与 Engram 接口。
+- 保留默认 TP4×PP2、DSpark TP4、最多 4 条序列，以及可选 TP2×PP4＋draft TP4。
+- 发布 vLLM `0.33.0 / vision12` 和配套 FlashInfer `0.7.3 / vision3` wheel，使用 Torch 2.14；Docker 镜像仍为旧版。
+- 修复新版 MoE 加载和压缩器循环缓存接口；通过 8×L20 整模型与近 1M 上下文验证。
+- 修复 TP2×PP4＋draft TP4 的启动预热和混合批次通信顺序。
 
-`vision12` vLLM 与 `vision3` FlashInfer 使用下方固定版本；它们不包含当前源码的
-L20 算子调优及可选 SM120 B12X 适配。需要这些功能时使用源码安装。
+### 2026-09-16
+
+- 发布公开的 GHCR `vision11` Docker 镜像，支持免登录拉取，包含完整 CUDA JIT
+  开发依赖和 CED 图片支持。
+- 当前安装入口更新为包含 adaptive verification 和 CED 图片支持的 `vision11`
+  vLLM wheel，配套 FlashInfer `vision2` 保持不变。
+- 增加 8× RTX 4090 48GB 的 DeepSeek-V4.1-Flash 启动示例：上下文长度 `auto`、
+  最多 4 条序列、显存利用率 `0.98`、batch token 预算 `4096`（可改为 `2048`）。
+
+### 2026-09-12
+
+- 在当前 `main` 源码中增加 DeepSeek-V4 / V4.1 的 SM89 / SM120 adaptive
+  verification 适配，覆盖 device-ragged metadata、padding 和 FULL graph 回放。
+  SM120 已完成算子及 V4.1 整模型验证。
+  当时 Release 中的 vLLM wheel 更新为包含该适配的 `vision10`，DSpark 示例默认开启
+  adaptive verification，并显式使用 FULL graph；`vision9` 及更早的 vLLM
+  wheel 不包含该适配。配套 FlashInfer `vision2` 保持不变。
+- 增加 DeepSeek-V4.1-Flash 原生模型、Engram、DSpark 和实验性 CED prefill
+  支持，发布 SM89+SM120 `vision9` wheel。
+- 在 4× RTX PRO 6000（SM120）上完成完整模型服务验证。
+- 已测长文本 prefill 中，按输入 token 数 / TTFT 估算的 prefill 代理指标相对
+  关闭 CED 时约翻倍；实际收益取决于 prompt 和运行配置。
+
+### 2026-09-07
+
+- 更新至 vLLM `0.28.1rc1` 开发版，发布 SM89+SM120 `vision8` wheel。
+- 修复 [Issue #98](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/98)
+  中 DeepSeek-V4 C128 稀疏注意力索引不连续导致的崩溃（PR #96）。
+- 修复 persistent Top-K 候选缓冲区溢出导致的索引选择错误（PR #97），
+  并修复 CUDA Triton block-FP8 路径的 E8M0 scale 兼容性。
+
+### 2026-09-03
+
+- 更新 SM89+SM120 Docker 镜像，修复
+  [Issue #95](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/95) 反馈的问题。
+
+### 2026-09-02
+
+- 修复 [Issue #90](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/90)，
+  GitHub Release 中有问题的 vLLM wheel 已替换为 `dev293` / `vision7` 构建。
+- 重新发布包含 DeepSeek-V4-Flash-Vision-Exp 支持的 SM89+SM120 Docker
+  镜像，并完成 SM120 GPU、模型模块和视频解码验证。
+
+### 2026-09-01
+
+- 增加 DeepSeek-V4-Flash-Vision-Exp 支持；4× RTX PRO 6000（SM120）和
+  8× RTX 4090 48GB（SM89）均已支持。
+- 增加 DeepSeek-V4-Flash-Vision-Exp 的 SM89 部署说明和 8 卡 DSpark
+  启动命令。
+- 增加 8× RTX 4090 48GB 的 GLM-5.3-Flash 启动命令，并将 DeepSeek-V4-Flash
+  的 SM89 示例改为 `--max-model-len auto`。
+
+### 2026-08-31
+
+- 社区用户已在 8× RTX 4090 48GB（SM89）上成功运行 GLM-5.3-Flash，参见
+  [Issue #74 的验证记录](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
+- 发布统一的 SM89+SM120 Docker 镜像到阿里云上海 ACR。
+
+### 2026-08-30
+
+- 将主分支更新到 vLLM `v0.28.1rc0-110` 基线，并保留本仓库已经验证的
+  DeepSeek-V4-Flash SM89 支持。
+- 增加 RTX PRO 6000（SM120）上的 DeepSeek-V4-Flash 和 GLM-5.3-Flash 支持。
+- 发布统一的 SM89+SM120 vLLM wheel，以及配套的 FlashInfer `0.6.18` wheel。
+- Python 包版本、Git 源码和 release 制品使用同一组版本标记。
+
+早期 SM89 版本和对应环境仍保留在
+[历史 Releases](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases) 中。
+
+---
+
+## 1. 当前 vision12 已验证环境
+
+| 项目 | 版本 / 配置 |
+|---|---|
+| 操作系统 | Linux x86_64 |
+| Python | 3.12 |
+| CUDA toolkit | 13.2 构建；L20 本地 JIT 使用 13.0 |
+| PyTorch | 2.14.0+cu130 |
+| Triton | 3.8.0 |
+| Transformers | 5.22.2 |
+| FlashInfer | `0.7.3+glm53.dsv41.vision3.sm89sm120.cu130.pt214` |
+| vLLM | `0.33.0+glm53.dsv41.vision12.sm89sm120.cu130` |
+| SM89 | 8× L20：V4.1 TP4/PP2、TP2/PP4＋draft TP4 整模型验证 |
+| SM120 | RTX PRO 6000 Blackwell：算子与 wheel 验证 |
+
+FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时会进行一次 JIT
+编译，后续启动会复用缓存。
+
+---
+
+## 2. 快速安装
+
+### 2.1 预编译 wheel
+
+在新的 Python 3.12 虚拟环境中安装 `vision12` vLLM 和配套 FlashInfer
+`vision3`。两者均来自新 Release `v0.33.0-vision12-sm89-sm120-cu130`：
 
 ```bash
 uv venv --python 3.12 --seed
@@ -52,20 +151,36 @@ uv pip install --torch-backend=cu130 \
   'transformers==5.22.2' 'triton==3.8.0'
 ```
 
-`uv` 会校验两个 wheel 的 SHA256。
+`uv` 会校验两个 wheel 的 SHA256。该 vLLM wheel 的运行时代码对应 main
+提交 `8e91ca5082c7c21dbdf1f03ae576fdca6c572072`，包含 SM89 / SM120 原生扩展和
+Release 模式的 Rust 前端。源码构建和验证范围见[详细说明](docs/models/deepseek_v41_sm89_sm120.md)。
 
-### 2.3 Docker
+PyPI 依赖可按需通过 `--index-url` 使用镜像源；wheel 仍从上述 Release URL 下载。
 
-现有 GHCR `vision11` 镜像使用 vLLM 0.28 / Torch 2.13，适合保留旧环境；
-当前源码的 L20 TP8 示例需要上面的源码安装，不能直接套用到此镜像。
-下方是容器模板，需替换模型路径并追加所用镜像版本的模型参数。
-环境变量通过 `docker run -e` 传入；`vision11` 的 V4.1 还需
-`-e VLLM_USE_V2_MODEL_RUNNER=1`。
+### 2.2 从当前 main 源码安装（wheel 的替代方案）
+
+当前源码依赖已升级，须按照[源码构建说明](docs/models/deepseek_v41_sm89_sm120.md)
+创建新环境，并安装配套的 FlashInfer 0.7.3 原生扩展。不要使用旧版 Torch 2.13 /
+Triton 3.7.1 或将 `vision11` 二进制覆盖到新源码。
+
+### 2.3 历史 vision11 Docker 镜像（GHCR，公开免登录）
+
+此镜像仍使用 vLLM 0.28 / Torch 2.13，不包含本次框架升级。
+
+[GHCR 镜像页面](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/pkgs/container/vllm-deepseek-v4-sm89)
+
+支持模型：DeepSeek-V4.1-Flash、DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp、
+GLM-5.3-Flash。
+
+拉取镜像（无需登录）：
 
 ```bash
 docker pull \
   ghcr.io/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc1-vision11-sm89-sm120-cu130
 ```
+
+启动模板：替换本地模型路径，并在末尾追加后文对应模型的启动参数；
+环境变量通过 `docker run -e` 传入，服务地址使用 `--host 0.0.0.0`。
 
 ```bash
 docker run --rm --gpus all --ipc=host \
@@ -76,16 +191,64 @@ docker run --rm --gpus all --ipc=host \
   --host 0.0.0.0 --port 8000
 ```
 
+### 2.4 历史 Docker 镜像（阿里云上海 ACR，vision7）
+
+> **注意：** 以下历史 `vision7` 镜像不包含 DeepSeek-V4.1-Flash 或本次 adaptive
+> 适配，不能直接使用下文默认开启 adaptive 的 DSpark 命令。请使用上面的 GHCR
+> `vision11` 镜像、wheel 或源码安装流程；旧镜像的历史配置须关闭 adaptive。
+
+镜像地址：
+
+```text
+crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
+```
+
+| 项目 | 值 |
+|---|---|
+| 平台 | Linux x86_64 / `linux/amd64` |
+| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
+| FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
+| PyTorch / CUDA | `2.13.0+cu130` / CUDA 13.0 JIT toolchain |
+| 镜像大小 | 9.27 GB 未压缩；约 4.33 GB Registry 传输量 |
+| Digest | `sha256:1a120648d54ebb90aad91bef2a620e5779c627426ad9f0a34367303b4cbe659a` |
+
+直接拉取镜像：
+
+```bash
+docker pull \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130
+```
+
+镜像入口是 `vllm serve`。使用后文启动参数时，将命令开头的
+`vllm serve /path/to/model` 替换为：
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  crpi-6uvuk5v2ux77q4n9.cn-shanghai.personal.cr.aliyuncs.com/yhfgyyf/vllm-deepseek-v4-sm89:0.28.1rc0-vision7-sm89-sm120-cu130 \
+  /models/model-directory
+```
+
+其余模型参数按旧镜像的历史配置设置。镜像已完成 SM120 GPU 运行验证和 SM89
+目标编译验证，不代表它支持本次 adaptive 适配。
+
+---
+
 ## 3. DeepSeek-V4.1-Flash 启动命令
 
-下方是 **4× RTX PRO 6000 96GB、TP4/PP1、draft TP4、DSpark5** 模板。
-**8×L20 默认使用 DSpark7**，命令见 3.3。替换虚拟环境、CUDA 和模型路径后运行。
+以下为 **4× RTX PRO 6000 96GB / TP4** 的当前源码启动模板，保留 EP、FP8 KV、
+Engram CPU offload、DSpark5 adaptive 和 CED；CPU offload 需要充足的主机内存。
+历史 SM120 整模型验收不覆盖本轮新接入的 B12X 算子。其显式开关、固定版本、
+已测组件与待测集成见 [SM120 说明](docs/models/deepseek_v41_sm120_b12x.md)。
+8×L20 的当前 TP8 命令见 3.3。V4.1 使用 Model Runner V2，不支持旧 V1 runner：
 
 ```bash
 source /path/to/.venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=12.0
+# 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
 unset TRITON_PTXAS_BLACKWELL_PATH
 
 vllm serve /path/to/DeepSeek-V4.1-Flash \
@@ -121,41 +284,79 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
-### 3.1 功能开关
+使用上述新环境中的 `vllm serve`，并将模型路径替换为自己的 checkpoint。
+当前源码使用 Triton 3.8 配套编译器；旧 Triton 3.7.1 的 `ptxas-blackwell`
+覆盖设置仅适用于历史环境。首次 JIT 和 graph capture
+可能耗时，应在服务就绪及预热完成后测吞吐。
 
-- **DSpark**：checkpoint 需要 confidence head。示例开启 adaptive verification；
-  要使用固定草稿验证，将 `enable_adaptive_verification` 改为 `false`。
-- **CUDA Graph**：V4.1 使用 `FULL_AND_PIECEWISE`，其余 DSpark 示例使用 `FULL`。
-  启用 adaptive 时保留对应配置，不添加 `--enforce-eager`。
-- **CED**：`ced_prefill=true` 开启实验性近似 prefill；移除此 override 可使用普通
-  prefill。CED 与 adaptive 可独立设置，输出质量需按实际任务确认。
-- **图片**：通过 `--limit-mm-per-prompt '{"image":2}'` 设置数量上限。
-  V4.1 当前不支持非图片模态、prompt embeddings 或 prompt logprobs。
-- **SM120 B12X**：默认关闭。按[安装与开关说明](docs/models/deepseek_v41_sm120_b12x.md)
-  使用固定版本并显式启用；新适配的 GPU 集成验证尚未完成。
+CED 是实验性近似 prefill，输出不保证与普通 prefill 等价，需按实际任务评估质量。
+`vision12` wheel 和当前源码支持 CED 单图、多图、DSpark 与 prefix caching；
+图片数量通过 `--limit-mm-per-prompt '{"image":2}'` 设置。V4.1 不支持
+非图片模态、prompt embeddings 或 prompt logprobs。
 
-首次启动的 JIT 和 Graph capture 可能较慢，等服务就绪后再调用。
-`max-model-len` 是请求长度上限，`max-num-seqs` 是调度上限，两者不保证所有
-并发请求都能同时使用最大上下文。
+### 3.1 DSpark 默认开启 adaptive verification
 
-### 3.2 L20 性能参考
+DSpark 示例默认开启 adaptive verification，需要带 confidence head 的 checkpoint。
+L20 V4.1 使用 **DSpark7**，PRO 6000 V4.1 模板保留 DSpark5；
+各模型的具体参数以对应启动命令为准。
 
-8×L20、TP8/PP1、draft TP8、DSpark7、显存利用率 0.96，启用 CED 和 adaptive：
+- `enable_adaptive_verification=true` 开启 adaptive；改为 `false` 可使用固定草稿验证。
+- V4.1 使用 `FULL_AND_PIECEWISE`，其余 DSpark 示例使用 `FULL`。
+  使用 adaptive 时不要添加 `--enforce-eager` 或改为仅 `PIECEWISE`。
+- CED 与 adaptive 独立；保留 `ced_prefill=true` 可组合使用，移除此 override
+  即使用普通 prefill。CED 的 prefill/mixed 步骤仍走 EAGER，纯 decode 可使用 FULL。
 
-| 输入 → 输出 tokens | Prefill 中位数 | Decode 中位数 | DSpark 命中率 |
-| --- | ---: | ---: | ---: |
-| 17,630 → 2,641 | **7,849.510 tokens/s** | **395.850 tokens/s** | **87.135177%** |
+### 3.2 DeepSeek-V4.1-Flash 吞吐参考
 
-2026-11-12 的合成复制负载，3 次单请求，temperature=0、reasoning_effort=none、
-前缀命中为零。Prefill = 输入 tokens / 服务端 prefill 秒数；decode =
-`(输出 tokens - 1) / 服务端 decode 秒数`；命中率 = accepted/proposed。
-这是单请求阶段速度，实际任务表现会随输入和接受率变化。
+2026-09-12，4× RTX PRO 6000 Blackwell Server Edition 96GB（SM120），
+TP4/EP、FP8 KV、Engram CPU offload、CED + DSpark5 adaptive、FULL 配置下，
+使用 `vllm bench serve` 测得：
+
+| 输入 / 输出 tokens | 最大并发 | 请求数 | 聚合输出吞吐 | 平均 TTFT | 平均 TPOT |
+|---|---:|---:|---:|---:|---:|
+| 8,192 / 512 | 10 | 200 | **296.61 tokens/s** | 1.464 s | 30.64 ms |
+
+服务已预热，随机输入、temperature=0、ignore-eos，200/200 请求成功，
+前缀缓存命中为 0。吞吐为完整测试周期的总输出 tokens / 总耗时，包含
+prefill 和 decode，不是单请求或纯 decode 速度。此为一次测量，来自已应用
+本次 adaptive 补丁的 Vision9 / FlashInfer Vision2 环境，仅作该环境的吞吐参考；
+无同负载基线，不据此声称 adaptive 加速比例或质量无损。
+
+同一已打补丁环境中的**单并发（C1）**结果如下。每种输入长度先预热 1 次，
+再测 4 次正式请求；每次输出均为 512 tokens，12 次正式请求全部成功，
+前缀缓存命中均为 0。
+
+| 输入 / 输出 tokens | 平均 TTFT (ms) | Prefill 代理 (tokens/s) | Decode (tokens/s) | DSpark 接受率 | 平均接受草稿 tokens | 平均接受长度（含 +1） |
+|---|---:|---:|---:|---:|---:|---:|
+| 8,192 / 512 | 913.30 | 8,969.81 | 267.11 | 84.11% | 4.206 | 5.206 |
+| 32,768 / 512 | 3,279.21 | 9,992.67 | 271.67 | 85.89% | 4.295 | 5.295 |
+| 131,072 / 512 | 15,529.54 | 8,440.21 | 80.00 | 4.64% | 0.232 | 1.232 |
+
+统计口径：
+
+- Prefill 代理为输入 tokens / TTFT（秒）。TTFT 包含排队、调度、prefill
+  和首 token 工作，因此不是纯 GPU 算子或引擎 prefill 吞吐。
+- Decode 为 `1000 / TPOT（ms）`。TTFT 取 4 次正式请求的算术平均；
+  两项吞吐均先逐次计算再取平均，不使用平均延迟的倒数。
+- 接受率 = 接受草稿 tokens 总数 / 提出草稿 tokens 总数；平均接受草稿数
+  = 接受草稿 tokens 总数 / 草稿轮次总数；vLLM 平均接受长度再加 1
+  （额外 target token）。
+  这三项使用 4 次正式请求的累计计数，不直接平均每次请求的比率。
+
+上述为 vLLM 原生计数：proposed 在 adaptive 裁剪前记录，accepted 在
+stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接受率或最终返回
+客户端的 accepted-token 数。随机输入的这些结果不代表质量评估。
 
 ### 3.3 SM89：8×48GB GPU（L20 / RTX 4090 48GB）
 
-当前源码的 L20 配置为 **TP8/PP1、draft TP8、DSpark7、0.96 自动 KV**，
-启用 PCIe IPC、EP、CED 和 Engram CPU offload。调度预算为 8192 tokens，
-最多 4 条序列，Graph capture 上限为 48 行。
+以下配置面向 **8 张 48GB SM89 GPU**，不适用于普通 24GB 版 RTX 4090。
+默认 **TP8/PP1、draft TP8、DSpark7、0.96 自动 KV**，启用 EP、CED、
+Engram CPU offload、adaptive 和 PCIe IPC；调度预算 8192 tokens、最多 4 条序列。
+
+需要当前 `main` 及配套 FlashInfer recipe patch；已发布的 `vision12` /
+FlashInfer `vision3` wheel 不含最新 L20 算子调优，安装见
+[构建说明](docs/models/deepseek_v41_sm89_sm120.md#build-the-current-source)。
+Engram CPU offload 与 checkpoint 加载需要充足的主机内存。
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -164,6 +365,7 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
 export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
+# 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
 
@@ -201,9 +403,23 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}'
 ```
 
-保留 `--no-enable-extensible-kv-cache`，让服务使用常规自动 KV 分配。
-target TP8 的 draft 也必须是 TP8。IPC 对不支持的消息使用原通信后端。
-显存不足时降低利用率或调度预算，再根据实际负载确认容量。
+- 保留 `--no-enable-extensible-kv-cache`，使用常规自动 KV 分配。
+- target TP8 的 draft 也必须为 TP8；不支持 target TP8 + draft TP4。
+- IPC 用于适用的小消息，其他消息使用原通信后端。
+- `max-num-seqs=4` 是调度上限，不保证四条满 1M 请求同时驻留。
+- **RTX PRO 6000 / SM120** 使用第 3 节的 TP4 模板；可选 B12X 的版本和开关见
+  [SM120 说明](docs/models/deepseek_v41_sm120_b12x.md)，新适配的 GPU 集成验证仍待完成。
+
+#### L20 单并发推理参考（2026-11-12）
+
+| 输入 → 输出 tokens | Prefill 中位数（tokens/s） | Decode 中位数（tokens/s） | DSpark 命中率 |
+| --- | ---: | ---: | ---: |
+| 17,630 → 2,641 | **7,849.510** | **395.850** | **87.135177%** |
+
+上述 TP8/K7/0.96 配置，合成复制负载，3 次单请求，temperature=0、
+reasoning_effort=none、前缀命中为零。Prefill = 输入 tokens / 服务端 prefill 秒数；
+decode = `(输出 tokens - 1) / 服务端 decode 秒数`；命中率 = accepted/proposed。
+实际任务表现取决于输入与接受率，详细口径见 [L20 说明](docs/models/deepseek_v41_l20_baseline.md#k7-single-request-measurement)。
 
 ## 4. DeepSeek-V4-Flash 启动命令
 
@@ -236,6 +452,8 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
   --compilation-config '{"cudagraph_mode":"FULL"}' \
   --port 8000
 ```
+
+历史固定 DSpark 配置曾验证 8K、32K、128K 输入、512 输出及 4 并发 8K 输入。
 
 ### 4.2 SM120：4× RTX PRO 6000 96GB
 
@@ -329,11 +547,15 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
+历史 SM89 实机回归使用 4× RTX 4090 48GB，且未启用 DSpark。
+
 ## 6. GLM-5.3-Flash 启动命令
 
 ### 6.1 SM89：8× RTX 4090 48GB
 
-以下示例使用官方 FP8 权重：
+以下参数参考社区用户在
+[Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)
+中使用官方 FP8 权重完成的部署验证：
 
 ```bash
 export FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -381,25 +603,82 @@ vllm serve /path/to/GLM-5.3-Flash \
   --port 8000
 ```
 
-## 7. 调用 API
+### 6.3 SM120 关键参数
 
-服务就绪后，通过 OpenAI 兼容接口调用。`model` 与启动时的
-`--served-model-name` 保持一致；下面使用 V4.1 示例：
+| 参数 | 推荐值 | 说明 |
+|---|---:|---|
+| `--tensor-parallel-size` | 4 | 4 张 96GB RTX PRO 6000 |
+| `--kv-cache-dtype` | `fp8` | 降低长上下文 KV cache 显存占用 |
+| `--block-size` | `2304` | GLM 混合 cache 使用的模型级 block size |
+| `--max-model-len` | `auto` | 根据当前显存和启动配置自动计算容量 |
+| `--max-num-seqs` | 4 | 已验证的并发上限配置 |
+| `--max-num-batched-tokens` | 8192 | chunked prefill token budget |
+| `--gpu-memory-utilization` | 0.97 | 为模型、CUDA Graph 和 KV cache 分配显存 |
+| `--speculative-config` | MTP 5 | 启用五 token MTP 推测解码 |
+| `--enable-prefix-caching` | 开启 | 复用重复或共享前缀 |
+| `glm45` / `glm47` | reasoning / tool parser | 推理输出和工具调用解析 |
 
-```bash
-curl http://127.0.0.1:8000/v1/models
+---
 
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
-```
+## 7. GLM-5.3-Flash SM120 吞吐基线
 
-## 8. 更多文档
+以下数据来自本项目第一版 SM120 完整基准，使用 4× RTX PRO 6000、TP=4、
+FP8 KV、MTP=5、CUDA Graph、`block-size=2304`、chunked prefill 8192，关闭
+prefix cache。每个输入长度运行 5 次，输出均为 512 tokens，10/10 请求成功。
 
-- [源码构建与依赖](docs/models/deepseek_v41_sm89_sm120.md)
-- [L20 配置与性能说明](docs/models/deepseek_v41_l20_baseline.md)
-- [SM120 可选算子设置](docs/models/deepseek_v41_sm120_b12x.md)
-- [历史发布与测量记录](docs/models/sm89_sm120_history.md)
+| 输入 → 输出 | Prefill TPS 均值 / 中位数 | Decode TPS 均值 / 中位数 | 平均 TTFT |
+|---|---:|---:|---:|
+| 8,192 → 512 | **9,919.34 / 9,904.75** | **158.47 / 175.25** | 825.88 ms |
+| 32,768 → 512 | **9,841.51 / 9,843.08** | **199.00 / 208.74** | 3,329.62 ms |
+
+计算口径：
+
+- `Prefill TPS = input tokens / TTFT`
+- `Decode TPS = 511 / (E2E - TTFT)`
+- TTFT 是端到端首 token 延迟近似值；decode 会随 MTP 接受率波动。
+
+这组数字用于保留第一版 SM120 的可比基线，不代表本次 wheel 在所有输入内容、
+驱动版本或显存配置下都能得到相同结果。
+
+### 长上下文吞吐
+
+首版 SM120 release 还记录了 256K / 784K 长上下文、512 输出、prefix cache
+相关数据：
+
+| 输入 / 输出 | 8192 chunk 基线 | 4096 chunk 稳态 | Prefill 变化 |
+|---|---:|---:|---:|
+| 256K / 512 | 27.865s；9,407.50 tok/s | 31.649s；8,282.96 tok/s | -11.95% |
+| 784K / 512 | 101.473s；7,911.64 tok/s | 112.685s；7,124.45 tok/s | -9.95% |
+
+重复相同 prompt 时：
+
+| 输入 | Prefix 命中率 | 重复请求 TTFT |
+|---|---:|---:|
+| 256K | 98.4375% | 1.308s |
+| 784K | 99.5855% | 3.117s |
+
+---
+
+## 8. 正确性验证
+
+- DeepSeek-V4.1-Flash、DeepSeek-V4-Flash、DeepSeek-V4-Flash-Vision-Exp
+  与 GLM-5.3-Flash
+  在 SM120 上均通过服务启动。
+- DeepSeek-V4.1-Flash 在 SM120 上通过文本服务、工具调用、DSpark 和实验性
+  CED prefill 验证；在 8× RTX 4090 48GB（SM89）上完成保留 CED + DSpark 的
+  单并发 8K / 32K / 128K 图片与工具调用请求。图片答案质量按实际任务单独评估。
+- DeepSeek-V4-Flash 与 GLM-5.3-Flash 在 SM120 上通过 8K/32K 输入和
+  512 输出测试。
+- DeepSeek-V4-Flash 在 SM89 上通过 8K/32K/128K、4 并发、工具调用和 UTF-8
+  输出测试。
+- DeepSeek-V4-Flash-Vision-Exp 在 4× RTX 4090 48GB（SM89）上通过服务启动、
+  单图、多图、视频、工具调用、8K/32K 输入和 UTF-8 输出测试；该 4 卡配置未启用
+  DSpark。
+- GLM-5.3-Flash 已由社区用户在 8× RTX 4090 48GB（SM89）上成功启动并完成
+  推理，参见 [Issue #74](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/74#issuecomment-5474430993)。
+- 两个模型均通过中英文、多语言字符、流式与非流式工具调用检查。
+
+---
 
 ## 微信用户交流群
 
