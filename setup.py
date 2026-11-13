@@ -1621,6 +1621,7 @@ if _build_custom_ops():
 package_data = {
     "vllm": [
         "py.typed",
+        "utils/numa_wrapper.sh",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         # Tuned kernel configs must be explicit: the setuptools-scm git

@@ -797,6 +797,8 @@ steps:
   - image-build-cpu
   timeout_in_minutes: 35
   source_file_dependencies: &cpu-async-engine-deps
+  - MANIFEST.in
+  - tools/check_wheel_numa.py
   - vllm/assets/
   - vllm/config/
   - vllm/device_allocator/
@@ -887,6 +889,7 @@ steps:
   - tests/device_allocator
   device: cpu-small
   commands:
+  - python3 ../tools/check_wheel_numa.py
   - pytest -v -s -m 'cpu_test' multimodal
   - pytest -v -s config
   - pytest -v -s tools/test_check_test_tethering.py

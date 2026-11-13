@@ -34,6 +34,13 @@ the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
 
 ## Changelog
 
+### 2026-11-13
+
+- Fix wheel/sdist packaging of the executable NUMA subprocess wrapper. Without
+  it, an installed wheel can fail to start EngineCore with exit code 255.
+- Add `tools/check_wheel_numa.py` to check the installed wrapper, real EngineCore
+  and worker spawn contexts, child imports and CPU affinity without loading a model.
+
 ### 2026-11-12
 
 - L20 launch example: TP8/PP1, draft TP8, DSpark7, 0.96 automatic KV and capture48.

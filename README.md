@@ -29,6 +29,11 @@
 
 ## Changelog
 
+### 2026-11-13
+
+- 修复 wheel/sdist 遗漏 NUMA 子进程启动脚本的问题，并保留执行权限；缺失时可能导致 EngineCore 以 255 退出。
+- 新增 `tools/check_wheel_numa.py`，从安装目录验证脚本、EngineCore/worker 的真实 spawn、子进程导入与 CPU 绑定，无需加载模型。
+
 ### 2026-11-12
 
 - L20 启动示例：TP8/PP1、draft TP8、DSpark7、0.96 自动 KV 和 capture48。
