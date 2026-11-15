@@ -4368,7 +4368,7 @@ diff --git a/include/flashinfer/attention/sparse_mla_sm89_compat/arch/cp_async.c
 new file mode 100644
 --- /dev/null
 +++ b/include/flashinfer/attention/sparse_mla_sm89_compat/arch/cp_async.cuh
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,142 @@
 +// Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: BSD-3-Clause
 +//
@@ -4435,6 +4435,22 @@ new file mode 100644
 +  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
 +  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(addr) : "memory");
 +}
++
++#if SPARSE_MLA_USE_SM89_PRIMS
++// Invalid sparse entries must not load NaN FP8 data or scales from cache row 0.
++__device__ __forceinline__ void cp_async_g2s_masked(void* smem_dst, const void* gmem_src,
++                                                 uint32_t bytes, bool valid) {
++  const int src_bytes = valid ? 16 : 0;
++#pragma unroll
++  for (uint32_t off = 0; off < bytes; off += 16) {
++    uint32_t dst = static_cast<uint32_t>(
++        __cvta_generic_to_shared(static_cast<uint8_t*>(smem_dst) + off));
++    const void* src = static_cast<const uint8_t*>(gmem_src) + off;
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
++                 ::"r"(dst), "l"(src), "r"(src_bytes) : "memory");
++  }
++}
++#endif
 +
 +// cp.async.bulk: SM90+ bulk global → shared (mbarrier-based completion)
 +__device__ __forceinline__ void cp_async_bulk_g2s(void* smem_dst, const void* gmem_src,
@@ -4953,7 +4969,7 @@ diff --git a/include/flashinfer/attention/sparse_mla_sm89_compat/common/kv_cache
 new file mode 100644
 --- /dev/null
 +++ b/include/flashinfer/attention/sparse_mla_sm89_compat/common/kv_cache_io.cuh
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,126 @@
 +// Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: BSD-3-Clause
 +//
@@ -5042,6 +5058,11 @@ new file mode 100644
 +      int local_idx = idx % pbs;
 +      src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
 +    }
++#if SPARSE_MLA_USE_SM89_PRIMS
++    if constexpr (MT == ModelType::GLM_NOPE) {
++      cp_async_g2s_masked(dst + bi * SMEM_STRIDE, src, COPY_BYTES, indices[bi] >= 0);
++    } else
++#endif
 +    if constexpr (USE_L2_HINT)
 +      cp_async_bulk_g2s_l2hint(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
 +    else
@@ -5833,7 +5854,7 @@ diff --git a/include/flashinfer/attention/sparse_mla_sm89_compat/decode_dsv3_2_k
 new file mode 100644
 --- /dev/null
 +++ b/include/flashinfer/attention/sparse_mla_sm89_compat/decode_dsv3_2_kernel.cuh
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,674 @@
 +// Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: BSD-3-Clause
 +//
@@ -6083,6 +6104,12 @@ new file mode 100644
 +      const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
 +                                 (size_t)local_idx_g * KV::KV_GMEM_STRIDE;
 +      // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
++#if SPARSE_MLA_USE_SM89_PRIMS
++      if constexpr (MT == ModelType::GLM_NOPE) {
++        cp_async_g2s_masked(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
++                            V2_BULK_NOPESC_BYTES, idx_raw >= 0);
++      } else
++#endif
 +      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
 +                        V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));
 +      if constexpr (D_ROPE_C > 0) {

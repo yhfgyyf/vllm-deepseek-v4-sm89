@@ -549,6 +549,11 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
 
 ## 6. GLM-5.3-Flash launch commands
 
+For repetitive output with MTP on SM89, rebuild and install FlashInfer using
+the recipe containing the [#182 fix](docs/models/deepseek_v41_sm89_sm120.md#glm-53-flash-mtp-on-sm89).
+The published FlashInfer vision4 does not contain it. Until updated, add
+`--enforce-eager` as a workaround or disable MTP.
+
 ### 6.1 SM89: 8× RTX 4090 48 GB
 
 The following configuration is based on the community deployment validation

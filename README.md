@@ -556,6 +556,10 @@ vllm serve /path/to/DeepSeek-V4-Flash-Vision-Exp \
 
 ## 6. GLM-5.3-Flash 启动命令
 
+SM89 开启 MTP 后若出现重复乱码，请使用包含 [#182 修复](docs/models/deepseek_v41_sm89_sm120.md#glm-53-flash-mtp-on-sm89)
+的 FlashInfer recipe 重新构建安装；已发布的 FlashInfer vision4 不含此修复。
+更新前可加 `--enforce-eager` 临时绕过，或关闭 MTP。
+
 ### 6.1 SM89：8× RTX 4090 48GB
 
 以下参数参考社区用户在
