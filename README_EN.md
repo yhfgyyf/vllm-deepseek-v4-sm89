@@ -43,7 +43,7 @@ the older vLLM 0.28 / Torch 2.13 / FlashInfer 0.6.18 stack.
 
 ### 2026-11-12
 
-- L20 launch example: TP8/PP1, draft TP8, DSpark7, 0.96 automatic KV and capture48.
+- L20 launch example: TP8/PP1, draft TP8, DSpark7, 0.96 automatic KV, capture48 and A/B/D.
 - Add opt-in SM120 B12X small-batch Attention/mHC/Linear adapters with native fallbacks; GPU integration qualification is pending.
 - This is a source update, not a new wheel or Docker release.
 
@@ -345,9 +345,11 @@ This configuration targets **eight 48 GB SM89 GPUs**, excluding standard 24 GB
 RTX 4090 cards. Defaults are **TP8/PP1, draft TP8, DSpark7 and 0.96 automatic KV**,
 with EP, CED, Engram CPU offload, adaptive and PCIe IPC. The scheduling budget
 is 8192 tokens with at most four sequences.
+The current source baseline enables A/B/D: four-rank indexer query-row sharding,
+paired pure-SWA queries, and inline K32 quantization in `wo_b`.
 
 Use current `main` and its matching FlashInfer recipe patch; the published
-`vision12` / FlashInfer `vision3` wheels do not include the latest L20 tuning.
+`vision14` / FlashInfer `vision4 post1` wheels do not include A/B/D.
 See the [build guide](docs/models/deepseek_v41_sm89_sm120.md#build-the-current-source).
 Engram offload and checkpoint loading require sufficient host memory.
 
@@ -358,6 +360,9 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
 export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
+export VLLM_DSV41_INDEXER_TP4=1
+export FLASHINFER_DSV41_PAIRED_SWA=1
+export VLLM_DSV41_INLINE_WOB_QUANT=1
 # Only historical vision11 artifacts need VLLM_USE_V2_MODEL_RUNNER=1.
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
@@ -399,6 +404,7 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 - Keep `--no-enable-extensible-kv-cache` for conventional automatic KV sizing.
 - Target TP8 requires draft TP8; target TP8 with draft TP4 is unsupported.
 - IPC handles eligible small messages; other messages use the original backend.
+- A/B/D is validated on 8×L20. See the [A/B/D baseline](docs/models/deepseek_v41_l20_baseline.md#accepted-baseline-2026-11-16) for guards, fallbacks and quality/performance limits; RTX 4090 has not been separately qualified.
 - `max-num-seqs=4` is a scheduling limit, not capacity for four full 1M requests.
 - **RTX PRO 6000 / SM120** uses the TP4 template in Section 3. See the
   [SM120 guide](docs/models/deepseek_v41_sm120_b12x.md) for optional B12X versions
@@ -410,7 +416,7 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 | --- | ---: | ---: | ---: |
 | 17,630 → 2,641 | **7,849.510** | **395.850** | **87.135177%** |
 
-The TP8/K7/0.96 configuration above, synthetic copying, three single-request
+This historical TP8/K7/0.96 configuration predates A/B/D: synthetic copying, three single-request
 runs, temperature=0, reasoning_effort=none and zero prefix hits. Prefill = input
 tokens / server prefill seconds; decode = `(output tokens - 1) / server decode
 seconds`; acceptance = accepted/proposed. Actual performance depends on the input

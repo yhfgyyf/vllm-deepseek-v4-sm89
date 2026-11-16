@@ -1,4 +1,14 @@
-# DeepSeek V4.1 L20: current TP8 and historical Q
+# DeepSeek V4.1 L20: A/B/D baseline and historical Q
+
+The selected source baseline is **TP8/K7 with A/B/D (2026-11-16)**, inheriting TP8/PP1,
+draft TP8, K7/adaptive, 0.96 automatic KV and Q's operators/PCIe IPC.
+The README launch commands enable the three
+[accepted A/B/D controls](#accepted-baseline-2026-11-16) below.
+Their library defaults remain off. Build both vLLM and the matching FlashInfer
+recipe from this source; the published vision14 / FlashInfer vision4 post1
+wheels do not contain A/B/D. Source publication does not rebuild those wheels.
+
+## TP8/K7 parent configuration
 
 The selected launch example as of 2026-11-12 is **TP8/PP1 + draft TP8 + DSpark7**,
 retaining Q's K1/K2/K3 and decode PCIe IPC. Both README commands use the
@@ -59,6 +69,83 @@ include restarts and initial JIT work; no return test or interleaved A/B/A was
 performed. This synthetic C1 observation does not establish general-task
 quality, complete C4 performance or long-term stability. Matching phase
 timelines and Top10 analyses remain unavailable for this measurement.
+
+## Accepted baseline (2026-11-16)
+
+The accepted cumulative L20 baseline adds three independent controls to the
+TP8/K7 parent above. The library defaults remain off; the L20 README template
+explicitly enables all three. Enabling a control requires the corresponding
+source and the current FlashInfer recipe patch, and does not change an
+already running service.
+
+```bash
+export VLLM_DSV41_INDEXER_TP4=1
+export FLASHINFER_DSV41_PAIRED_SWA=1
+export VLLM_DSV41_INLINE_WOB_QUANT=1
+```
+
+| Environment variable | Enabled behavior | Guard and fallback |
+| --- | --- | --- |
+| `VLLM_DSV41_INDEXER_TP4=1` | Divide replicated indexer query rows among contiguous four-rank TP subgroups, then gather integer top-k and candidate-block results | Requires TP divisible by four, no context parallelism and no elastic EP. Runs for at least eight rows with index width at least 8192, or at least 128 rows. Smaller workloads use the original path. A smaller draft TP group that does not contain the full subgroup also uses the original path. |
+| `FLASHINFER_DSV41_PAIRED_SWA=1` | Reuse matching physical SWA slots across two queries, with independent masks and inverse RoPE | H=8, no global slots, SWA width 128 or 192; at most 128 tokens on SM89 or 32 on SM120. Other shapes and architectures use the existing mixed-attention implementation. |
+| `VLLM_DSV41_INLINE_WOB_QUANT=1` | Quantize K32 activations inside the existing Ada `wo_b` GEMM | Contiguous BF16 input, no bias, K=1024/N=5120 and 4–128 rows. Prequantized input, other shapes and the SM120 FlashInfer backend retain their original dispatch. |
+
+Set a control to `0` or leave it unset to retain its baseline implementation.
+For distributed runs, give every participating rank the same environment.
+The auxiliary indexer groups follow the existing graph-capture and teardown
+lifecycle. Physical placement follows the configured TP rank order; it does
+not discover or rearrange NUMA topology.
+
+The runtime validation used vision12/FlashInfer vision3 plus exact Q and A/B/D
+Python/Triton overlays. It was not a full wheel build of the source parent.
+Operator numerical checks and changed-input CUDA Graph replay passed, including
+padded cache pages, masks, inverse RoPE, dispatch boundaries and SWA byte offsets
+beyond 2 GiB. The latter regression failed with the initial int32 offset and
+passed after converting cache slots to int64. Final L20 model checks passed
+Chinese text, images, tool round trips, 8 code cases, 32 concurrent code cases
+and retrieval of three identifiers from a 127,050-token input. These are bounded
+checks, not a complete SWE task-accuracy evaluation.
+
+The unprofiled A/B/A comparison completed 108 batches for
+8K/32K/128K input × 512/1024 output × C1/C4, with three trials per condition
+at each of the three service starts. A separate natural-length LongSWE replay
+completed 27 batches using 12 fixed representative instances. Every service
+start warmed the same shapes; measured requests had zero prefix hits and
+preemptions. Startup and warmup are excluded. C1 prefill counts input tokens
+over server prefill time; C4 counts total batch output tokens over wall time,
+including prefill, queueing, decode and drain. At 128K, mean C1 prefill increased
+about 21%, and complete C4 throughput increased about 18.8%/17.5% for 512/1024
+output tokens. Natural replay's longest bucket improved about 29.1%, while its
+shortest bucket regressed about 6.9%; these are cumulative configuration results.
+Same-K decode pairs require accepted/proposed within one percentage point,
+selected without speed-based filtering or reference reuse. Some conditions
+have no matched pair, and aggregate acceptance does not match per-request
+interference.
+
+At 0.96, reported KV capacity changed from 3,439,356 to 3,422,094 tokens
+(-0.50%); automatic sizing and adaptive startup cost calibration remain enabled.
+Two eight-worker 32K/128-output/C1 traces provide bounded phase timelines, but
+event-loss warnings and unresolved communication/CPU attribution prevent a
+complete causal bottleneck claim. Full C4/128K traces are not available.
+SM120 validation is limited to single-device operator replay: only the guarded
+paired-SWA operator is accepted there, with no multi-GPU or full-model claim.
+W4A8, key sharding and Markov fusion were rejected and are not enabled by A/B/D.
+
+Focused GPU regressions in a built checkout with the matching FlashInfer patch:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/kernels/attention/test_dsv41_native_indexer.py \
+  tests/kernels/quantization/test_ada_mxfp8_linear.py \
+  tests/kernels/test_deepseek_v41_native_ops.py \
+  -k 'query_row_partitions or inline_wo_b or paired_swa'
+```
+
+The L4 native-components Buildkite step selects these tests. Multi-rank indexer
+and full-model validation require separate eight-GPU capacity; the single-GPU
+CI step does not establish that coverage. Full per-trial results and rejected
+experiments remain in the workspace record `1cat-optimization-20261116/REPORT.md`.
+The historical Q results below do not describe A/B/D.
 
 ## Historical Q
 

@@ -193,6 +193,128 @@ def _cos(size=128):
     return torch.cat((angles.cos(), angles.sin()), -1)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((8, 9), (12, 0)),
+    reason="native V4.1 attention requires SM89 or SM120",
+)
+@pytest.mark.parametrize("tokens", [1, 2, 7, 32, 33, 128, 129])
+@pytest.mark.parametrize("width", [128, 192])
+def test_paired_swa_preserves_masks_padded_pages_and_replay(monkeypatch, tokens, width):
+    from flashinfer.mla.deepseek_v41 import (
+        _deepseek_v41_mixed_sparse_attention_with_inv_rope as attention,
+    )
+
+    torch.manual_seed(20261116)
+    storage, cache = _cache(16, 32, 528)
+    kv = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    values, scales = _fp8_pack(kv)
+    cache.copy_(torch.cat((values.view(torch.uint8), scales), -1).view_as(cache))
+    q = torch.randn(tokens, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sw = torch.arange(width, device="cuda", dtype=torch.int32)[None].repeat(tokens, 1)
+    sw[1::2] += 1
+    sw[::3, -2:] = -1
+    sw[::4, 0] = 4096
+    if tokens > 2:
+        sw[2].fill_(-1)
+    sinks = torch.randn(8, device="cuda")
+    cs = _cos(tokens + 4)
+    positions = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    old = torch.full((1, tokens + 4, 4096), 37, device="cuda", dtype=q.dtype)
+    new = old.clone()
+
+    def call(output):
+        return attention(
+            q,
+            cache,
+            None,
+            sw,
+            None,
+            512**-0.5,
+            sinks,
+            positions=positions,
+            cos_sin=cs,
+            grouped_out=output,
+            token_offset=2,
+        )
+
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "0")
+    expected = call(old)
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "1")
+    actual = call(new)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    assert (new[:, :2] == 37).all() and (new[:, -2:] == 37).all()
+    assert (storage[:, 32 * 528 :] == 165).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call(new)
+    q.neg_()
+    sw[:, 1] = 400
+    graph.replay()
+    replayed = captured.clone()
+    torch.testing.assert_close(replayed, call(new), rtol=0, atol=0)
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "0")
+    torch.testing.assert_close(replayed, call(old), rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((8, 9), (12, 0)),
+    reason="native V4.1 attention requires SM89 or SM120",
+)
+def test_paired_swa_uses_64bit_cache_offsets(monkeypatch):
+    from flashinfer.mla.deepseek_v41 import (
+        _deepseek_v41_mixed_sparse_attention_with_inv_rope as attention,
+    )
+
+    torch.manual_seed(20261116)
+    # A small logical cache with the final page beyond the signed-int32 limit.
+    page_stride = (1 << 29) + 80
+    storage = torch.empty(4 * page_stride + 32 * 528, device="cuda", dtype=torch.uint8)
+    cache = storage.as_strided((5, 32, 528), (page_stride, 528, 1))
+    kv = torch.randn(160, 512, device="cuda", dtype=torch.bfloat16)
+    values, scales = _fp8_pack(kv)
+    cache.copy_(torch.cat((values.view(torch.uint8), scales), -1).view_as(cache))
+    q = torch.randn(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sw = torch.arange(16, 144, device="cuda", dtype=torch.int32)[None].repeat(2, 1)
+    sw[1] += 1
+    sinks = torch.randn(8, device="cuda")
+    positions = torch.arange(2, device="cuda", dtype=torch.int64)
+    cs = _cos(4)
+
+    def call():
+        return attention(
+            q,
+            cache,
+            None,
+            sw,
+            None,
+            512**-0.5,
+            sinks,
+            positions=positions,
+            cos_sin=cs,
+            grouped_out=q.new_empty(1, 2, 4096),
+            token_offset=0,
+        )
+
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "0")
+    expected = call()
+    torch.accelerator.synchronize()
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "1")
+    actual = call()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    sw[1, -1] = 129
+    graph.replay()
+    replayed = captured.clone()
+    monkeypatch.setenv("FLASHINFER_DSV41_PAIRED_SWA", "0")
+    torch.testing.assert_close(replayed, call(), rtol=0.02, atol=0.02)
+
+
 @triton.jit
 def _convert_pairs(
     x, out, SIZE: tl.constexpr, NATIVE: tl.constexpr, BLOCK: tl.constexpr

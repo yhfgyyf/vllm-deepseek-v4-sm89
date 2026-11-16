@@ -36,7 +36,7 @@
 
 ### 2026-11-12
 
-- L20 启动示例：TP8/PP1、draft TP8、DSpark7、0.96 自动 KV 和 capture48。
+- L20 启动示例：TP8/PP1、draft TP8、DSpark7、0.96 自动 KV、capture48 和 A/B/D 优化。
 - 加入显式启用的 SM120 B12X 小批 Attention/mHC/Linear 适配；原生回退保留，GPU 集成验收待补。
 - 本次为源码更新，未发布包含这些改动的新 wheel 或 Docker 镜像。
 
@@ -357,9 +357,10 @@ stop / 输出上限截断前记录；不等于裁剪后实际验证槽位的接�
 以下配置面向 **8 张 48GB SM89 GPU**，不适用于普通 24GB 版 RTX 4090。
 默认 **TP8/PP1、draft TP8、DSpark7、0.96 自动 KV**，启用 EP、CED、
 Engram CPU offload、adaptive 和 PCIe IPC；调度预算 8192 tokens、最多 4 条序列。
+当前源码基线启用 A/B/D：四卡组内 indexer 行分工、双 query 纯 SWA 复用、wo_b 内 K32 量化。
 
-需要当前 `main` 及配套 FlashInfer recipe patch；已发布的 `vision12` /
-FlashInfer `vision3` wheel 不含最新 L20 算子调优，安装见
+需要当前 `main` 及配套 FlashInfer recipe patch；已发布的 `vision14` /
+FlashInfer `vision4 post1` wheel 尚不含 A/B/D，安装见
 [构建说明](docs/models/deepseek_v41_sm89_sm120.md#build-the-current-source)。
 Engram CPU offload 与 checkpoint 加载需要充足的主机内存。
 
@@ -370,6 +371,9 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9
 export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
+export VLLM_DSV41_INDEXER_TP4=1
+export FLASHINFER_DSV41_PAIRED_SWA=1
+export VLLM_DSV41_INLINE_WOB_QUANT=1
 # 仅旧 vision11 制品需要 VLLM_USE_V2_MODEL_RUNNER=1；当前源码无需设置。
 unset TRITON_PTXAS_BLACKWELL_PATH
 unset VLLM_PP_LAYER_PARTITION
@@ -411,6 +415,7 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 - 保留 `--no-enable-extensible-kv-cache`，使用常规自动 KV 分配。
 - target TP8 的 draft 也必须为 TP8；不支持 target TP8 + draft TP4。
 - IPC 用于适用的小消息，其他消息使用原通信后端。
+- A/B/D 已在 8×L20 验收；门控、回退及质量/性能范围见 [A/B/D 基线](docs/models/deepseek_v41_l20_baseline.md#accepted-baseline-2026-11-16)。RTX 4090 未另行验收。
 - `max-num-seqs=4` 是调度上限，不保证四条满 1M 请求同时驻留。
 - **RTX PRO 6000 / SM120** 使用第 3 节的 TP4 模板；可选 B12X 的版本和开关见
   [SM120 说明](docs/models/deepseek_v41_sm120_b12x.md)，新适配的 GPU 集成验证仍待完成。
@@ -421,7 +426,7 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 | --- | ---: | ---: | ---: |
 | 17,630 → 2,641 | **7,849.510** | **395.850** | **87.135177%** |
 
-上述 TP8/K7/0.96 配置，合成复制负载，3 次单请求，temperature=0、
+这是尚未启用 A/B/D 的历史 TP8/K7/0.96 配置，合成复制负载，3 次单请求，temperature=0、
 reasoning_effort=none、前缀命中为零。Prefill = 输入 tokens / 服务端 prefill 秒数；
 decode = `(输出 tokens - 1) / 服务端 decode 秒数`；命中率 = accepted/proposed。
 实际任务表现取决于输入与接受率，详细口径见 [L20 说明](docs/models/deepseek_v41_l20_baseline.md#k7-single-request-measurement)。

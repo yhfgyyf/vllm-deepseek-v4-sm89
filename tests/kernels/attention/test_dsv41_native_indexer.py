@@ -1044,6 +1044,70 @@ def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
+@requires_dsv41_gpu
+@pytest.mark.parametrize("rows", [0, 1, 3, 4, 7, 8, 31, 32])
+def test_query_row_partitions_preserve_request_mapping(rows: int) -> None:
+    """A shard beginning inside a speculative block must use the original request."""
+    torch.manual_seed(73)
+    repeat, width, page_size = 3, 529, 128
+    batch = max(1, (rows + repeat - 1) // repeat)
+    q = torch.randn(rows, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn(batch, width, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q_values, q_scales = _quantize_mxfp4(q)
+    pages = (width + page_size - 1) // page_size
+    tables = torch.arange(batch * pages, device="cuda", dtype=torch.int32).reshape(
+        batch, pages
+    )
+    cache, _ = _make_cache(keys, page_size, tables)
+    weights = torch.randn(rows, HEADS, device="cuda", dtype=torch.float32)
+    ends = (width - torch.arange(rows, device="cuda") % 13).to(torch.int32)
+    candidates = torch.arange(67, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    if rows:
+        ends[-1] = 0
+        candidates[:, 0] = -1
+    dense = dsv41_mxfp4_dense_logits(
+        q_values, q_scales, cache, weights, tables, ends, width, row_repeat=repeat
+    )
+    compact = dsv41_mxfp4_candidate_logits(
+        q_values,
+        q_scales,
+        cache,
+        weights,
+        tables,
+        ends,
+        candidates,
+        row_repeat=repeat,
+    )
+    for owner in range(4):
+        per_rank = (rows + 3) // 4
+        start, stop = min(owner * per_rank, rows), min((owner + 1) * per_rank, rows)
+        sliced = slice(start, stop)
+        actual = dsv41_mxfp4_dense_logits(
+            q_values[sliced],
+            q_scales[sliced],
+            cache,
+            weights[sliced],
+            tables,
+            ends[sliced],
+            width,
+            row_repeat=repeat,
+            row_offset=start,
+        )
+        actual_candidates = dsv41_mxfp4_candidate_logits(
+            q_values[sliced],
+            q_scales[sliced],
+            cache,
+            weights[sliced],
+            tables,
+            ends[sliced],
+            candidates[sliced],
+            row_repeat=repeat,
+            row_offset=start,
+        )
+        assert _same_bits(actual, dense[sliced])
+        assert _same_bits(actual_candidates, compact[sliced])
+
+
 def _all_logit_paths():
     """Dense and candidate logits for decode (next_n = 4) and packed prefill."""
     outputs = []

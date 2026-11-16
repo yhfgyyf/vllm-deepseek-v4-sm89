@@ -691,6 +691,9 @@ steps:
   - tools/recipes/patches/flashinfer-0.7.3-deepseek-v41-native.patch
   - tools/recipes/patches/flashinfer-0.7.3-sm89-glm-compat.patch
   - tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+  - tests/kernels/attention/test_dsv41_native_indexer.py
+  - tests/kernels/quantization/test_ada_mxfp8_linear.py
+  - tests/kernels/test_deepseek_v41_native_ops.py
   commands:
   - git clone --recursive --depth 1 --branch v0.7.3 https://github.com/flashinfer-ai/flashinfer.git /tmp/flashinfer-dsv41
   - test "$(git -C /tmp/flashinfer-dsv41 rev-parse HEAD)" = 775207deb34055667df89ed618fb4b06fc84de74
@@ -706,3 +709,9 @@ steps:
     tests/models/deepseek_v4_1
     tests/v1/cudagraph/test_dsv4_adaptive_fullgraph.py
     tests/v1/worker/test_pp_utils.py
+  - >-
+    pytest -v -s
+    tests/kernels/attention/test_dsv41_native_indexer.py
+    tests/kernels/quantization/test_ada_mxfp8_linear.py
+    tests/kernels/test_deepseek_v41_native_ops.py
+    -k 'query_row_partitions or inline_wo_b or paired_swa'
