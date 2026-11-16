@@ -1609,6 +1609,15 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_INDEXER: GroupCoordinator | None = None
+
+
+def get_indexer_group() -> GroupCoordinator | None:
+    """Return the optional four-rank group for replicated V4.1 index queries."""
+    if _INDEXER is None or _TP is None:
+        return None
+    # A smaller draft TP group may execute on only part of this subgroup.
+    return _INDEXER if set(_INDEXER.ranks).issubset(_TP.ranks) else None
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -1745,6 +1754,7 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
     from vllm.platforms import current_platform
 
     tp, pp, dp = get_tp_group(), get_pp_group(), get_dp_group()
+    indexer = get_indexer_group()
     context = GraphCaptureContext(stream or torch.cuda.Stream(device=device))
     # Let AITER all-reduce register captured buffers instead of copying them.
     # Not with DP AITER collectives: they reduce workspaces allocated earlier.
@@ -1758,6 +1768,7 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
         tp.graph_capture(context),
         pp.graph_capture(context),
         dp.graph_capture(context),
+        indexer.graph_capture(context) if indexer is not None else nullcontext(),
     ):
         yield context
 
@@ -2216,6 +2227,28 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
+    global _INDEXER
+    assert _INDEXER is None, "indexer group is already initialized"
+    if envs.VLLM_DSV41_INDEXER_TP4:
+        if (
+            enable_elastic_ep
+            or tensor_model_parallel_size % 4
+            or decode_context_model_parallel_size != 1
+            or prefill_context_model_parallel_size != 1
+        ):
+            raise ValueError("V4.1 indexer TP4 requires TP divisible by 4 and no CP")
+        indexer_ranks = [
+            ranks[start : start + 4]
+            for ranks in group_ranks
+            for start in range(0, len(ranks), 4)
+        ]
+        _INDEXER = init_model_parallel_group(
+            indexer_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dsv41_indexer",
+        )
+
     global _ETP
     assert _ETP is None, "Engram tensor-parallel group is already initialized"
     engram_tensor_parallel_size = (
@@ -2529,6 +2562,11 @@ def get_node_count() -> int:
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP, _ETP
+
+    global _INDEXER
+    if _INDEXER:
+        _INDEXER.destroy()
+    _INDEXER = None
 
     if _ETP and _ETP is not _TP:
         _ETP.destroy()

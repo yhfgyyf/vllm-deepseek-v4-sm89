@@ -126,6 +126,7 @@ def _mxfp4_indexer_logits_kernel(
     width,
     PAGE_SIZE: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
+    ROW_OFFSET: tl.constexpr,
     PREFILL: tl.constexpr,
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_STRIDE_ROW: tl.constexpr,
@@ -155,7 +156,7 @@ def _mxfp4_indexer_logits_kernel(
             first_col = tl.minimum(start, width)
             stop = tl.minimum(end, width)
     else:
-        req = row // ROW_REPEAT
+        req = (row + ROW_OFFSET) // ROW_REPEAT
         end = tl.load(row_ends + row)
         first_col = 0
         stop = width if USE_CANDIDATES else tl.minimum(end, width)
@@ -545,6 +546,7 @@ def dsv41_mxfp4_dense_logits(
     cu_seq_lens: torch.Tensor | None = None,
     token_to_seq: torch.Tensor | None = None,
     row_repeat: int = 1,
+    row_offset: int = 0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dense V4.1 index scores directly from segregated MXFP4 pages."""
@@ -597,6 +599,7 @@ def dsv41_mxfp4_dense_logits(
         width,
         PAGE_SIZE=k_cache.shape[1],
         ROW_REPEAT=row_repeat,
+        ROW_OFFSET=row_offset,
         PREFILL=prefill,
         USE_CANDIDATES=False,
         CANDIDATE_STRIDE_ROW=0,
@@ -622,6 +625,7 @@ def dsv41_mxfp4_candidate_logits(
     cu_seq_lens: torch.Tensor | None = None,
     token_to_seq: torch.Tensor | None = None,
     row_repeat: int = 1,
+    row_offset: int = 0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score only the token positions named by request-local candidate blocks."""
@@ -679,6 +683,7 @@ def dsv41_mxfp4_candidate_logits(
         width,
         PAGE_SIZE=k_cache.shape[1],
         ROW_REPEAT=row_repeat,
+        ROW_OFFSET=row_offset,
         PREFILL=prefill,
         USE_CANDIDATES=True,
         CANDIDATE_STRIDE_ROW=candidates.stride(0),

@@ -1072,12 +1072,13 @@ diff --git a/flashinfer/mla/deepseek_v41.py b/flashinfer/mla/deepseek_v41.py
 new file mode 100644
 --- /dev/null
 +++ b/flashinfer/mla/deepseek_v41.py
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,952 @@
 +"""Native mixed sparse MLA for DeepSeek-V4.1 Flash."""
 +
 +from __future__ import annotations
 +
 +import functools
++import os
 +from dataclasses import dataclass
 +
 +import torch
@@ -1500,6 +1501,37 @@ new file mode 100644
 +        grouped_out: torch.Tensor,
 +        token_offset: int,
 +    ) -> None:
++        if (
++            os.environ.get("FLASHINFER_DSV41_PAIRED_SWA", "0") == "1"
++            and q.shape[1] == 8
++            and q.shape[0] <= 128
++            and (
++                q.shape[0] <= 32
++                or torch.cuda.get_device_capability(q.device) == (8, 9)
++            )
++            and not has_global
++            and swa_slots.shape[1] in (128, 192)
++        ):
++            from ._deepseek_v41_paired_swa_triton import paired_swa_with_inv_rope
++
++            paired_swa_with_inv_rope(
++                q,
++                swa_cache,
++                swa_slots,
++                sinks,
++                partial_out,
++                partial_lse,
++                positions,
++                cos_sin,
++                grouped_out,
++                sm_scale,
++                num_splits,
++                swa_page_size,
++                swa_page_stride,
++                swa_row_stride,
++                token_offset,
++            )
++            return
 +        module.deepseek_v41_mixed_sparse_attention_with_inv_rope(
 +            q,
 +            swa_cache,
@@ -4778,4 +4810,316 @@ new file mode 100644
 +            grouped_out=grouped_out,
 +            token_offset=0,
 +            workspace=workspace,
++        )
+diff --git a/flashinfer/mla/_deepseek_v41_paired_swa_triton.py b/flashinfer/mla/_deepseek_v41_paired_swa_triton.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/mla/_deepseek_v41_paired_swa_triton.py
+@@ -0,0 +1,307 @@
++"""Reuse matching SWA cache slots across two eight-head query rows."""
++
++import triton
++import triton.language as tl
++
++from ._deepseek_v41_sparse_triton import _load_global_tile, _load_swa_tile
++
++
++@triton.jit
++def _step(q, kv, mask, m, l, acc, scale):
++    scores = tl.dot(q, tl.trans(kv)) * scale
++    scores = tl.where(mask, scores, -float("inf"))
++    active = tl.sum(mask.to(tl.int32), 1) > 0
++    next_m = tl.where(active, tl.maximum(m, tl.max(scores, 1)), m)
++    alpha = tl.exp2(tl.where(active, m - next_m, 0.0) * 1.4426950408889634)
++    p = tl.where(
++        mask,
++        tl.exp2(tl.where(mask, scores - next_m[:, None], 0.0) * 1.4426950408889634),
++        0.0,
++    )
++    acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
++    return next_m, l * alpha + tl.sum(p, 1), acc
++
++
++@triton.jit
++def _paired(
++    q,
++    swa,
++    glob,
++    sw,
++    gl,
++    sinks,
++    partial,
++    lse,
++    positions,
++    cos_sin,
++    grouped,
++    T: tl.constexpr,
++    SW: tl.constexpr,
++    GL: tl.constexpr,
++    SW_STRIDE: tl.constexpr,
++    GL_STRIDE: tl.constexpr,
++    SW_BYTES: tl.constexpr,
++    GL_BYTES: tl.constexpr,
++    SW_PAGE: tl.constexpr,
++    GL_PAGE: tl.constexpr,
++    SW_PAGE_STRIDE: tl.constexpr,
++    GL_PAGE_STRIDE: tl.constexpr,
++    SW_ROW_STRIDE: tl.constexpr,
++    GL_ROW_STRIDE: tl.constexpr,
++    S: tl.constexpr,
++    SCALE: tl.constexpr,
++    BN: tl.constexpr,
++    SW_BLOCK: tl.constexpr,
++    INV: tl.constexpr,
++    COS_STRIDE: tl.constexpr,
++    COS_ROWS: tl.constexpr,
++    TOTAL_TOKENS: tl.constexpr,
++    TOKEN_OFFSET: tl.constexpr,
++):
++    first = tl.program_id(0) * 2
++    second = first + 1
++    split = tl.program_id(1)
++    h = tl.arange(0, 16)
++    d = tl.arange(0, 512)
++    token = first + h // 8
++    valid_h = token < T
++    qtile = tl.load(
++        q + token[:, None] * 4096 + (h[:, None] % 8) * 512 + d[None, :],
++        valid_h[:, None],
++        other=0,
++    )
++    m = tl.full((16,), -float("inf"), tl.float32)
++    l = tl.zeros((16,), tl.float32)
++    acc = tl.zeros((16, 512), tl.float32)
++    o = tl.arange(0, BN)
++    all_sw = tl.arange(0, SW_BLOCK)
++    row0 = tl.load(sw + first * SW_STRIDE + all_sw, all_sw < SW, other=-1)
++    row1 = tl.load(
++        sw + second * SW_STRIDE + all_sw, (second < T) & (all_sw < SW), other=-1
++    )
++    first0 = tl.load(sw + first * SW_STRIDE)
++    first1 = tl.load(sw + second * SW_STRIDE, second < T, other=-1)
++    forward = tl.min(tl.where((row0 == first1) & (first1 >= 0), all_sw, SW_BLOCK))
++    backward = tl.min(tl.where((row1 == first0) & (first0 >= 0), all_sw, SW_BLOCK))
++    shift = tl.where(
++        forward < SW, forward, tl.where(backward < SW, -backward, SW_BLOCK * 2)
++    )
++    for tile in range(split, tl.cdiv(SW, BN), S):
++        j = tile * BN + o
++        # Paged cache byte offsets can exceed signed int32 even for few queries.
++        s0 = tl.load(sw + first * SW_STRIDE + j, j < SW, other=-1).to(tl.int64)
++        j1 = j - shift
++        s1 = tl.load(
++            sw + second * SW_STRIDE + j1, (second < T) & (j1 >= 0) & (j1 < SW), other=-2
++        )
++        kv, valid = _load_swa_tile(
++            swa, s0, j < SW, SW_BYTES, SW_PAGE_STRIDE, SW_ROW_STRIDE, SW_PAGE, BN
++        )
++        mask = (
++            valid_h[:, None]
++            & valid[None, :]
++            & ((h[:, None] < 8) | (s0[None, :] == s1[None, :]))
++        )
++        m, l, acc = _step(qtile, kv, mask, m, l, acc, SCALE)
++        extra = tl.load(
++            sw + second * SW_STRIDE + j, (second < T) & (j < SW), other=-1
++        ).to(tl.int64)
++        j0 = j + shift
++        source = tl.load(sw + first * SW_STRIDE + j0, (j0 >= 0) & (j0 < SW), other=-2)
++        extra_mask = (second < T) & (j < SW) & (extra >= 0) & (extra != source)
++        if tl.sum(extra_mask.to(tl.int32), 0) > 0:
++            kv, valid = _load_swa_tile(
++                swa,
++                extra,
++                extra_mask,
++                SW_BYTES,
++                SW_PAGE_STRIDE,
++                SW_ROW_STRIDE,
++                SW_PAGE,
++                BN,
++            )
++            mask = valid_h[:, None] & (h[:, None] >= 8) & valid[None, :]
++            m, l, acc = _step(qtile, kv, mask, m, l, acc, SCALE)
++    if GL:
++        for tile in range(split, tl.cdiv(GL, BN), S):
++            j = tile * BN + o
++            for side in tl.static_range(2):
++                t = first + side
++                slots = tl.load(
++                    gl + t * GL_STRIDE + j, (t < T) & (j < GL), other=-1
++                ).to(tl.int64)
++                kv, valid = _load_global_tile(
++                    glob,
++                    slots,
++                    (t < T) & (j < GL),
++                    GL_BYTES,
++                    GL_PAGE_STRIDE,
++                    GL_ROW_STRIDE,
++                    GL_PAGE,
++                    BN,
++                )
++                mask = valid_h[:, None] & (h[:, None] // 8 == side) & valid[None, :]
++                m, l, acc = _step(qtile, kv, mask, m, l, acc, SCALE)
++    if split == 0:
++        sink = tl.load(sinks + h % 8)
++        has = (sink > -float("inf")) & valid_h
++        nm = tl.where(has, tl.maximum(m, sink), m)
++        alpha = tl.exp2(tl.where(has, m - nm, 0.0) * 1.4426950408889634)
++        p = tl.where(
++            has, tl.exp2(tl.where(has, sink - nm, 0.0) * 1.4426950408889634), 0.0
++        )
++        acc *= alpha[:, None]
++        l = l * alpha + p
++        m = nm
++    value = tl.where(l[:, None] > 0, acc / tl.where(l > 0, l, 1.0)[:, None], 0.0)
++    if INV and S == 1:
++        rounded = value.to(tl.bfloat16).to(tl.float32)
++        mate = tl.gather(rounded, tl.broadcast_to((d ^ 1)[None, :], (16, 512)), 1)
++        position = tl.load(positions + token, valid_h, other=-1)
++        rotate = (
++            valid_h[:, None]
++            & (position[:, None] >= 0)
++            & (position[:, None] < COS_ROWS)
++            & (d[None, :] >= 448)
++        )
++        pair = tl.maximum((d - 448) // 2, 0)
++        cs = cos_sin + position[:, None].to(tl.int64) * COS_STRIDE
++        cosine = tl.load(cs + pair[None, :], rotate, other=1.0)
++        sine = tl.load(cs + pair[None, :] + 32, rotate, other=0.0)
++        rotated = rounded * cosine + tl.where(
++            (d[None, :] & 1) == 0, mate * sine, -mate * sine
++        )
++        tl.store(
++            grouped
++            + ((token[:, None] + TOKEN_OFFSET) * 8 + h[:, None] % 8) * 512
++            + d[None, :],
++            rotated,
++            valid_h[:, None],
++        )
++    else:
++        tl.store(
++            partial
++            + ((token[:, None] * S + split) * 8 + h[:, None] % 8) * 512
++            + d[None, :],
++            value,
++            valid_h[:, None],
++        )
++    lv = tl.where(l > 0, m + tl.log(l), -float("inf"))
++    tl.store(lse + (token * S + split) * 8 + h % 8, lv, valid_h)
++
++
++@triton.jit
++def _merge_inverse(
++    partial,
++    lse,
++    positions,
++    cos_sin,
++    out,
++    S: tl.constexpr,
++    SB: tl.constexpr,
++    COS_STRIDE: tl.constexpr,
++    COS_ROWS: tl.constexpr,
++    TOKEN_OFFSET: tl.constexpr,
++):
++    t, h = tl.program_id(0), tl.program_id(1)
++    s = tl.arange(0, SB)
++    d = tl.arange(0, 512)
++    ls = tl.load(lse + (t * S + s) * 8 + h, s < S, other=-float("inf"))
++    mx = tl.max(ls, 0)
++    w = tl.where(
++        mx > -float("inf"),
++        tl.exp2((ls - tl.where(mx > -float("inf"), mx, 0.0)) * 1.4426950408889634),
++        0.0,
++    )
++    p = tl.load(
++        partial + ((t * S + s[:, None]) * 8 + h) * 512 + d[None, :],
++        s[:, None] < S,
++        other=0.0,
++    ).to(tl.float32)
++    den = tl.sum(w, 0)
++    value = (
++        tl.where(den > 0, tl.sum(p * w[:, None], 0) / tl.where(den > 0, den, 1.0), 0.0)
++        .to(tl.bfloat16)
++        .to(tl.float32)
++    )
++    mate = tl.gather(value, d ^ 1, 0)
++    pos = tl.load(positions + t).to(tl.int64)
++    mask = (pos >= 0) & (pos < COS_ROWS) & (d >= 448)
++    pair = tl.maximum((d - 448) // 2, 0)
++    c = tl.load(cos_sin + pos * COS_STRIDE + pair, mask, other=1.0)
++    sine = tl.load(cos_sin + pos * COS_STRIDE + pair + 32, mask, other=0.0)
++    rotated = value * c + tl.where((d & 1) == 0, mate * sine, -mate * sine)
++    tl.store(out + ((t + TOKEN_OFFSET) * 8 + h) * 512 + d, rotated)
++
++
++def paired_swa_with_inv_rope(
++    q,
++    swa,
++    sw,
++    sinks,
++    partial,
++    lse,
++    positions,
++    cos_sin,
++    grouped_out,
++    sm_scale,
++    num_splits,
++    swa_page_size,
++    swa_page_stride,
++    swa_row_stride,
++    token_offset,
++):
++    tokens = q.shape[0]
++    _paired[(triton.cdiv(tokens, 2), num_splits)](
++        q,
++        swa,
++        swa,
++        sw,
++        sw,
++        sinks,
++        partial,
++        lse,
++        positions,
++        cos_sin,
++        grouped_out,
++        tokens,
++        sw.shape[1],
++        0,
++        sw.stride(0),
++        sw.stride(0),
++        swa.numel(),
++        swa.numel(),
++        swa_page_size,
++        swa_page_size,
++        swa_page_stride,
++        swa_page_stride,
++        swa_row_stride,
++        swa_row_stride,
++        num_splits,
++        sm_scale,
++        32,
++        triton.next_power_of_2(sw.shape[1]),
++        True,
++        cos_sin.stride(0),
++        cos_sin.shape[0],
++        grouped_out.shape[1],
++        token_offset,
++        num_warps=8,
++        num_stages=2,
++        enable_fp_fusion=False,
++    )
++    if num_splits > 1:
++        _merge_inverse[(tokens, 8)](
++            partial,
++            lse,
++            positions,
++            cos_sin,
++            grouped_out,
++            num_splits,
++            triton.next_power_of_2(num_splits),
++            cos_sin.stride(0),
++            cos_sin.shape[0],
++            token_offset,
++            num_warps=4,
++            enable_fp_fusion=False,
 +        )

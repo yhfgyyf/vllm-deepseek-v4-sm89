@@ -82,3 +82,43 @@ def test_ada_mxfp8_small_rows_numerics_and_mutable_graph(
     torch.testing.assert_close(
         captured, kernel.apply_weights(layer, x, bias), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("rows", [1, 3, 4, 7, 32, 128, 129])
+@torch.inference_mode()
+def test_inline_wo_b_quant_preserves_output_and_fresh_graph(monkeypatch, rows):
+    """Consumer fusion retains the existing K32 quantization and BF16 result."""
+    torch.manual_seed(20261116)
+    k, n = 1024, 5120
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    wq, ws = _mxfp8_e4m3_quantize_torch(weight, min_amax=1e-4)
+    layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
+    layer.weight = torch.nn.Parameter(wq, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(ws, requires_grad=False)
+    kernel = AdaMxfp8LinearKernel(
+        Mxfp8LinearLayerConfig(weight_shape=(n, k), model_profile="deepseek_v41")
+    )
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    x[0, :32] = 0
+    x[0, 32:64] = 1e-4
+    monkeypatch.setenv("VLLM_DSV41_INLINE_WOB_QUANT", "0")
+    expected = kernel.apply_weights(layer, x)
+    monkeypatch.setenv("VLLM_DSV41_INLINE_WOB_QUANT", "1")
+    actual = kernel.apply_weights(layer, x)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = kernel.apply_weights(layer, x)
+    x.neg_()
+    graph.replay()
+    monkeypatch.setenv("VLLM_DSV41_INLINE_WOB_QUANT", "0")
+    torch.testing.assert_close(captured, kernel.apply_weights(layer, x), rtol=0, atol=0)
+    strided = torch.stack((x, x), dim=-1)[..., 0]
+    expected = kernel.apply_weights(layer, strided)
+    monkeypatch.setenv("VLLM_DSV41_INLINE_WOB_QUANT", "1")
+    torch.testing.assert_close(
+        kernel.apply_weights(layer, strided), expected, rtol=0, atol=0
+    )

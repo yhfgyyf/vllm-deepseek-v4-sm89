@@ -121,6 +121,25 @@ def test_glm_nope_packed_cache_decode_and_graph_replay(
     graph.replay()
     torch.testing.assert_close(output, changed, atol=5e-2, rtol=5e-2)
 
+    # No selected index references row 0 after the replay update. Padding must
+    # not read its FP8 data or scales: 0 * NaN still contaminates the reduction.
+    unpoisoned_output = output.clone()
+    null_row = rows[0].clone()
+    for poison_data in (True, False):
+        rows[0].copy_(null_row)
+        if poison_data:
+            rows[0, :512].fill_(0x7F)  # E4M3 NaN payload.
+        else:
+            rows[0, 512:].view(torch.float32).fill_(float("nan"))
+        run()
+        torch.testing.assert_close(output, unpoisoned_output, atol=0, rtol=0)
+        graph.replay()
+        torch.testing.assert_close(output, unpoisoned_output, atol=0, rtol=0)
+
+    indices.fill_(-1)
+    graph.replay()
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
 
 def _fake_vllm_config(
     model_type: str,

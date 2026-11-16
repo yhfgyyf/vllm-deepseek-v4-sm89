@@ -100,6 +100,36 @@ from the same revision. Kernel symbols and JIT paths use an isolated namespace;
 SM120 continues to use the official 0.7.3 attention kernels. The vLLM adapter
 translates the former NoPE scale-format name to the current API.
 
+## GLM-5.3-Flash MTP on SM89
+
+[Issue #182](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/182)
+was reproduced on 8×L20 with vLLM vision14, FlashInfer vision4 and Torch 2.14:
+MTP with CUDA Graph produced repetitive `handle` output, while eager execution
+and disabling MTP returned normal answers. Invalid sparse indices (`-1`)
+could read cache row 0; NaN FP8 data in that unrelated row contaminated the
+value reduction despite the attention-score mask.
+
+The current `flashinfer-0.7.3-sm89-glm-compat.patch` zero-fills invalid
+GLM NoPE entries in the SM89 decode and prefill loaders. Rebuild **FlashInfer**
+with both patches using the instructions above; updating only vLLM does not
+apply this fix. The published FlashInfer vision4 predates it. Restart the
+server after installing the rebuilt package so JIT loads the updated kernels.
+For the existing release, `--enforce-eager` is a validated K1 workaround;
+disabling MTP is another option.
+
+The regression covers FP8/scale NaNs in an unselected cache row, completely
+masked rows, decode/prefill dispatch, and CUDA Graph replay with changed inputs.
+All 75 tests in `tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py`
+passed on L20. K1 and K5 with default Graph passed bounded Chinese, English,
+code, JSON, tool and retrieval checks at concurrency 1 and 4. Both scored
+27/32 on the fixed GSM8K sample, versus 28/32 without MTP and with original K1 eager;
+all completed normally. These checks do not establish full task accuracy or
+token-for-token equivalence. SM120 was not retested for this change.
+
+The 200K/250K prefill OOM reported in the same issue is a separate capacity
+limitation, not covered by this fix. A configured `--max-model-len 262144`
+does not guarantee enough activation memory for every request at that length.
+
 ## Serving configuration
 
 The current L20 command uses target TP8 / PP1, draft TP8, DSpark7,

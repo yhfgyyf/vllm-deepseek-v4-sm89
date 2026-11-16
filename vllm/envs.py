@@ -198,6 +198,8 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPSEEK_V41_B12X: bool = False
+    VLLM_DSV41_INDEXER_TP4: bool = False
+    VLLM_DSV41_INLINE_WOB_QUANT: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1748,6 +1750,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental, shape-gated V4.1 SM120 adapters; requires the documented pin.
     "VLLM_DEEPSEEK_V41_B12X": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_B12X", "0"))
+    ),
+    # Split replicated V4.1 indexer rows within contiguous four-rank TP groups.
+    "VLLM_DSV41_INDEXER_TP4": lambda: bool(
+        int(os.getenv("VLLM_DSV41_INDEXER_TP4", "0"))
+    ),
+    "VLLM_DSV41_INLINE_WOB_QUANT": lambda: bool(
+        int(os.getenv("VLLM_DSV41_INLINE_WOB_QUANT", "0"))
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(

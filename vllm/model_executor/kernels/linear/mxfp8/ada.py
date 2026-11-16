@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native K32 MXFP8 linear kernel for Ada (SM89)."""
 
+from typing import cast
+
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -39,6 +42,7 @@ def _ada_mxfp8_k32_linear_kernel(
     SPLIT_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    QUANTIZE_INPUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     split_id = tl.program_id(1)
@@ -58,17 +62,25 @@ def _ada_mxfp8_k32_linear_kernel(
             mask=mask_m[:, None],
             other=0.0,
         )
+        if QUANTIZE_INPUT:
+            values = x.to(tl.float32)
+            amax = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-4)
+            x_scale_exp = tl.minimum(
+                tl.maximum(tl.ceil(tl.log2(amax / 448.0)) + 127.0, 0.0), 254.0
+            )
+            x = (values * tl.exp2(127.0 - x_scale_exp[:, None])).to(tl.float8e4nv)
         weight = tl.load(
             w_ptr + offs_k[:, None] * N + offs_n[None, :],
             mask=mask_n[None, :],
             other=0.0,
         )
         group = k_start // 32
-        x_scale_exp = tl.load(
-            x_scale_ptr + offs_m * (K // 32) + group,
-            mask=mask_m,
-            other=0,
-        ).to(tl.float32)
+        if not QUANTIZE_INPUT:
+            x_scale_exp = tl.load(
+                x_scale_ptr + offs_m * (K // 32) + group,
+                mask=mask_m,
+                other=0,
+            ).to(tl.float32)
         w_scale_exp = tl.load(
             w_scale_ptr + offs_n * (K // 32) + group,
             mask=mask_n,
@@ -255,7 +267,21 @@ class AdaMxfp8LinearKernel(Mxfp8LinearKernel):
     ) -> torch.Tensor:
         input_size = layer._ada_mxfp8_input_size
         output_size = layer._ada_mxfp8_output_size
-        xq, x_scale, output_dtype, input_shape = self._quantize_input(x, input_size)
+        inline_quant = (
+            envs.VLLM_DSV41_INLINE_WOB_QUANT
+            and isinstance(x, torch.Tensor)
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and bias is None
+            and (input_size, output_size) == (1024, 5120)
+            and 4 <= x.numel() // input_size <= 128
+        )
+        if inline_quant:
+            x = cast(torch.Tensor, x)
+            xq = x.reshape(-1, input_size)
+            x_scale, output_dtype, input_shape = None, x.dtype, x.shape
+        else:
+            xq, x_scale, output_dtype, input_shape = self._quantize_input(x, input_size)
         rows = xq.shape[0]
         output = torch.empty((rows, output_size), dtype=output_dtype, device=xq.device)
         block_m, block_n, split_k = self._launch_config(rows, input_size, output_size)
@@ -284,6 +310,7 @@ class AdaMxfp8LinearKernel(Mxfp8LinearKernel):
             SPLIT_K=split_k,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            QUANTIZE_INPUT=inline_quant,
             num_warps=4,
         )
         if split_k > 1:

@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -19,6 +20,7 @@ from vllm.config import (
 )
 from vllm.distributed import (
     get_dcp_group,
+    get_indexer_group,
     get_pcp_group,
 )
 from vllm.forward_context import get_forward_context
@@ -603,6 +605,43 @@ def _dsv41_rows_per_chunk(
     return rows
 
 
+@contextmanager
+def _dsv41_shard_rows(topk, candidates, candidate_write, width):
+    """Compute disjoint rows, then replicate only integer index results."""
+    group = get_indexer_group()
+    rows, k = topk.shape
+    if group is None or rows < 8 or (width < 8192 and rows < 128):
+        yield 0, rows, topk, candidates
+        return
+    rows_per_rank = (rows + group.world_size - 1) // group.world_size
+    start = min(group.rank_in_group * rows_per_rank, rows)
+    stop = min(start + rows_per_rank, rows)
+    candidate_width = candidates.shape[1] if candidate_write else 0
+    local = torch.full(
+        (rows_per_rank * (k + candidate_width),),
+        -1,
+        dtype=topk.dtype,
+        device=topk.device,
+    )
+    # Native top-k writes contiguous rows, so do not interleave the two outputs.
+    topk_elements = rows_per_rank * k
+    local_topk = local[:topk_elements].view(rows_per_rank, k)[: stop - start]
+    local_candidates = (
+        local[topk_elements:].view(rows_per_rank, candidate_width)[: stop - start]
+        if candidate_write
+        else candidates[start:stop]
+        if candidates is not None
+        else None
+    )
+    yield start, stop, local_topk, local_candidates
+    gathered = group.all_gather(local, dim=0).view(group.world_size, -1)
+    topk.copy_(gathered[:, :topk_elements].reshape(-1, k)[:rows])
+    if candidate_write:
+        candidates.copy_(
+            gathered[:, topk_elements:].reshape(-1, candidate_width)[:rows]
+        )
+
+
 def _dsv41_native_indexer(
     attn_metadata: DeepseekV32IndexerMetadata,
     kv_cache: torch.Tensor,
@@ -657,83 +696,91 @@ def _dsv41_native_indexer(
                 token_start = chunk.token_start + row_offset
                 token_end = min(token_start + rows_per_chunk, chunk.token_end)
                 rows = token_end - token_start
-                local_rows = slice(row_offset, row_offset + rows)
-                q_values = q_quant[token_start:token_end]
-                q_scales = q_scale[token_start:token_end]
-                chunk_weights = weights[token_start:token_end]
-                topk_indices = topk_indices_buffer[token_start:token_end, :topk_tokens]
-                chunk_candidates = (
+                all_topk = topk_indices_buffer[token_start:token_end, :topk_tokens]
+                all_candidates = (
                     candidate_blocks[token_start:token_end]
                     if candidate_blocks is not None
                     else None
                 )
-                logits_out = logits_scratch[: rows * width].view(rows, width)
-                if reads_candidates:
-                    assert chunk_candidates is not None
-                    logits = dsv41_mxfp4_candidate_logits(
+                with _dsv41_shard_rows(
+                    all_topk, all_candidates, candidate_write, width
+                ) as (first, last, topk_indices, chunk_candidates):
+                    if first == last:
+                        continue
+                    local_rows = slice(row_offset + first, row_offset + last)
+                    token_start += first
+                    token_end = token_start + last - first
+                    rows = last - first
+                    q_values = q_quant[token_start:token_end]
+                    q_scales = q_scale[token_start:token_end]
+                    chunk_weights = weights[token_start:token_end]
+                    logits_out = logits_scratch[: rows * width].view(rows, width)
+                    if reads_candidates:
+                        assert chunk_candidates is not None
+                        logits = dsv41_mxfp4_candidate_logits(
+                            q_values,
+                            q_scales,
+                            kv_cache,
+                            chunk_weights,
+                            chunk.block_table,
+                            chunk.cu_seqlen_ke[local_rows],
+                            chunk_candidates,
+                            row_starts=chunk.cu_seqlen_ks[local_rows],
+                            cu_seq_lens=chunk.cu_seq_lens,
+                            token_to_seq=chunk.token_to_seq,
+                            out=logits_out,
+                        )
+                        _dsv41_topk_from_candidates(
+                            logits,
+                            chunk_candidates,
+                            topk_indices,
+                            topk_workspace,
+                            lengths_scratch,
+                        )
+                        continue
+
+                    logits = dsv41_mxfp4_dense_logits(
                         q_values,
                         q_scales,
                         kv_cache,
                         chunk_weights,
                         chunk.block_table,
                         chunk.cu_seqlen_ke[local_rows],
-                        chunk_candidates,
+                        width,
                         row_starts=chunk.cu_seqlen_ks[local_rows],
                         cu_seq_lens=chunk.cu_seq_lens,
                         token_to_seq=chunk.token_to_seq,
                         out=logits_out,
                     )
-                    _dsv41_topk_from_candidates(
-                        logits,
-                        chunk_candidates,
-                        topk_indices,
-                        topk_workspace,
-                        lengths_scratch,
-                    )
-                    continue
-
-                logits = dsv41_mxfp4_dense_logits(
-                    q_values,
-                    q_scales,
-                    kv_cache,
-                    chunk_weights,
-                    chunk.block_table,
-                    chunk.cu_seqlen_ke[local_rows],
-                    width,
-                    row_starts=chunk.cu_seqlen_ks[local_rows],
-                    cu_seq_lens=chunk.cu_seq_lens,
-                    token_to_seq=chunk.token_to_seq,
-                    out=logits_out,
-                )
-                if chunk_candidates is not None:
-                    num_blocks = (
-                        width + candidate_block_size - 1
-                    ) // candidate_block_size
-                    score_width = max(chunk_candidates.shape[1], num_blocks)
-                    scores_out = block_scores_scratch[: rows * score_width].view(
-                        rows, score_width
-                    )
-                    _select_dsv41_candidate_blocks(
+                    if chunk_candidates is not None:
+                        num_blocks = (
+                            width + candidate_block_size - 1
+                        ) // candidate_block_size
+                        score_width = max(chunk_candidates.shape[1], num_blocks)
+                        scores_out = block_scores_scratch[: rows * score_width].view(
+                            rows, score_width
+                        )
+                        _select_dsv41_candidate_blocks(
+                            logits,
+                            chunk.cu_seqlen_ks[local_rows],
+                            chunk.cu_seqlen_ke[local_rows],
+                            chunk_candidates.shape[1],
+                            candidate_block_size,
+                            chunk_candidates,
+                            topk_workspace,
+                            scores_out=scores_out,
+                            block_lens_out=lengths_scratch[:rows],
+                        )
+                    ops.top_k_per_row_prefill(
                         logits,
                         chunk.cu_seqlen_ks[local_rows],
                         chunk.cu_seqlen_ke[local_rows],
-                        chunk_candidates.shape[1],
-                        candidate_block_size,
-                        chunk_candidates,
-                        topk_workspace,
-                        scores_out=scores_out,
-                        block_lens_out=lengths_scratch[:rows],
+                        topk_indices,
+                        rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
                     )
-                ops.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks[local_rows],
-                    chunk.cu_seqlen_ke[local_rows],
-                    topk_indices,
-                    rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
 
     if attn_metadata.num_decodes > 0:
         assert attn_metadata.decode is not None
@@ -813,73 +860,83 @@ def _dsv41_native_indexer(
             rows = row_end - row_start
             row_slice = slice(row_start, row_end)
             request_slice = slice(request_start, request_end)
-            q_values = padded_q_values[request_slice]
-            q_scales = padded_q_scales[request_slice]
-            chunk_weights = padded_weights[row_slice]
-            chunk_candidates = (
+            all_candidates = (
                 padded_candidates[row_slice] if padded_candidates is not None else None
             )
-            chunk_topk_indices = topk_indices[row_slice]
-            chunk_seq_lens = seq_lens[row_slice]
-            logits_out = logits_scratch[: rows * width].view(rows, width)
-            if reads_candidates:
-                assert chunk_candidates is not None
-                logits = dsv41_mxfp4_candidate_logits(
+            with _dsv41_shard_rows(
+                topk_indices[row_slice], all_candidates, candidate_write, width
+            ) as (first, last, chunk_topk_indices, chunk_candidates):
+                if first == last:
+                    continue
+                rows = last - first
+                local_rows = slice(row_start + first, row_start + last)
+                q_values = padded_q_values[request_slice].flatten(0, 1)[first:last]
+                q_scales = padded_q_scales[request_slice].flatten(0, 1)[first:last]
+                chunk_weights = padded_weights[local_rows]
+                chunk_seq_lens = seq_lens[local_rows]
+                logits_out = logits_scratch[: rows * width].view(rows, width)
+                if reads_candidates:
+                    assert chunk_candidates is not None
+                    logits = dsv41_mxfp4_candidate_logits(
+                        q_values,
+                        q_scales,
+                        kv_cache,
+                        chunk_weights,
+                        decode_metadata.block_table[request_slice],
+                        chunk_seq_lens,
+                        chunk_candidates,
+                        row_repeat=next_n,
+                        row_offset=first,
+                        out=logits_out,
+                    )
+                    _dsv41_topk_from_candidates(
+                        logits,
+                        chunk_candidates,
+                        chunk_topk_indices,
+                        topk_workspace,
+                        lengths_scratch,
+                    )
+                    continue
+
+                logits = dsv41_mxfp4_dense_logits(
                     q_values,
                     q_scales,
                     kv_cache,
                     chunk_weights,
                     decode_metadata.block_table[request_slice],
                     chunk_seq_lens,
-                    chunk_candidates,
+                    width,
                     row_repeat=next_n,
+                    row_offset=first,
                     out=logits_out,
                 )
-                _dsv41_topk_from_candidates(
+                if chunk_candidates is not None:
+                    num_blocks = (
+                        width + candidate_block_size - 1
+                    ) // candidate_block_size
+                    score_width = max(chunk_candidates.shape[1], num_blocks)
+                    scores_out = block_scores_scratch[: rows * score_width].view(
+                        rows, score_width
+                    )
+                    _select_dsv41_candidate_blocks(
+                        logits,
+                        None,
+                        chunk_seq_lens,
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                        topk_workspace,
+                        scores_out=scores_out,
+                        block_lens_out=lengths_scratch[:rows],
+                    )
+                torch.ops._C.persistent_topk(
                     logits,
-                    chunk_candidates,
+                    chunk_seq_lens,
                     chunk_topk_indices,
                     topk_workspace,
-                    lengths_scratch,
+                    topk_tokens,
+                    width,
                 )
-                continue
-
-            logits = dsv41_mxfp4_dense_logits(
-                q_values,
-                q_scales,
-                kv_cache,
-                chunk_weights,
-                decode_metadata.block_table[request_slice],
-                chunk_seq_lens,
-                width,
-                row_repeat=next_n,
-                out=logits_out,
-            )
-            if chunk_candidates is not None:
-                num_blocks = (width + candidate_block_size - 1) // candidate_block_size
-                score_width = max(chunk_candidates.shape[1], num_blocks)
-                scores_out = block_scores_scratch[: rows * score_width].view(
-                    rows, score_width
-                )
-                _select_dsv41_candidate_blocks(
-                    logits,
-                    None,
-                    chunk_seq_lens,
-                    chunk_candidates.shape[1],
-                    candidate_block_size,
-                    chunk_candidates,
-                    topk_workspace,
-                    scores_out=scores_out,
-                    block_lens_out=lengths_scratch[:rows],
-                )
-            torch.ops._C.persistent_topk(
-                logits,
-                chunk_seq_lens,
-                chunk_topk_indices,
-                topk_workspace,
-                topk_tokens,
-                width,
-            )
 
         if decode_metadata.requires_padding:
             unpacked = unpack_seq_triton(
