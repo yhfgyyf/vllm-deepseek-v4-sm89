@@ -4362,9 +4362,9 @@ platformdirs==4.14.2 \
     #   jupyter-core
     #   pooch
     #   virtualenv
-plotly==5.24.1 \
-    --hash=sha256:dbc8ac8339d248a4bcc36e08a5659bacfe1b079390b8953533f4eb22169b4bae \
-    --hash=sha256:f67073a1e637eb0dc3e46324d9d51e2fe76e9727c892dde64ddf1e1b51f29089
+plotly==7.1.0 \
+    --hash=sha256:dbb7fa18afce40d0a8e80d1bf162eceb3faa0ce5a77fe741ad09a74cf78f53f3 \
+    --hash=sha256:f860166a4a3d78c69cb1f4a15f28a5c8283eade98a282a698f3bb853a449ace5
     # via
     #   -r requirements/test/cuda.in
     #   genai-perf
