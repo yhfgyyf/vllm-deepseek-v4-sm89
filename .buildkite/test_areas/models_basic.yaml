@@ -714,4 +714,4 @@ steps:
     tests/kernels/attention/test_dsv41_native_indexer.py
     tests/kernels/quantization/test_ada_mxfp8_linear.py
     tests/kernels/test_deepseek_v41_native_ops.py
-    -k 'query_row_partitions or inline_wo_b or paired_swa'
+    -k 'query_row_partitions or inline_wo_b or paired_swa or woa_w8a16'

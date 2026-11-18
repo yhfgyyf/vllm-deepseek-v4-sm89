@@ -158,6 +158,49 @@ adaptive verification and FULL graph settings remain in the repository's
 DeepSeek V4.1 launch examples. Recheck the actual context capacity and memory
 budget when deploying the new dependency stack.
 
+### Optional FP8 `wo_a` (W8A16)
+
+`VLLM_DSV41_WOA_W8A16=1` is an explicit, default-off SM120 opt-in. It keeps
+the checkpoint's FP8 `wo_a` and UE8M0 K32 scales instead of expanding them to
+BF16 at load time.
+
+- Up to 128 tokens, a grouped Triton GEMM dequantizes each tile to BF16 in
+  registers and writes the `wo_b` input directly.
+- Larger batches dequantize into workspace and run the existing BF16 grouped
+  GEMM.
+- Dequantization is exact, so outputs match the default path up to FP32
+  accumulation order.
+- The switch is ignored on SM89, which has not been run, and when LoRA is
+  enabled.
+- It halves `wo_a` weight memory.
+
+Component evidence comes from one RTX PRO 6000 Blackwell Workstation (SM120).
+Timings use CUPTI with cold L2. CUPTI resolution is about 2 µs.
+
+| Local groups (TP) | Tokens | BF16 `wo_a` (µs) | W8A16 (µs) |
+| --- | ---: | ---: | ---: |
+| 2 (TP4) | 8 | 34.8 | 14.3 |
+| 2 (TP4) | 48 | 43.0 | 14.5 |
+| 2 (TP4) | 8192 | 377.3 | 391.2 |
+| 4 (TP2) | 8 | 49.1 | 22.9 |
+| 4 (TP2) | 512 | 74.1 | 98.3 |
+| 1 (TP8) | 8 | 12.7 | 12.3 |
+| 1 (TP8) | 48 | 12.7 | 16.3 |
+
+Timing used synthetic FP8 weights of the V4.1 shape `R=1024, D=4096`. On
+captured L20 TP8 `wo_a` operands, requantization reproduced the BF16 weights
+bit-exactly. The 7-token decode output was bitwise equal to the default path.
+At 128 tokens the output differed by at most one BF16 ULP.
+
+TP8 shows no decode gain. Batches above 128 tokens run at 0.75-0.97x of the
+default path because of the extra dequantization pass. Full-model serving,
+multi-GPU runs and end-to-end speed are unverified; this is a component-level
+result. Focused regression:
+
+```bash
+.venv/bin/python -m pytest -q tests/kernels/test_deepseek_v41_native_ops.py -k woa_w8a16
+```
+
 ## Validation scope
 
 The 2026-11-09 validation used L20 (SM89) and RTX PRO 6000 (SM120), both with

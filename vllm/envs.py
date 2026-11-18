@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_B12X: bool = False
     VLLM_DSV41_INDEXER_TP4: bool = False
     VLLM_DSV41_INLINE_WOB_QUANT: bool = False
+    VLLM_DSV41_WOA_W8A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1758,6 +1759,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_INLINE_WOB_QUANT": lambda: bool(
         int(os.getenv("VLLM_DSV41_INLINE_WOB_QUANT", "0"))
     ),
+    # Keep V4.1 wo_a in FP8 on SM120 and dequantize it inside a grouped GEMM.
+    "VLLM_DSV41_WOA_W8A16": lambda: bool(int(os.getenv("VLLM_DSV41_WOA_W8A16", "0"))),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))

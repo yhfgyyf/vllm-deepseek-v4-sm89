@@ -15,6 +15,11 @@ from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import (
     compute_global_topk_indices_and_lens,
 )
+from vllm.models.deepseek_v4_1.common.ops.woa_w8a16 import (
+    woa_w8a16,
+    woa_w8a16_workspace_bytes,
+)
+from vllm.models.deepseek_v4_1.quant_config import use_woa_w8a16
 from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV41SparseMLABackend,
     DeepseekV41SparseMLAMetadata,
@@ -301,6 +306,15 @@ class DeepseekV41NativeMixedAttention(DeepseekV4Attention):
             max_swa_slots,
             max_global_slots,
         )
+        if use_woa_w8a16():
+            workspace_bytes = max(
+                workspace_bytes,
+                woa_w8a16_workspace_bytes(
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    self.n_local_heads * self.head_dim // self.n_local_groups,
+                ),
+            )
         current_workspace_manager().get_simultaneous(
             ((workspace_bytes,), torch.uint8),
         )
@@ -318,9 +332,14 @@ class DeepseekV41NativeMixedAttention(DeepseekV4Attention):
         del positions
         # The native final store applies inverse RoPE and writes [G, T, D].
         group_dim = o.shape[1] * o.shape[2] // self.n_local_groups
-        grouped_o = o.view(self.n_local_groups, o.shape[0], group_dim).transpose(0, 1)
+        grouped_o = o.view(self.n_local_groups, o.shape[0], group_dim)
         weight = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        projected = torch.einsum("bhd,hrd->bhr", grouped_o, weight)
+        if getattr(self.wo_a, "w8a16", False):
+            scale = self.wo_a.weight_scale.view(
+                self.n_local_groups, self.o_lora_rank, -1
+            )
+            return self.wo_b(woa_w8a16(grouped_o, weight, scale))
+        projected = torch.einsum("bhd,hrd->bhr", grouped_o.transpose(0, 1), weight)
         return self.wo_b(projected.flatten(1))
 
     def _global_slots(
