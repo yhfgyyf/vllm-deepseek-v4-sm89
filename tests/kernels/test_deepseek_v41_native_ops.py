@@ -405,6 +405,110 @@ def test_global_fp4_insert_uses_group16_and_group_start_rope(ratio):
     torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
 
+def _woa_operands(groups, tokens, seed):
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    values = torch.randn(groups * 1024, 4096, generator=gen, device="cuda") * 60
+    values = values.clamp(-448, 448).to(torch.float8_e4m3fn)
+    scales = torch.randint(
+        110, 122, (groups * 1024, 128), generator=gen, device="cuda", dtype=torch.int32
+    ).to(torch.uint8)
+    # Production BF16 form of the checkpoint weight.
+    dense = dequant_mxfp8_to_bf16(values, scales).view(groups, 1024, 4096)
+    x = torch.randn(groups, tokens, 4096, generator=gen, device="cuda") * 0.5
+    return (
+        x.to(torch.bfloat16),
+        values.view(groups, 1024, 4096),
+        scales.view(groups, 1024, 128),
+        dense,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((8, 9), (12, 0)),
+    reason="the portable W8A16 wo_a kernel targets SM89 and SM120",
+)
+@pytest.mark.parametrize("groups", [1, 2, 4])
+@pytest.mark.parametrize("tokens", [1, 7, 16, 33, 64, 128, 129, 1024, 1025])
+def test_woa_w8a16_matches_bf16_grouped_projection(workspace_init, groups, tokens):
+    """FP8 wo_a dequantized in-kernel equals the official BF16 grouped GEMM up to
+    FP32 accumulation order, across split-K, direct and dequant+BMM dispatch."""
+    from vllm.models.deepseek_v4_1.common.ops.woa_w8a16 import woa_w8a16
+
+    x, values, scales, dense = _woa_operands(groups, tokens, 20261118 + tokens)
+    expected = torch.einsum("bhd,hrd->bhr", x.transpose(0, 1), dense).flatten(1)
+    reference = torch.einsum("gtd,grd->tgr", x.double(), dense.double()).flatten(1)
+    actual = woa_w8a16(x, values, scales)
+    assert actual.shape == (tokens, groups * 1024)
+    bound = reference.abs().max()
+    assert (actual.double() - reference).abs().max() <= (
+        (expected.double() - reference).abs().max() + bound * 2**-8
+    )
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=bound.item() * 2**-8)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((8, 9), (12, 0)),
+    reason="the portable W8A16 wo_a kernel targets SM89 and SM120",
+)
+@pytest.mark.parametrize("tokens", [8, 48])
+def test_woa_w8a16_graph_replay_reads_changed_inputs(workspace_init, tokens):
+    from vllm.models.deepseek_v4_1.common.ops.woa_w8a16 import woa_w8a16
+
+    x, values, scales, _ = _woa_operands(2, tokens, 7)
+    woa_w8a16(x, values, scales)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = woa_w8a16(x, values, scales)
+    x.copy_(torch.randn_like(x))
+    scales.add_(1)
+    graph.replay()
+    torch.testing.assert_close(captured, woa_w8a16(x, values, scales), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="the V4.1 W8A16 wo_a switch is enabled on SM120 only",
+)
+@pytest.mark.parametrize("tokens", [6, 200])
+def test_woa_w8a16_o_proj_matches_dequantized_wo_a(workspace_init, monkeypatch, tokens):
+    """The flag keeps the checkpoint FP8 wo_a and `_o_proj` feeds `wo_b` the same
+    `[T, G*R]` input as the default dequantized-BF16 path."""
+    from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
+        DeepseekV41NativeMixedAttention,
+    )
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41WoALinearMethod
+
+    x, values, scales, _ = _woa_operands(2, tokens, 11)
+    # The native attention stores [G, T, D] into its [T, H, 512] output buffer.
+    attention_out = x.view(tokens, 16, 512)
+
+    def projection(enabled):
+        monkeypatch.setenv("VLLM_DSV41_WOA_W8A16", "1" if enabled else "0")
+        wo_a = torch.nn.Module()
+        wo_a.weight = torch.nn.Parameter(values.reshape(2048, 4096).clone(), False)
+        wo_a.weight_scale = torch.nn.Parameter(scales.reshape(2048, 128).clone(), False)
+        DeepseekV41WoALinearMethod().process_weights_after_loading(wo_a)
+        assert getattr(wo_a, "w8a16", False) == enabled
+        assert wo_a.weight.dtype == (torch.float8_e4m3fn if enabled else torch.bfloat16)
+        layer = SimpleNamespace(
+            n_local_groups=2, o_lora_rank=1024, wo_a=wo_a, wo_b=lambda t: t
+        )
+        return DeepseekV41NativeMixedAttention._o_proj(layer, attention_out, None)
+
+    expected = projection(False)
+    actual = projection(True)
+    assert actual.shape == expected.shape == (tokens, 2048)
+    torch.testing.assert_close(
+        actual, expected, rtol=2**-7, atol=expected.abs().max().item() * 2**-8
+    )
+
+
 @cuda
 @pytest.mark.parametrize("heads", [8, 16, 32])
 def test_inverse_rope_retains_bf16_grouped_projection_contract(heads):

@@ -8,6 +8,7 @@ from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.fused_moe import (
@@ -45,6 +46,18 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.models.deepseek_v4.quant_config import (
     DeepseekV4FP8Config as DeepseekV4BaseFP8Config,
 )
+from vllm.platforms import current_platform
+
+
+def use_woa_w8a16() -> bool:
+    """Whether V4.1 `wo_a` stays FP8 for the SM120 grouped W8A16 GEMM."""
+    config = get_current_vllm_config_or_none()
+    return (
+        envs.VLLM_DSV41_WOA_W8A16
+        and (config is None or config.lora_config is None)
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    )
 
 
 @register_weight_loader_v2_supported_method
@@ -136,6 +149,10 @@ class DeepseekV41WoALinearMethod(LinearMethodBase):
                     "DeepSeek-V4.1 wo_a checkpoint scale was not fully loaded"
                 )
             layer.weight_scale.data.fill_(127)
+        if use_woa_w8a16():
+            # The grouped GEMM dequantizes exactly to the same BF16 values.
+            layer.w8a16 = True
+            return
         replace_parameter(
             layer,
             "weight",
@@ -148,6 +165,8 @@ class DeepseekV41WoALinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "w8a16", False):
+            raise RuntimeError("FP8 V4.1 wo_a runs only through the grouped GEMM.")
         return self.unquantized_method.apply(layer, x, bias)
 
 
