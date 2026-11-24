@@ -4011,9 +4011,9 @@ opentelemetry-semantic-conventions-ai==0.4.13 \
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
-optuna==3.6.1 \
-    --hash=sha256:146e530b57b4b9afd7526b3e642fbe65491f7e292b405913355f8e438e361ecf \
-    --hash=sha256:b32e0490bd6552790b70ec94de77dd2855057c9e229cd9f4da48fe8a31c7f1cc
+optuna==5.1.0 \
+    --hash=sha256:6a4eed79680fdb4f0a70e9a9a59530ae8e9e976db1362e4660de1fdd89434e67 \
+    --hash=sha256:aba6a73d32e4ccf58c00ea70a60bf5bcece6b34defb024474dddd0962dc070b1
     # via genai-perf
 orjson==3.12.0 \
     --hash=sha256:010811c1b69773450a01cef97727a67b223242f350b77d4ca000e59a9ef2155a \
