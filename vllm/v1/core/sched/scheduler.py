@@ -1694,6 +1694,24 @@ class Scheduler(SchedulerInterface):
                     )
 
                     if (
+                        pad_spec_decode
+                        and num_new_tokens != 1 + self.num_spec_tokens
+                    ):
+                        # A cap applied after the padding clipped the placeholder
+                        # rows: long_prefill_token_threshold, the CED prompt
+                        # boundary cap (a request whose only remaining token is
+                        # its last prompt token, e.g. a 1-token prompt, is capped
+                        # to that single token), the MM atomic span, the encoder
+                        # budget or the prefill lookahead. A padded request must
+                        # keep all 1 + num_spec rows or the sampler's row count
+                        # stops matching its query rows, so drop the padding and
+                        # schedule only the one real token. The padded rows lie
+                        # past request.num_tokens, so none of these caps treats
+                        # that token differently; 0 stays 0 (skipped).
+                        num_new_tokens = min(num_new_tokens, 1)
+                        pad_spec_decode = False
+
+                    if (
                         request.has_encoder_inputs
                         and not self.scheduler_config.enable_chunked_prefill
                         and not self.is_mm_encoder_only
