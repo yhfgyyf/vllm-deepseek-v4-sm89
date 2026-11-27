@@ -3545,6 +3545,38 @@ def test_spec_decode_padding_dropped_when_recurrent_alignment_clips(
     assert r2.request_id not in out.scheduled_spec_decode_tokens
 
 
+def test_spec_decode_padding_dropped_when_ced_caps_a_one_token_prompt():
+    """A CED prompt-boundary cap must cancel spec padding, not shorten it.
+
+    The request's only remaining token is its last prompt token, so
+    _cap_ced_replay_chunk caps the padded 1 + num_spec window back to one row.
+    Keeping the flag would publish num_spec placeholders for a one-row request
+    and trip the final width assert.
+    """
+    num_spec = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    scheduler.ced_prefill = True
+    r1 = create_requests(num_requests=1, num_tokens=33)[0]
+
+    scheduler.add_request(r1)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, out, [[100]])
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3]]))
+
+    tail = create_requests(num_requests=1, num_tokens=1, req_ids=["ced-tail"])[0]
+    scheduler.add_request(tail)
+    out = scheduler.schedule()
+
+    assert out.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3]
+    assert out.num_scheduled_tokens[tail.request_id] == 1
+    assert tail.request_id not in out.scheduled_spec_decode_tokens
+
+
 def test_spec_decode_padding_skipped_with_prefill_in_batch():
     """Padding is skipped when the batch contains a prefill chunk: the batch is
     already mixed/non-uniform, so padding a new decode request buys nothing.
